@@ -1832,14 +1832,6 @@ end if;
  end if;-- In main process, decode writes to AutoTxKickAddr (use GA match)
 
 
-if WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = AutoTxKickAddr then
-  AutoTx_kick_req  <= '1';
-  AutoTx_kick_mask <= uCD(7 downto 0);  -- lower byte selects target(s); one-hot recommended
-else
-  AutoTx_kick_req  <= '0';
-  AutoTx_kick_mask <= AutoTx_kick_mask;
-end if;
-
 -------------------------------- DDR Macro Interfaces -------------------------------
 
 -- Read_Seq_FSM is (Idle,Wait0,SetAddr,CheckEmpty,FirstCmd,CheckRdBuff0,RdWdCount,CheckWdCount,PrepareWordCnt,

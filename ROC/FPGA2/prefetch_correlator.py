@@ -47,17 +47,66 @@ def set_host_port(host: str, port: int) -> None:
     if hasattr(uc, "PORT"):
         uc.PORT = port
 
+def _normalize_read_result(res):
+    """
+    Normalize different adapter return styles to (ok: bool, value: int).
+    Accepts:
+      - int (direct register value)
+      - str (e.g. "123" or "0x7B")
+      - (ok: bool, value: int)
+      - (value,) single-element tuple
+    """
+    # (ok, value) tuple
+    if isinstance(res, tuple):
+        if len(res) == 2 and isinstance(res[0], bool):
+            ok, val = res
+            return ok, int(val) if isinstance(val, (int,)) else (ok, None)
+        if len(res) == 1:
+            # treat single-element tuple as direct value
+            try:
+                return True, int(res[0])
+            except Exception:
+                return False, None
 
-def uc_read16(a16: int):
-    """Read 16-bit register via adapter."""
-    if hasattr(uc, "uc_read"):
-        ok, val = uc.uc_read(a16)
-        return ok, val
-    if hasattr(uc, "uc_read16"):
-        ok, val = uc.uc_read16(a16)
-        return ok, val
+    # direct int
+    if isinstance(res, int):
+        return True, res
+
+    # string value (decimal or hex)
+    if isinstance(res, str):
+        s = res.strip()
+        try:
+            val = int(s, 0)  # auto base (handles "123" or "0x7B")
+            return True, val
+        except Exception:
+            return False, None
+
+    # unknown type
     return False, None
 
+
+def uc_read16(a16: int):
+    """
+    Read 16-bit register via adapter; tolerant to different adapter APIs.
+    Tries uc.uc_read(a16) then uc.uc_read16(a16). Normalizes the result.
+    """
+    # Try uc_read first
+    if hasattr(uc, "uc_read"):
+        try:
+            res = uc.uc_read(a16)
+            return _normalize_read_result(res)
+        except Exception:
+            pass
+
+    # Fallback to uc_read16
+    if hasattr(uc, "uc_read16"):
+        try:
+            res = uc.uc_read16(a16)
+            return _normalize_read_result(res)
+        except Exception:
+            pass
+
+    return False, None
 
 def popcount8(x: int) -> int:
     x &= 0xFF
