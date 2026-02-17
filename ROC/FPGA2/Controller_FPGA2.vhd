@@ -20,6 +20,7 @@ use UNISIM.vcomponents.all;
 
 use work.Proj_Defs.all;
 
+
 entity Controller_FPGA2 is port(
 
 -- 160 MHz VXO clock, Phy clocks
@@ -62,7 +63,10 @@ entity Controller_FPGA2 is port(
 	SPICS,SPISClk,SPIMOSI : buffer std_logic;
 	SPIMISO : in std_logic;
 -- Debug port
-	Debug : buffer std_logic_vector(10 downto 1)
+	Debug : buffer std_logic_vector(10 downto 1);
+	--Debug : buffer std_logic_vector(10 downto 1);
+    -- debug outputs for testbench visibility
+    debug_ReadyStatus : out std_logic_vector(7 downto 0)
 );
 
 end Controller_FPGA2;
@@ -77,7 +81,9 @@ Type Array_8x2 is Array(0 to 7) of std_logic_vector(1 downto 0);
 Type Array_8x3 is Array(0 to 7) of std_logic_vector(2 downto 0);
 Type Array_8x4 is Array (0 to 7) of std_logic_vector(3 downto 0);
 Type Array_8x11 is Array(0 to 7) of std_logic_vector(10 downto 0);
+Type Array_8x12 is Array(0 to 7) of std_logic_vector(11 downto 0);
 Type Array_8x13 is Array(0 to 7) of std_logic_vector(12 downto 0);
+Type Array_8x14 is Array(0 to 7) of std_logic_vector(13 downto 0);
 Type Array_8x16 is Array(0 to 7) of std_logic_vector(15 downto 0);
 Type Array_8x32 is Array(0 to 7) of std_logic_vector(31 downto 0);
 Type Array_3x8x16 is Array(0 to 2) of Array_8x16;
@@ -142,6 +148,7 @@ signal EventWdCnt,EventStat : std_logic_vector (15 downto 0);
 signal uBunch : std_logic_vector(31 downto 0);
 signal PortWdCounter : Array_8x16;
 signal EventRdy,FirstActive : std_logic;
+signal PhyActivityCounter: Array_8x16;
 
 Type Write_Seq_FSM is (Idle,ChkWrtBuff,SndCmd,WtCmdMtpy,CheckActive0,IncrPort0,
 							  Rd_WdCount,Rd_uBunchHi,Rd_uBunchLo,Rd_Stat,IncrPort1,
@@ -151,20 +158,20 @@ signal DDR_Write_Seq : Write_Seq_FSM;
 
 -- Signals used by SDRAM readout sequencer
 Type Read_Seq_FSM is (Idle,Wait0,SetAddr,CheckEmpty,FirstCmd,CheckRdBuff0,
-							  RdWdCount,CheckRdBuff1,RdDataHi,RdDataLo);
+							  RdWdCount,CheckWdCount,PrepareWordCnt,CheckRdBuff1,RdDataHi,RdDataLo);
 signal DDR_Read_Seq : Read_Seq_FSM;
 signal WaitCount : std_logic_vector(5 downto 0);
-signal EvWdCount : std_logic_vector(13 downto 0);
+signal EvWdCount : std_logic_vector(15 downto 0);
 signal ReadCount,DDRRdStat,TxBlkCount : std_logic_vector(2 downto 0);
 -- Count of event pending for readout
 
 -- SMI signals
 signal SMI_Full,SMI_Empty,SMI_wreq,SMI_rdreq,ClkDiv,MDIORd : std_logic;
-signal SPI_Count : std_logic_vector (9 downto 0); 
+signal SPI_Count : std_logic_vector (10 downto 0); 
 signal Strt,TA,R_W,iMDIO,ChainSel : std_logic_vector (1 downto 0);
 signal SMI_Out : std_logic_vector (23 downto 0);
 signal PhyAd : std_logic_vector (4 downto 0);
-signal BitCount : std_logic_vector (4 downto 0);
+signal BitCount : std_logic_vector (5 downto 0);
 signal SMIShift : std_logic_vector (31 downto 0);
 signal SMIRdReg0,SMIRdReg1 : std_logic_vector (15 downto 0);
 Type  SMI_FSM is (Idle,Load,Shift,Done);
@@ -183,7 +190,7 @@ Signal SPI_State : SPI_FSM;
 signal PhyRstCnt : std_logic_vector (1 downto 0);
 signal PhyTxBuff_Full,PhyTxBuff_Empty,PhyTxBuff_rdreq,PreambleTx,DDRRd_en,
 		 PhyTxBuff_wreq,TxEnReq,TxEnAck,DDRWrt_En,DDRWrt_EnD,InitReq,PhyDatSel : std_logic;
-signal PhyTxBuff_Count : std_logic_vector (9 downto 0);
+signal PhyTxBuff_Count : std_logic_vector (10 downto 0);
 signal PreambleCnt : std_logic_vector (2 downto 0);
 signal TxReg : std_logic_vector (3 downto 0);
 signal Preamble,CRCErr_Reg,TxEnMask : std_logic_vector (7 downto 0);
@@ -194,13 +201,23 @@ signal TxNibbleCount : std_logic_vector (1 downto 0);
 signal PhyRxBuff_wreq,PhyRxBuff_rdreq,PhyRxBuff_Empty,HitFlag,
 		 PhyRxBuff_Full,iCRS,PhyRxBuff_RdStat : std_logic_vector (7 downto 0);
 signal RxBuffRst,FMRxBuffRst : std_logic;
-Signal PhyRxBuff_RdCnt : Array_8x13;
+Signal PhyRxBuff_RdCnt : Array_8x12;
 signal PhyRxBuff_Out : Array_8x16;
 signal RxPipeline : Array_3x8x16;
 signal RxNibbleCount,RxClkDL,iRxDV : Array_8x2;
 signal StartCount : Array_8x3;
 signal FMRxBuff_Count : Array_8x11;
-signal PhyRx,PhyTx : Array_8x4;
+signal PhyRx : Array_8x4;
+signal PhyTx : Array_8x4 := (
+  0 => (others => '0'),
+  1 => (others => '0'),
+  2 => (others => '0'),
+  3 => (others => '0'),
+  4 => (others => '0'),
+  5 => (others => '0'),
+  6 => (others => '0'),
+  7 => (others => '0')
+  );
 signal Rx_CRC_Out : Array_8x32;
 signal RdCRCEn,RxCRCRst : std_logic_vector(7 downto 0);
 
@@ -240,10 +257,142 @@ signal LinkFIFO_Dat : std_logic_vector(17 downto 0);
 signal BitClk,WdClk,PllLock,LockOut,Link_Stat_Req : std_logic;
 signal LinkTxFull,LinkTxEmpty,LinkTxWrReq,LinkTxRDReq,TxValid,LinkTxTraceWrReq : std_logic;
 
+-- Added 11/24: PHY to FEB signal for prefetch filling
+-- Ready notification / edge-detect signals (per PHY port)
+signal phy_empty_d    : Array_8x2 := (others => (others => '0'));  -- delayed copy for edge detect
+signal ReadyStatus    : std_logic_vector(7 downto 0) := (others => '0');  -- sticky ready bits
+
+
 -- debug trace buffer
 signal LinkTxTraceRDReq : std_logic;
 signal TxFIFOTrace_Out : std_logic_vector(8 downto 0);
 signal LinkTxTrace_Cnt : std_logic_vector(12 downto 0);
+
+-- SC: signals to handle overflows
+signal tx_overflow : std_logic; -- flag indcating if we are sending an event with overflow
+signal tx_overflow_cnt : std_logic_vector(15 downto 0); -- overflow counter for diagnostics
+--signal tx_word_cnt : std_logic_vector(15 downto 0);
+signal word_number : std_logic_vector(1 downto 0); -- shift register used to identify the first (word count) and second (status) words
+signal EvWdCountTot : std_logic_vector(15 downto 0); -- latches the total EvWdCount used to send out (for the statemachine we start at +1)
+-- TX MAX WORDS
+-- we can at least try to cut at hit boundaries
+-- the header is 4 words: count, status, uB-low, ub-high
+-- each hit currently has 11 words
+-- So we want to cut somewhere at 4 + N x 11 with integer N
+-- N=1: 11*1 + 4 = 15 = 0x000f, for debugging, testing
+-- N=744: 11*744 + 4 = 8188 = 0x1ffc
+constant MAX_TX_WORDS : std_logic_vector(15 downto 0) := X"1ffc";-- X"2000";
+-- constant UB_MISMATCH_STATUS_BIT : std_logic_vector(7 downto 0) := X"10";
+constant OVERFLOW_STATUS_BIT : std_logic_vector(15 downto 0) := X"1000"; -- bit 12
+
+-- added 11/24: Auto-TX FPGA automatic READY Packet sender, 2 words for now? Can change later. 
+signal PhyTxDin_FPGA      : std_logic_vector(15 downto 0) := (others => '0'); -- FPGA-produced write data
+signal PhyTxDin_mux       : std_logic_vector(15 downto 0) := (others => '0'); -- selected DIN to PhyTx_Buff (uC or FPGA)
+signal PhyTxBuff_wr_en_mux: std_logic := '0';                                  -- combined wr_en into PhyTx_Buff
+signal PhyTxWrReq_FPGA    : std_logic := '0';                                  -- one-cycle FPGA write request
+signal AutoTx_State       : std_logic_vector(1 downto 0) := "00";              -- small FSM state
+signal AutoTx_Port        : integer range 0 to 7 := 0;
+signal AutoTx_WordIdx     : integer range 0 to 15 := 0; -- supports up to 16-word packets if needed
+signal AutoTx_WordPending : std_logic := '0';  -- internal one-cycle writer strobe tracker
+signal AutoTx_Claim : std_logic_vector(7 downto 0) := (others => '0'); -- one-hot claim for main to clear ReadyStatus
+
+signal AutoTx_Target       : std_logic_vector(7 downto 0) := (others => '0'); -- one-hot chosen port
+signal AutoTx_BroadcastMode: std_logic := '0'; -- if '1', ignore AutoTx_Target and broadcast to TxEn bits
+signal port_full : std_logic_vector(7 downto 0); -- hook this to your per-port FIFO-full flags
+signal AutoTx_kick_req   : std_logic := '0';
+signal AutoTx_kick_mask  : std_logic_vector(7 downto 0) := (others => '0'); -- ports to consider (one-hot or multi-bit)
+
+signal PhyTxBuff_wr_count   : std_logic_vector(10 downto 0);   -- FIFO write-side count
+signal PhyTxBuff_rst_pulse  : std_logic := '0';
+
+-- Local register addresses (self-contained, do not require Proj_Defs changes)
+-- Lower 10-bit uC addresses for manual AutoTx kick and TX FIFO reset
+-- AutoTxKickAddr: write lower byte one-hot to select port(s) for a manual UBT kick
+constant AutoTxKickAddr    : std_logic_vector(9 downto 0) := "00" & X"4D";  -- 0x04D
+-- TxFifoResetAddr: write 0x0001 to pulse a reset on PhyTx_Buff
+constant TxFifoResetAddr   : std_logic_vector(9 downto 0) := "00" & X"4E";  -- 0x04E
+-- Optional control (reserved for future use)
+constant TxFifoCtrlAddr    : std_logic_vector(9 downto 0) := "00" & X"4F";  -- 0x04F
+
+-- New reset wire for TX FIFO (OR of ResetHi and a one-cycle pulse)
+signal PhyTxBuff_rst       : std_logic := '0';
+
+-- Use the existing write-side count published by the FIFO (PhyTxBuff_Count)
+-- to generate a synchronized "has data" flag into the CSR/SMI domain.
+-- Robust "has data" sync into CSR domain
+signal TxFifoHasData_meta   : std_logic := '0';
+signal TxFifoHasData_sync   : std_logic := '0';
+
+
+-- CurrentTarget is derived at transmit time to guarantee only one port
+-- actually receives the 4 nibbles for a single FIFO read.  It picks
+-- AutoTx_Target (one-hot) if set, otherwise selects the lowest-indexed
+-- bit from TxEn so we never drive more than one PHY at once.
+signal CurrentTarget : std_logic_vector(7 downto 0) := (others => '0');
+constant ZERO4 : std_logic_vector(3 downto 0) := "0000";
+constant ZERO8 : std_logic_vector(7 downto 0) := "00000000";
+signal TxTarget_hold : std_logic_vector(7 downto 0) := (others => '0');
+signal nibble_hold_cnt : integer range 0 to 4 := 0;
+-- added 11/24: Helper function: ready packet word generator (adjust to your packet format)
+-- ready_packet_word: return a 16-bit READY packet word.
+-- word 0 = packet length (2)
+-- word 1 = [15] = buf_full, [14:0] = port id
+--function ready_packet_word(port_idx : integer; idx : integer; buf_full : std_logic) return std_logic_vector(15 downto 0) is
+--  variable outw : std_logic_vector(15 downto 0);
+--  variable tmp  : integer;
+--begin
+--  if idx = 0 then
+--    outw := X"0002";
+--  elsif idx = 1 then
+--    -- Build the 16-bit integer value: top bit is buf_full, low 15 bits are port_idx
+--    tmp := port_idx;            -- should be 0..7
+--    if buf_full = '1' then
+--      tmp := tmp + 2**15;       -- set bit 15
+--    end if;
+--    outw := std_logic_vector(to_unsigned(tmp, 16));
+--  else
+--    outw := (others => '0');
+--  end if;
+--  return outw;
+--end function ready_packet_word;
+
+--function ready_packet_word(
+--    port_idx : integer;
+--    idx      : integer;
+--    buf_full : std_logic
+--  ) return std_logic_vector(15 downto 0) is
+--    variable outw : std_logic_vector(15 downto 0);
+--    variable tmp  : integer;
+--	 variable u    : unsigned(outw'length-1 downto 0);
+--  begin
+--    if idx = 0 then
+--      outw := X"0002";  -- packet length = 2 words
+--    elsif idx = 1 then
+--      tmp := port_idx;            -- expect 0..7
+--      if buf_full = '1' then
+--        tmp := tmp + 32768;       -- set bit 15
+--      end if;
+--      u := to_unsigned(tmp, u'length);
+--      outw := std_logic_vector(u);
+--    else
+--      outw := (others => '0');
+--    end if;
+--    return outw;
+--  end function ready_packet_word;
+
+constant READY_WORD_COUNT : integer := 2; -- number of words in the READY packet (update if you change helper)
+
+-- added 11/24
+-- helper: returns true if all bits of the std_logic_vector are '0'
+function is_all_zero(vec : std_logic_vector) return boolean is
+begin
+  for i in vec'range loop
+    if vec(i) = '1' then
+      return false;
+	 end if;
+  end loop;
+  return true;
+end function is_all_zero;
 
 begin
 
@@ -401,13 +550,36 @@ SMI_Buff : SMI_FIFO
     empty => SMI_Empty);
 
 -- 1k deep buffer for PhyTx
-PhyTx_Buff : PhyTxBuff
-  PORT MAP ( rst => ResetHi,   wr_clk => SysClk,
-    rd_clk => i50MHz, din => uCD,
-    wr_en => PhyTxBuff_wreq, rd_en => PhyTxBuff_rdreq,
-    dout => PhyTxBuff_Out, full => PhyTxBuff_Full,
-    empty => PhyTxBuff_Empty,
-	 wr_data_count => PhyTxBuff_Count);
+-- 11/24 modify instantiation 
+--    Find the existing block (search for "PhyTx_Buff : PhyTxBuff PORT MAP ( rst => ResetHi,   wr_clk => SysClk,")
+--    Replace the PORT MAP arguments `din => uCD, wr_en => PhyTxBuff_wreq,` with the two lines below:
+
+-- changed 1/7
+	PhyTx_Buff : PhyTxBuff
+	PORT MAP ( rst => PhyTxBuff_rst,   wr_clk => SysClk,
+		rd_clk => i50MHz, din => PhyTxDin_mux,
+		wr_en => PhyTxBuff_wr_en_mux, rd_en => PhyTxBuff_rdreq,
+		dout => PhyTxBuff_Out, full => PhyTxBuff_Full,
+		empty => PhyTxBuff_Empty,
+		wr_data_count => PhyTxBuff_Count);
+
+	PhyTxDin_mux <= uCD when PhyTxBuff_wreq = '1' else PhyTxDin_FPGA;
+	PhyTxBuff_wr_en_mux <= PhyTxBuff_wreq or PhyTxWrReq_FPGA;
+
+
+--PhyTx_Buff : PhyTxBuff
+--  PORT MAP ( rst => ResetHi,   wr_clk => SysClk,
+--    rd_clk => i50MHz, din => PhyTxDin_mux,
+--    wr_en => PhyTxBuff_wr_en_mux, rd_en => PhyTxBuff_rdreq,
+--    dout => PhyTxBuff_Out, full => PhyTxBuff_Full,
+--    empty => PhyTxBuff_Empty,
+--	 wr_data_count => PhyTxBuff_Count);
+--
+---- Added 11/24/25
+--------------------combinational assignments (mux) and the AutoTx FSM process-------------
+--PhyTxDin_mux <= uCD when PhyTxBuff_wreq = '1' else PhyTxDin_FPGA;
+--PhyTxBuff_wr_en_mux <= PhyTxBuff_wreq or PhyTxWrReq_FPGA;
+
 
 -- Buffer for SPI data
 SPITx_Buff : PhyTxBuff
@@ -420,23 +592,23 @@ SPITx_Buff : PhyTxBuff
 
 -- FM Receivers for getting data request packets and heartbeat data from
 -- the top level FPGA
-DReqFMRx : FM_Rx
-	generic MAP(Pwidth => 16)
-	port map(SysClk => SysClk, RxClk => RxFMClk, 
-				reset => ResetHi,
-				Rx_In => RxIn(0),
-				Data => RxDat(0), 
-				Rx_Out => RxOut(0));
-RxIn(0).FM <= DReqFM when DRegSrc = '1' else '0';
+--DReqFMRx : FM_Rx
+--	generic MAP(Pwidth => 16)
+--	port map(SysClk => SysClk, RxClk => RxFMClk, 
+--				reset => ResetHi,
+--				Rx_In => RxIn(0),
+--				Data => RxDat(0), 
+--				Rx_Out => RxOut(0));
+--RxIn(0).FM <= DReqFM when DRegSrc = '1' else '0';
 
 -- Trigger request buffer
-DatReqBuff: SCFifo_512x16
-  PORT MAP ( rst => GTPRxRst, clk => SysClk,
-    din => RxDat(0),
-	 wr_en => RxOut(0).Done, rd_en => DatReqBuff_rdreq,
-    dout => DatReqBuff_Out, 
-	 full => DatReqBuff_Full, empty => DatReqBuff_Empty,
-	 data_count => DatReqBuff_Count);
+--DatReqBuff: SCFifo_512x16
+--  PORT MAP ( rst => GTPRxRst, clk => SysClk,
+--    din => RxDat(0),
+--	 wr_en => RxOut(0).Done, rd_en => DatReqBuff_rdreq,
+--    dout => DatReqBuff_Out, 
+--	 full => DatReqBuff_Full, empty => DatReqBuff_Empty,
+--	 data_count => DatReqBuff_Count);
 
 GTPRxRst <= '1' when CpldRst = '0' 
   	or (CpldCS = '0' and uCWR = '0' and uCA(11 downto 10) = "00" and uCA(9 downto 0) = GTPFIFOAddr and uCD(0) = '1') else '0';
@@ -471,14 +643,8 @@ Debug(4) <= FEBRxOut(0).Done;
 Debug(5) <= FEBRxBuff_rdreq(0);
 Debug(6) <= FMRx(0);
 
-Gen_RxBuffs : for i in 0 to 7 generate
-
--- CRC generators for receive data CRC checking. 
-RxCRC : CRC32_D4 
- port map(rst => RxCRCRst(i), clk => RxFMClk, crc_en => RdCRCEn(i), 
-			 data_in => PhyRx(i),
-			 crc_out => Rx_CRC_Out(i));
-
+-- 2 BRAM based
+Gen_FEBRxBuffs : for i in 0 to 7 generate
 -- 4k deep input buffers for eight Rx Phy channels
 FEBRx_Buff : PhyRxBuff
   PORT MAP (rst => RxBuffRst, rd_clk => SysClk,
@@ -487,6 +653,33 @@ FEBRx_Buff : PhyRxBuff
     dout => PhyRxBuff_Out(i), full => PhyRxBuff_Full(i),
     empty => PhyRxBuff_Empty(i),
 	 rd_data_count => PhyRxBuff_RdCnt(i));
+end generate;
+
+-- 2 DRAM based
+--Gen_FEBRxBuffs_test : for i in 5 to 7 generate
+
+--FEBRx_Buff_test : FEBRx_test_Buff
+  --PORT MAP (rst => RxBuffRst, rd_clk => SysClk,
+    --wr_clk => RxFMClk, din => RxPipeline(2)(i),
+--    wr_en => PhyRxBuff_wreq(i), rd_en => PhyRxBuff_rdreq(i),
+--    dout => PhyRxBuff_Out(i), full => PhyRxBuff_Full(i),
+--    empty => PhyRxBuff_Empty(i),
+--	 rd_data_count => PhyRxBuff_RdCnt(i));
+--	 
+--end generate;
+
+
+Gen_RxBuffs : for i in 0 to 7 generate
+
+-- CRC generators for receive data CRC checking. 
+RxCRC : CRC32_D4 
+ port map(rst => RxCRCRst(i), clk => RxFMClk, crc_en => RdCRCEn(i), 
+			 data_in => PhyRx(i),
+			 crc_out => Rx_CRC_Out(i));
+
+
+
+
 
 -- FM receivers for FEB FM links
 FEBFMRx : FM_Rx
@@ -523,8 +716,17 @@ begin
 	 iCRS(i) <= '0'; iRxDV(i) <= "00"; 
 	 RdCRCEn(i) <= '0'; RxCRCRst(i) <= '1';
 	 StartCount(i) <= "000";
+	 PhyActivityCounter(i) <= (others => '0');
 
  elsif rising_edge(RxFMClk) then
+ 
+-- PhyActivityCounter
+   if PhyRxBuff_wreq(i) = '1' then 
+	    PhyActivityCounter(i) <= PhyActivityCounter(i) + 1;
+	else
+		 PhyActivityCounter(i) <= PhyActivityCounter(i);
+	end if;
+	     
 
 -- Synchronous edge detector for 25MHz PhyRx clock
 	RxClkDL(i)(0) <= RxClk(i);
@@ -605,6 +807,8 @@ end if;
 
 end process PhyRx_Proc;
 
+
+
 end generate;
 --Debug(2) <= PhyRxBuff_wreq(1);
 
@@ -619,10 +823,10 @@ begin
 
 Clk25MHz <= '0'; SMI_rdreq <= '0'; MDC <= "00"; 
 TxEn <= (others => '0'); Strt <= "01"; TA <= "10"; 
-R_W <= "01"; PhyAd <= "00000"; BitCount <= "00000";
+R_W <= "01"; PhyAd <= "00000"; BitCount <= (others => '0');
 SMIShift <= (others => '0'); SMIRdReg0 <= (others => '0');
 SMIRdReg1 <= (others => '0'); SMI_Shift <= Idle;
-TxNibbleCount <= "00"; PhyTx <= (others => X"0");
+TxNibbleCount <= "00";
 PhyTxBuff_rdreq <= '0'; TxEnAck <= '0'; PreambleTx <= '0';
 PreambleCnt <= "000"; Preamble <= X"00";
 
@@ -635,6 +839,10 @@ SPI_rdreq <= '0';
 elsif rising_edge (i50MHz) then 
 
 Clk25MHz <= not Clk25MHz; 
+
+
+
+
 
 -------------------- Logic for Phy MDIO serial control --------------------
 
@@ -686,14 +894,17 @@ end if;
 
 -- Serial bit counter
 if SMI_Shift = Load and BitCount = 0 and MDC(0) = '0'
-then BitCount <= "11111";
+--then BitCount <= "11111";
+then BitCount <= "100000";
 elsif BitCount /= 0 and SMI_Shift = Shift and MDC(0) = '0' then BitCount <= BitCount - 1;
 end if;
 
--- Send clocks as long as there is data waiting to go out
-if SMI_Empty = '0' then MDC <= not MDC;
-else MDC <= "00";
-end if;
+MDC <= not MDC;
+--if SMI_Shift /= Idle or SMI_Empty = '0' then
+--   MDC <= not MDC;
+--else 
+--   MDC <= "00"; 
+--end if;
 
 -- Clock in any readback data
 if R_W = "10" and SMI_Shift = Shift and BitCount /= 0 and MDC(0) = '0'
@@ -716,11 +927,20 @@ end if;
 
 -- TxEn is used to hold off sending Phy data until a block of data has been 
 -- loaded into the transmit FIFO
-if Clk25MHz = '0' and TxEnAck = '0' and TxEnReq = '1' and PhyTxBuff_Empty = '0' then TxEnAck <= '1';
-elsif PhyTxBuff_Empty = '1' and Clk25MHz = '0' then TxEnAck <= '0';
-else TxEnAck <= TxEnAck;
-end if;
+--if Clk25MHz = '0' and TxEnAck = '0' and TxEnReq = '1' and PhyTxBuff_Empty = '0' then TxEnAck <= '1';
+--elsif PhyTxBuff_Empty = '1' and Clk25MHz = '0' then TxEnAck <= '0';
+--else TxEnAck <= TxEnAck;
+--end if;
+                                
 
+if Clk25MHz = '0' and TxEnAck = '0' and TxEnReq = '1' and TxFifoHasData_sync = '1' then
+  TxEnAck <= '1';
+elsif Clk25MHz = '0' and TxFifoHasData_sync = '0' then
+  TxEnAck <= '0';
+else
+  TxEnAck <= TxEnAck;
+end if;
+                                
 -- Preamble: X"55",X"55",X"55",X"55",X"55",X"55",X"D5"
 -- Use PreambleTx signal to distinguish between preamble and data. When seven 
 -- bytes of preamble have been sent, start sending data
@@ -753,37 +973,85 @@ elsif Clk25MHz = '0' and PreambleCnt /= 5 then Preamble <= X"55";
 else Preamble <= Preamble;
 end if;
 
--- Multiplexer to choose which preamble nibble or which nibble
--- of the transmit data word goes to the Tx Outs
+
+-- add 1/7
+-- Multiplexer to choose nibble to Tx outs (unchanged)
 Case TxNibbleCount is
-	When "00" =>
-	if PreambleTx = '1' then TxReg <= Preamble(3 downto 0);
-	else TxReg <= PhyTxBuff_Out(3 downto 0);
-	end if;
-	When "01" =>
-	if PreambleTx = '1' then TxReg <= Preamble(7 downto 4);
-	else TxReg <= PhyTxBuff_Out(7 downto 4);
-	end if;
-	When "10" =>
-	if PreambleTx = '1' then TxReg <= Preamble(3 downto 0);
-	else TxReg <= PhyTxBuff_Out(11 downto 8);
-	end if;
-	When "11" =>
-	if PreambleTx = '1' then TxReg <= Preamble(7 downto 4);
-	else TxReg <= PhyTxBuff_Out(15 downto 12);
-	end if;
-	When others =>
-		TxReg <= TxReg;
+  When "00" =>
+    if PreambleTx = '1' then TxReg <= Preamble(3 downto 0);
+    else TxReg <= PhyTxBuff_Out(3 downto 0);
+    end if;
+  When "01" =>
+    if PreambleTx = '1' then TxReg <= Preamble(7 downto 4);
+    else TxReg <= PhyTxBuff_Out(7 downto 4);
+    end if;
+  When "10" =>
+    if PreambleTx = '1' then TxReg <= Preamble(3 downto 0);
+    else TxReg <= PhyTxBuff_Out(11 downto 8);
+    end if;
+  When "11" =>
+    if PreambleTx = '1' then TxReg <= Preamble(7 downto 4);
+    else TxReg <= PhyTxBuff_Out(15 downto 12);
+    end if;
+  When others =>
+    TxReg <= TxReg;
 end Case;
 
--- Time the transmit data w.r.t the 25MHz Tx clocks
-if Clk25MHz = '0' then PhyTx(0 to 3) <= (others => TxReg); 
-else PhyTx(0 to 3) <= PhyTx(0 to 3);
-end if;
+-- comment 1/7
+-- Multiplexer to choose which preamble nibble or which nibble
+-- of the transmit data word goes to the Tx Outs
+--Case TxNibbleCount is
+--	When "00" =>
+--	if PreambleTx = '1' then TxReg <= Preamble(3 downto 0);
+--	else TxReg <= PhyTxBuff_Out(3 downto 0);
+--	end if;
+--	When "01" =>
+--	if PreambleTx = '1' then TxReg <= Preamble(7 downto 4);
+--	else TxReg <= PhyTxBuff_Out(7 downto 4);
+--	end if;
+--	When "10" =>
+--	if PreambleTx = '1' then TxReg <= Preamble(3 downto 0);
+--	else TxReg <= PhyTxBuff_Out(11 downto 8);
+--	end if;
+--	When "11" =>
+--	if PreambleTx = '1' then TxReg <= Preamble(7 downto 4);
+--	else TxReg <= PhyTxBuff_Out(15 downto 12);
+--	end if;
+--	When others =>
+--		TxReg <= TxReg;
+--end Case;
+-- end comment 1/7
 
-if Clk25MHz = '0' then PhyTx(4 to 7) <= (others => TxReg);
-else PhyTx(4 to 7) <= PhyTx(4 to 7);
-end if;
+
+-- Time the transmit data w.r.t the 25MHz Tx clocks
+-- Gate the 4-bit nibble (TxReg) onto each PHY port when the corresponding
+-- TxEn bit is asserted. If a port is not enabled, drive an idle pattern.
+--if Clk25MHz = '0' then
+--  -- If AutoTx_Target is active (one-hot) or AutoTx_BroadcastMode asserted,
+--  -- limit drive to the target(s). Otherwise preserve pre-existing behavior.
+--  if AutoTx_Target /= (others => '0') or AutoTx_BroadcastMode = '1' then
+--    for i in 0 to 7 loop
+--      if TxEn(i) = '1' and (AutoTx_BroadcastMode = '1' or AutoTx_Target(i) = '1') then
+--        PhyTx(i) <= TxReg;
+--      else
+--        PhyTx(i) <= (others => '0');
+--      end if;
+--    end loop;
+--  else
+--    for i in 0 to 7 loop
+--      if TxEn(i) = '1' then
+--        PhyTx(i) <= TxReg;            -- PhyTx(i) is std_logic_vector(3 downto 0)
+--      else
+--        PhyTx(i) <= (others => '0');  -- idle when not enabled (safe default)
+--      end if;
+--    end loop;
+--  end if;
+--else
+--  -- keep outputs stable when clock high (explicit re-assignment avoids latches)
+--  for i in 0 to 7 loop
+--    PhyTx(i) <= PhyTx(i);
+--  end loop;
+--end if;
 
 -- When four nibbles have been sent, get the next word from the buffer
 if TxNibbleCount = 2 and Clk25MHz = '0' and PreambleTx = '0' then PhyTxBuff_rdreq <= '1'; 
@@ -861,7 +1129,365 @@ end if; -- CpldRst
 
 end process SMI_Proc;
 
+-- comment out 1/7
+--phy_out_gating : process(Clk25MHz)
+--  variable tgt : std_logic_vector(7 downto 0);
+--begin
+--  if falling_edge(Clk25MHz) then
+--    -- Determine single target mask for this transmit cycle.
+--    -- Priority:
+--    -- 1) If AutoTx_BroadcastMode = '1' then drive any TxEn bits (legacy broadcast).
+--    -- 2) Else if AutoTx_Target is non-zero use it (one-hot selected by AutoTx FSM).
+--    -- 3) Else select lowest-index set bit from TxEn (defensive: pick one port).
+--	if AutoTx_BroadcastMode = '1' then
+--      tgt := TxEn; -- broadcast mode: allow multiple ports (legacy)
+--    elsif not is_all_zero(AutoTx_Target) then
+--      tgt := AutoTx_Target;
+--    else
+--      -- pick lowest bit of TxEn
+--      tgt := "00000000";
+--      for i in 0 to 7 loop
+--        if TxEn(i) = '1' then
+--          tgt := "00000000";
+--          tgt(i) := '1';
+--          exit;
+--        end if;
+--      end loop;
+--    end if;
+--
+--    -- Optionally capture target into a register visible elsewhere
+--    CurrentTarget <= tgt;
+--
+--    -- Drive PHY outputs: only the chosen target(s) get the nibble
+--    for i in 0 to 7 loop
+--      if tgt(i) = '1' then
+--        PhyTx(i) <= TxReg;
+--      else
+--        PhyTx(i) <= ZERO4;
+--      end if;
+--    end loop;
+--  end if;
+--end process;
+-- end comment from 1/7
+
+-- Deterministic transmit gating: hold selected target for exactly 4 nibbles
+phy_out_gating : process(Clk25MHz)
+  variable tgt_candidate : std_logic_vector(7 downto 0);
+  variable lowest_mask   : std_logic_vector(7 downto 0);
+begin
+  if falling_edge(Clk25MHz) then
+    if AutoTx_BroadcastMode = '1' then
+      tgt_candidate := TxEn;
+    elsif not is_all_zero(AutoTx_Target) then
+      tgt_candidate := AutoTx_Target;
+    else
+      lowest_mask := ZERO8;
+      for i in 0 to 7 loop
+        if TxEn(i) = '1' then
+          lowest_mask := ZERO8;
+          lowest_mask(i) := '1';
+          exit;
+        end if;
+      end loop;
+      tgt_candidate := lowest_mask;
+    end if;
+
+    if PhyTxBuff_rdreq = '1' then
+      if AutoTx_BroadcastMode = '1' then
+        TxTarget_hold <= TxEn;
+      else
+        TxTarget_hold <= tgt_candidate;
+      end if;
+      nibble_hold_cnt <= 4;
+    end if;
+
+    if nibble_hold_cnt > 0 then
+      CurrentTarget <= TxTarget_hold;
+      nibble_hold_cnt <= nibble_hold_cnt - 1;
+      if nibble_hold_cnt = 0 then
+        TxTarget_hold <= ZERO8;
+      end if;
+    else
+      CurrentTarget <= tgt_candidate;
+    end if;
+
+    for i in 0 to 7 loop
+      if CurrentTarget(i) = '1' then
+        PhyTx(i) <= TxReg;
+      else
+        PhyTx(i) <= ZERO4;
+      end if;
+    end loop;
+  end if;
+end process;
+
 SPIMOSI <= SPI_Shift(15);
+
+-------------------------------------------------------------------------------
+-- uC write decode: manual kick + TX FIFO reset + optional control
+-------------------------------------------------------------------------------
+uC_decode_proc : process(SysClk)
+begin
+  if rising_edge(SysClk) then
+    -- Manual AutoTx kick (one-cycle pulse on req; retain mask)
+    if (WRDL = 1) and (uCA(11 downto 10) = GA) and (uCA(9 downto 0) = AutoTxKickAddr) then
+      AutoTx_kick_req  <= '1';
+      AutoTx_kick_mask <= uCD(7 downto 0);
+    else
+      AutoTx_kick_req  <= '0';
+      AutoTx_kick_mask <= AutoTx_kick_mask;
+    end if;
+
+    -- TX FIFO reset pulse
+    if (WRDL = 1) and (uCA(11 downto 10) = GA) and (uCA(9 downto 0) = TxFifoResetAddr) then
+      PhyTxBuff_rst_pulse <= '1';
+    else
+      PhyTxBuff_rst_pulse <= '0';
+    end if;
+    -- Optional control register (store bits if needed)
+    if (WRDL = 1) and (uCA(11 downto 10) = GA) and (uCA(9 downto 0) = TxFifoCtrlAddr) then
+      -- e.g., latch uCD(3 downto 0) into a local control signal for future features
+      -- TxFifoCtrl <= uCD(3 downto 0);
+      null;
+    end if;
+  end if;
+end process;
+
+-- Stretch/reset connection (combine with your existing reset)
+PhyTxBuff_rst <= ResetHi or PhyTxBuff_rst_pulse;-- or GlobalReset;
+
+-------------------------------------------------------------------------------
+-- Ack gate improvement:
+-- 
+-- use synchronized “has data” instead of raw empty Add this small synchronizer (SysClk domain), using the write-side count from the FIFO:
+-------------------------------------------------------------------------------
+has_data_sync_proc : process(SysClk)
+  variable wr_cnt_u : unsigned(10 downto 0);
+begin
+  if rising_edge(SysClk) then
+    wr_cnt_u := unsigned(PhyTxBuff_Count);
+    if wr_cnt_u > to_unsigned(PHYTX_RESERVED_SLOTS, 11) then
+      TxFifoHasData_meta <= '1';
+    else
+      TxFifoHasData_meta <= '0';
+    end if;
+    TxFifoHasData_sync <= TxFifoHasData_meta;
+  end if;
+end process;
+
+-- Wherever you currently compute TxEnAck_next, qualify with TxFifoHasData_sync:
+-- Example (adjust to your SMI/CSR logic):
+-- TxEnAck_next <= '1' when (TxEnReq = '1' and TxFifoHasData_sync = '1') else '0';
+
+
+AutoTx_Proc : process(SysClk, CpldRst)  variable p : integer;  
+  variable found_port : integer range 0 to 7;
+  variable have_port : boolean;
+  variable occ : integer;
+  variable buf_flag : std_logic;
+ begin
+  if CpldRst = '0' then
+    PhyTxDin_FPGA      <= (others => '0');
+    PhyTxWrReq_FPGA    <= '0';
+    AutoTx_State       <= "00";
+    AutoTx_Port        <= 0;
+    AutoTx_WordIdx     <= 0;
+    AutoTx_WordPending <= '0';
+    AutoTx_Claim       <= X"00";  -- ensure claim is deasserted on reset
+	 AutoTx_Target      <= ZERO8;
+  elsif rising_edge(SysClk) then
+    -- default: clear any claim every cycle; set one-hot when we actually claim
+    AutoTx_Claim <= X"00";
+	 PhyTxWrReq_FPGA <= '0';
+    if AutoTx_WordPending = '1' then
+      AutoTx_WordPending <= '0';
+    end if;
+
+    -- compute current PhyTx FIFO occupancy and buffer-full hint
+    occ := to_integer(unsigned(PhyTxBuff_Count));
+    if occ >= (PHYTX_FIFO_DEPTH - PHYTX_RESERVED_SLOTS) then
+      buf_flag := '1';
+    else
+      buf_flag := '0';
+    end if;
+
+-- comment on 1.7
+    -- Default single-cycle pulse behavior: ensure FPGA single-cycle writes
+--    if AutoTx_WordPending = '1' then
+--      PhyTxWrReq_FPGA <= '0';
+--      AutoTx_WordPending <= '0';
+--    else
+--      PhyTxWrReq_FPGA <= '0';
+--    end if;
+--
+--    case AutoTx_State is
+--      when "00" =>  -- Idle: find a port with ReadyStatus set
+--        found_port := 0;
+--        have_port := false;
+--        for p in 0 to 7 loop
+--          if ReadyStatus(p) = '1' then
+--            found_port := p;
+--            have_port := true;
+--            exit;
+--          end if;
+--        end loop;
+--
+--        -- Allow start when occupancy is <= threshold so READY packet may be sent with buf_flag asserted.
+--        if have_port and occ <= (PHYTX_FIFO_DEPTH - PHYTX_RESERVED_SLOTS) then
+--          AutoTx_Port <= found_port;
+--          AutoTx_WordIdx <= 0;
+--          AutoTx_Claim(found_port) <= '1';  -- request main to clear ReadyStatus next cycle
+--          -- set AutoTx_Target so only the selected PHY receives the READY packet
+--          AutoTx_Target <= "00000000";
+--          AutoTx_Target(found_port) <= '1';
+--			 
+--          AutoTx_State <= "01";
+--        end if;
+--
+--      when "01" =>  -- Sending: issue words one at a time
+--        -- Recompute occupancy and buf_flag right before attempting each word
+--        occ := to_integer(unsigned(PhyTxBuff_Count));
+--        if occ >= (PHYTX_FIFO_DEPTH - PHYTX_RESERVED_SLOTS) then
+--          buf_flag := '1';
+--        else
+--          buf_flag := '0';
+--        end if;
+--
+--        -- only attempt to queue a word if FIFO not full and we don't have a pending single-cycle pulse
+--        if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0' then
+--          -- prepare the next word to send, include buf_flag in packet word
+--          PhyTxDin_FPGA <= ready_packet_word(AutoTx_Port, AutoTx_WordIdx, buf_flag);
+--          PhyTxWrReq_FPGA <= '1';         -- pulse for one cycle (cleared by top of proc next cycle)
+--          AutoTx_WordPending <= '1';      -- indicate we must clear the pulse next cycle
+--
+--          -- increment index for next word
+--			 if AutoTx_WordIdx + 1 >= READY_WORD_COUNT then
+--            -- last word queued; return to idle on next cycle
+--            AutoTx_State <= "00";
+--            AutoTx_WordIdx <= 0;
+--            -- clear AutoTx target once we've queued the final READY word
+--            AutoTx_Target <= "00000000";
+--          else
+--            AutoTx_WordIdx <= AutoTx_WordIdx + 1;
+--            AutoTx_State <= "01";
+--          end if;
+--        else
+--          -- wait until FIFO has room or previous pulse clears
+--          AutoTx_State <= "01";
+--        end if;
+--
+--      when others =>
+--        AutoTx_State <= "00";
+		  -- end comment 1/7
+		  
+		  -- comment 1/9
+--		  case AutoTx_State is
+--      when "00" =>
+--        found_port := 0; have_port := false;
+--        for p in 0 to 7 loop
+--          if ReadyStatus(p) = '1' then
+--            found_port := p; have_port := true; exit;
+--          end if;
+--        end loop;
+--        if have_port and occ <= (PHYTX_FIFO_DEPTH - PHYTX_RESERVED_SLOTS) then
+--          AutoTx_Port    <= found_port;
+--          AutoTx_WordIdx <= 0;
+--          AutoTx_Claim(found_port) <= '1';
+--          AutoTx_Target <= ZERO8;
+--          AutoTx_Target(found_port) <= '1';
+--          AutoTx_State <= "01";
+--        end if;
+--      when "01" =>
+--        occ := to_integer(unsigned(PhyTxBuff_Count));
+--        if occ >= (PHYTX_FIFO_DEPTH - PHYTX_RESERVED_SLOTS) then
+--          buf_flag := '1';
+--        else
+--          buf_flag := '0';
+--        end if;
+--
+--        if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0' then
+--          PhyTxDin_FPGA   <= ready_packet_word(AutoTx_Port, AutoTx_WordIdx, buf_flag);
+--          PhyTxWrReq_FPGA <= '1';
+--          AutoTx_WordPending <= '1';
+--          if AutoTx_WordIdx + 1 >= READY_WORD_COUNT then
+--            AutoTx_State    <= "00";
+--            AutoTx_WordIdx  <= 0;
+--            AutoTx_Target   <= ZERO8;
+--          else
+--            AutoTx_WordIdx <= AutoTx_WordIdx + 1;
+--            AutoTx_State   <= "01";
+--          end if;
+--        end if;
+--      when others =>
+--        AutoTx_State <= "00";
+--    end case;
+--  end if;
+-- end comment 1/9
+
+-- new 1/9
+-- Inside AutoTx_Proc rising_edge(SysClk):
+
+case AutoTx_State is
+  when "00" =>
+    -- Manual kick has priority over RX-derived ReadyStatus
+    if AutoTx_kick_req = '1' and PhyTxBuff_Full = '0' and PhyTxBuff_wreq = '0' then
+      -- Choose the lowest set bit in the kick mask
+      found_port := 0; have_port := false;
+      for p in 0 to 7 loop
+        if AutoTx_kick_mask(p) = '1' then
+          found_port := p; have_port := true; exit;
+        end if;
+      end loop;
+      if have_port then
+        AutoTx_Port        <= found_port;
+        AutoTx_WordIdx     <= 0;
+        AutoTx_Claim       <= X"00";        -- no ReadyStatus to clear for manual kick
+        -- Optional: gate TX to chosen port by setting AutoTx_Target one-hot
+        AutoTx_Target      <= (others => '0');
+        AutoTx_Target(found_port) <= '1';
+        AutoTx_State       <= "01";
+      end if;
+
+    else
+      -- Original ReadyStatus-driven start (as you have now)
+      found_port := 0; have_port := false;
+      for p in 0 to 7 loop
+        if ReadyStatus(p) = '1' then
+          found_port := p; have_port := true; exit;
+        end if;
+      end loop;
+      if have_port and PhyTxBuff_Full = '0' and PhyTxBuff_wreq = '0' then
+        AutoTx_Port        <= found_port;
+        AutoTx_WordIdx     <= 0;
+        AutoTx_Claim(found_port) <= '1';
+        -- Optional gating:
+        AutoTx_Target      <= (others => '0');
+        AutoTx_Target(found_port) <= '1';
+        AutoTx_State       <= "01";
+      end if;
+    end if;
+
+  when "01" =>
+    -- Your existing UBT queuing logic (defer to uC writes; queue ubt_ascii_word; advance index)
+    if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0' and PhyTxBuff_wreq = '0' then
+      PhyTxDin_FPGA      <= ubt_ascii_word(AutoTx_WordIdx, '1');
+      PhyTxWrReq_FPGA    <= '1';
+      AutoTx_WordPending <= '1';
+      if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
+        AutoTx_State   <= "00";
+        AutoTx_WordIdx <= 0;
+        AutoTx_Target  <= (others => '0');  -- release gating
+      else
+        AutoTx_WordIdx <= AutoTx_WordIdx + 1;
+        AutoTx_State   <= "01";
+      end if;
+    end if;
+
+  when others =>
+    AutoTx_State <= "00";
+end case;
+end if;
+end process;
 
 ----------------------- 100 Mhz clocked logic -----------------------------
 
@@ -907,10 +1533,36 @@ main : process(SysClk, CpldRst)
 	DReqFMDL <= X"0"; LinkFIFOStat <= '0';
 	LinkStatEn <= '1';
 	LinkTxFullCnt <= X"00";
+	tx_overflow <= '0';
+	tx_overflow_cnt <= (others => '0');
+	--tx_word_cnt <= (others => '0');
+	word_number <= (others => '0');
+	EvWdCountTot <= (others => '0');
+	ReadyStatus <= (others => '0');
 --Debug(10 downto 8) <= (others => '0'); 
 
 elsif rising_edge (SysClk) then 
 
+    for p in 0 to 7 loop
+      -- two-stage sample of FIFO empty flag for safe edge detection
+      phy_empty_d(p)(1) <= phy_empty_d(p)(0);
+      phy_empty_d(p)(0) <= PhyRxBuff_Empty(p);
+
+      -- rising edge detected: PhyRxBuff became empty (0 -> 1)
+      if phy_empty_d(p)(0) = '1' and phy_empty_d(p)(1) = '0' then
+        if ReadyStatus(p) = '0' then
+          ReadyStatus(p) <= '1';   -- latch that port is ready for new data
+          --ReadyIRQ <= '1';         -- single-cycle pulse; clear below
+        end if;
+      end if;
+
+	-- comment out 1/7
+		--if not is_all_zero(PhyRxBuff_RdCnt(p)) then
+		--	ReadyStatus(p) <= '0';
+		--end if;
+    end loop;
+
+   
 -- Synchronous edge detectors for read and write strobes
 RDDL(0) <= not uCRD and not CpldCS;
 RDDL(1) <= RDDL(0); 
@@ -918,10 +1570,29 @@ RDDL(1) <= RDDL(0);
 WRDL(0) <= not uCWR and not CpldCS;
 WRDL(1) <= WRDL(0);
 
+debug_ReadyStatus <= ReadyStatus;
+
 -- Latch the address for post increment during reads
 if RDDL = 1 or WRDL = 1 then AddrReg <= uCA;
 else AddrReg <= AddrReg;
 end if;
+
+-- clear ReadyStatus bits requested by AutoTx (AutoTx_Claim is single-writer from AutoTx_Proc)
+--if AutoTx_Claim /= (others => '0') then
+--  ReadyStatus <= ReadyStatus and (not AutoTx_Claim);
+--else
+--  ReadyStatus <= ReadyStatus;
+--end if;
+-- clear ReadyStatus bits requested by AutoTx (AutoTx_Claim is single-writer from AutoTx_Proc)
+if AutoTx_Claim /= X"00" then
+  ReadyStatus <= ReadyStatus and (not AutoTx_Claim);
+end if;
+
+-- clear ReadyStatus on microcontroller read of the ReadyStatus register
+if RDDL = 2 and AddrReg(11 downto 10) = GA and AddrReg(9 downto 0) = ReadyStatusAddr then
+  ReadyStatus <= (others => '0');
+end if;
+       
 
 -- 1us time base
 if Counter1us /= Count1us then Counter1us <= Counter1us + 1;
@@ -1005,6 +1676,11 @@ then PhyTxBuff_wreq <= '1';
 else PhyTxBuff_wreq <= '0';
 end if;
 
+-- Clear ReadyStatus bits by writing 1s in the lower byte of uCD
+if WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = ReadyClearAddr then
+  ReadyStatus <= ReadyStatus and (not uCD(7 downto 0));
+end if;
+
 -- When at least one packet has bee received, examine it. If it is a trigger request packet,
 -- Start the data transfer from DRAM to the serial link transmitter
 if DatReqBuff_Count > 8 and DDR_Read_Seq = Idle then DatReqBuff_rdreq <= '1';
@@ -1018,14 +1694,14 @@ elsif TrigWdCount = 8 or TrigWdCntRst = '1' then TrigWdCount <= X"0";
 else TrigWdCount <= TrigWdCount;
 end if;
 
-if TrigWdCount = 1 and DatReqBuff_Out(7 downto 4) = 2
- then TrigReqCount <= TrigReqCount + 1;
-elsif TrigReqCount /= 0 
-		and (DDR_Read_Seq = RdDataHi or DDR_Read_Seq = RdDataLo) and EvWdCount = 0 
- then TrigReqCount <= TrigReqCount - 1;
-elsif TrigWdCntRst = '1' then TrigReqCount <= X"00";
-else TrigReqCount <= TrigReqCount;
-end if;
+--if TrigWdCount = 1 and DatReqBuff_Out(7 downto 4) = 2
+-- then TrigReqCount <= TrigReqCount + 1;
+--elsif TrigReqCount /= 0 
+--		and (DDR_Read_Seq = RdDataHi or DDR_Read_Seq = RdDataLo) and EvWdCount = 0 
+-- then TrigReqCount <= TrigReqCount - 1;
+--elsif TrigWdCntRst = '1' then TrigReqCount <= X"00";
+--else TrigReqCount <= TrigReqCount;
+--end if;
 
 if WRDL = 1 and ((uCA(11 downto 10) = GA and uCA(9 downto 0) = CSRRegAddr)
 					or (uCA(9 downto 0) = CSRBroadCastAd))
@@ -1153,11 +1829,20 @@ end if;
  if WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = TxEnMaskAd
    then TxEnMask <= uCD(7 downto 0);
   else TxEnMask <= TxEnMask;
- end if;
+ end if;-- In main process, decode writes to AutoTxKickAddr (use GA match)
+
+
+if WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = AutoTxKickAddr then
+  AutoTx_kick_req  <= '1';
+  AutoTx_kick_mask <= uCD(7 downto 0);  -- lower byte selects target(s); one-hot recommended
+else
+  AutoTx_kick_req  <= '0';
+  AutoTx_kick_mask <= AutoTx_kick_mask;
+end if;
 
 -------------------------------- DDR Macro Interfaces -------------------------------
 
--- Read_Seq_FSM is (Idle,Wait0,SetAddr,CheckEmpty,FirstCmd,CheckRdBuff0,RdWdCount,
+-- Read_Seq_FSM is (Idle,Wait0,SetAddr,CheckEmpty,FirstCmd,CheckRdBuff0,RdWdCount,CheckWdCount,PrepareWordCnt,
 -- CheckRdBuff1,RdDataHi,RdDataLo
 case DDR_Read_Seq is
 	When Idle => DDRRdStat <= "000"; --Debug(10 downto 8) <= "000";
@@ -1191,10 +1876,14 @@ case DDR_Read_Seq is
 			else DDR_Read_Seq <= CheckRdBuff0;
 			end if;
 	When RdWdCount => DDRRdStat <= "100"; --Debug(10 downto 8) <= "100";
-				  if RdHi_LoSel = '0'
-				 then DDR_Read_Seq <= RdDataHi;
-			    else DDR_Read_Seq <= RdDataLo;
-				end if;
+	    DDR_Read_Seq <= CheckWdCount;
+	When CheckWdCount => DDRRdStat <= "100";
+	    DDR_Read_Seq <= PrepareWordCnt;
+	When PrepareWordCnt => DDRRdStat <= "100";
+			if RdHi_LoSel = '0'
+			then DDR_Read_Seq <= RdDataHi;
+			else DDR_Read_Seq <= RdDataLo;
+			end if;
 	When CheckRdBuff1 => DDRRdStat <= "101"; --Debug(10 downto 8) <= "101";
 		if SDrd_empty = '0' then DDR_Read_Seq <= RdDataHi;
 		else DDR_Read_Seq <= CheckRdBuff1;
@@ -1235,13 +1924,26 @@ end case;
  end if;
 Debug(1) <= DReqFM;
 
-	if DDR_Read_Seq = RdWdCount and RdHi_LoSel = '0' then EvWdCount <= SDRdDat(29 downto 16) + 1;
-elsif DDR_Read_Seq = RdWdCount and RdHi_LoSel = '1' then EvWdCount <= SDRdDat(13 downto 0) + 1;
+	if DDR_Read_Seq = RdWdCount and RdHi_LoSel = '0' then EvWdCount <= SDRdDat(31 downto 16) + 1;
+elsif DDR_Read_Seq = RdWdCount and RdHi_LoSel = '1' then EvWdCount <= SDRdDat(15 downto 0) + 1;
+elsif DDR_Read_Seq = CheckWdCount and EvWdCount > MAX_TX_WORDS then EvWdCount <= MAX_TX_WORDS + 1;
 elsif EvWdCount /= 0 and (DDR_Read_Seq = RdDataHi or (DDR_Read_Seq = RdDataLo and SDrd_en = '1'))
    then EvWdCount <= EvWdCount - 1;
 	elsif DDRRd_en = '0' then EvWdCount <= (others => '0');
 else EvWdCount <= EvWdCount;
 end if;
+
+if DDR_Read_Seq = PrepareWordCnt and EvWdCount > MAX_TX_WORDS then 
+    tx_overflow <= '1';
+	 tx_overflow_cnt <= tx_overflow_cnt + 1;
+elsif DDR_Read_Seq = PrepareWordCnt and EvWdCount <= MAX_TX_WORDS then 
+    tx_overflow <= '0';
+	 tx_overflow_cnt <= tx_overflow_cnt;
+else 
+    tx_overflow <= tx_overflow;
+	 tx_overflow_cnt <= tx_overflow_cnt;
+end if;
+
 
 -- DDR Read address register
 -- Microcontroller access upper
@@ -1357,13 +2059,53 @@ end if;
 
 --if DDR_Write_Seq = Idle then Debug(2) <= '1'; else  Debug(2) <= '0'; end if;
 
+-- Track word position
+if DDR_Read_Seq = PrepareWordCnt then 
+    --tx_word_cnt <= (others => '0');  -- Reset at start of event
+	 word_number <= "01";
+elsif EvWdCount /= 0 and (DDR_Read_Seq = RdDataHi or (DDR_Read_Seq = RdDataLo and SDrd_en = '1')) 
+    then 
+	 -- tx_word_cnt <= tx_word_cnt + 1;
+	 word_number(0) <= '0';
+	 word_number(1 downto 1) <= word_number(0 downto 0);
+else 
+    --tx_word_cnt <= tx_word_cnt;
+	 word_number <= word_number;
+end if;
+
+if DDR_Read_Seq = PrepareWordCnt then
+    EvWdCountTot <= EvWdCount - 1; -- EvWdCountTot goes to the header, the +1 is needed for state machine
+else
+    EvWdCountTot <= EvWdCountTot;
+end if;
+
 -- Serial link transmit data
-   if Link_Stat_Req = '0' and DDR_Read_Seq = RdDataHi 
-		then LinkFIFO_Dat(17 downto 9) <= '1' & SDRdDat(31 downto 24);
-			   LinkFIFO_Dat(8 downto 0) <= '1' & SDRdDat(23 downto 16);
-elsif Link_Stat_Req = '0' and DDR_Read_Seq = RdDataLo 
-	then LinkFIFO_Dat(17 downto 9) <= '1' & SDRdDat(15 downto 8);
-		   LinkFIFO_Dat(8 downto 0) <= '1' & SDRdDat(7 downto 0);
+if Link_Stat_Req = '0' and DDR_Read_Seq = RdDataHi then
+    --if tx_word_cnt = 1 and tx_overflow = '1' then
+	 if word_number(0) = '1' then
+	     LinkFIFO_Dat(17 downto 9) <= '1' & EvWdCountTot(15 downto 8);
+        LinkFIFO_Dat(8 downto 0)  <= '1' & EvWdCountTot( 7 downto 0);	 
+	 elsif word_number(1) = '1' and tx_overflow = '1' then
+        LinkFIFO_Dat(17 downto 9) <= '1' & (SDRdDat(31 downto 24) or OVERFLOW_STATUS_BIT(15 downto 8));
+        LinkFIFO_Dat(8 downto 0) <= '1' &  (SDRdDat(23 downto 16) or OVERFLOW_STATUS_BIT( 7 downto 0));
+		  --LinkFIFO_Dat(8 downto 0) <= '1' & OVERFLOW_STATUS_BIT; 
+	 else
+        LinkFIFO_Dat(17 downto 9) <= '1' & SDRdDat(31 downto 24);
+        LinkFIFO_Dat(8 downto 0) <= '1' & SDRdDat(23 downto 16);
+	 end if;
+elsif Link_Stat_Req = '0' and DDR_Read_Seq = RdDataLo then 
+    --if tx_word_cnt = 1 and tx_overflow = '1' then
+	 if word_number(0) = '1' then
+	     LinkFIFO_Dat(17 downto 9) <= '1' & EvWdCountTot(15 downto 8);
+        LinkFIFO_Dat(8 downto 0)  <= '1' & EvWdCountTot( 7 downto 0);
+	 elsif word_number(1) = '1' and tx_overflow = '1' then
+        LinkFIFO_Dat(17 downto 9) <= '1' & (SDRdDat(15 downto 8) or OVERFLOW_STATUS_BIT(15 downto 8));
+		  LinkFIFO_Dat(8 downto 0) <= '1' &   (SDRdDat(7 downto 0) or OVERFLOW_STATUS_BIT( 7 downto 0));
+		  --LinkFIFO_Dat(8 downto 0) <= '1' & OVERFLOW_STATUS_BIT;
+    else
+	     LinkFIFO_Dat(17 downto 9) <= '1' & SDRdDat(15 downto 8);
+		  LinkFIFO_Dat(8 downto 0) <= '1' & SDRdDat(7 downto 0);
+    end if;
 elsif Link_Stat_Req = '1' then LinkFIFO_Dat <= '0' & X"00" & '0' & Rx_active;
 else LinkFIFO_Dat(17 downto 9) <= '1' & uCD(15 downto 8);
 	   LinkFIFO_Dat(8 downto 0) <= '1' & uCD(7 downto 0);
@@ -1524,16 +2266,32 @@ end if;
 	end if;
 
 -- "OR" the status bits from the FEBs and compare the first microbunch to any additional microbunches.
-if DDR_Write_Seq = Idle then EventStat(7 downto 0) <= (others => '0'); 
-elsif	DDR_Write_Seq = Rd_Stat then EventStat(7 downto 0) <= EventStat(7 downto 0) or PhyRxBuff_Out(PortNo)(7 downto 0);
+-- EventStat
+-- bit 0 to 7: indicate error on port
+-- bit 8 to 10: what error(s)
+-- bit 11: uB mismatch between ports
+
+if DDR_Write_Seq = Idle then EventStat <= (others => '0'); 
+elsif	DDR_Write_Seq = Rd_Stat then
+    -- OR each EventStat bit with the corresponding 4-bit group
+	 EventStat(PortNo) <= PhyRxBuff_Out(PortNo)(0)  or PhyRxBuff_Out(PortNo)(1)  or PhyRxBuff_Out(PortNo)(2)  or PhyRxBuff_Out(PortNo)(3) or
+	                      PhyRxBuff_Out(PortNo)(4)  or PhyRxBuff_Out(PortNo)(5)  or PhyRxBuff_Out(PortNo)(6)  or PhyRxBuff_Out(PortNo)(7) or
+                         PhyRxBuff_Out(PortNo)(8)  or PhyRxBuff_Out(PortNo)(9)  or PhyRxBuff_Out(PortNo)(10) or PhyRxBuff_Out(PortNo)(11) or
+                         PhyRxBuff_Out(PortNo)(12) or PhyRxBuff_Out(PortNo)(13) or PhyRxBuff_Out(PortNo)(14) or PhyRxBuff_Out(PortNo)(15);								 
+	 EventStat(8)  <= EventStat(8) or PhyRxBuff_Out(PortNo)(3)  or PhyRxBuff_Out(PortNo)(2)  or PhyRxBuff_Out(PortNo)(1)  or PhyRxBuff_Out(PortNo)(0);
+	 EventStat(9)  <= EventStat(9) or PhyRxBuff_Out(PortNo)(7)  or PhyRxBuff_Out(PortNo)(6)  or PhyRxBuff_Out(PortNo)(5)  or PhyRxBuff_Out(PortNo)(4)
+	                              or PhyRxBuff_Out(PortNo)(11) or PhyRxBuff_Out(PortNo)(10) or PhyRxBuff_Out(PortNo)(9)  or PhyRxBuff_Out(PortNo)(8);
+	 EventStat(10) <= EventStat(10) or PhyRxBuff_Out(PortNo)(15) or PhyRxBuff_Out(PortNo)(14) or PhyRxBuff_Out(PortNo)(13) or PhyRxBuff_Out(PortNo)(12);
+    EventStat(15 downto 11) <= EventStat(15 downto 11); -- Keep upper bits unchanged
 elsif FirstActive = '0' then
 	 if (DDR_Write_Seq = Rd_uBunchHi and uBunch(31 downto 16) /= PhyRxBuff_Out(PortNo))
 	 or (DDR_Write_Seq = Rd_uBunchLo and uBunch(15 downto 0) /= PhyRxBuff_Out(PortNo))
-	  then  EventStat(7 downto 0) <= EventStat(7 downto 0) or X"01"; 
+	  then  -- EventStat(7 downto 0) <= EventStat(7 downto 0) or UB_MISMATCH_STATUS_BIT; 
+	      EventStat(11) <= EventStat(11) or '1';
 	 end if;
-else EventStat(7 downto 0) <= EventStat(7 downto 0);
+else EventStat(15 downto 0) <= EventStat(15 downto 0);
 end if;
-EventStat(15 downto 8) <= Rx_active;
+--EventStat(15 downto 8) <= Rx_active;
 
 -- Toggle between upper and lower words during writes to the DDR
     if (WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = SDRamWrtPtrLoAd)
@@ -1565,6 +2323,8 @@ end if;
   then PhyRxBuff_RdStat(i) <= '1';
   else PhyRxBuff_RdStat(i) <= '0';
  end if;
+ 
+ 
 
 end loop;
 
@@ -1716,10 +2476,12 @@ end process main;
 
 DDRRd_Mux <= SDRdDat(31 downto 16) when RdHi_LoSel = '0' else SDRdDat(15 downto 0);
 
+
 with uCA(9 downto 0) select
 
-iCD <= X"0" & '0' & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En & '0' 
-				& FMRxEn & not PhyPDn & '0' & RxBuffRst when CSRRegAddr,
+-- did I mess up these bits? Check what it used to be? *First worry about size of design
+iCD <= "00000" & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En & "0" 
+				& FMRxEn & (not PhyPDn) & "0" & RxBuffRst when CSRRegAddr,
 		 X"00" & MaskReg when InputMaskAddr,
 		 UpTimeStage(31 downto 16) when UpTimeRegAddrHi,
 		 UpTimeStage(15 downto 0) when UpTimeRegAddrLo,
@@ -1736,16 +2498,16 @@ iCD <= X"0" & '0' & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En &
 		 X"0" & "00" & SDrd_empty & SDrd_full & SDcmd_empty(1) & SDcmd_full(1) 
 						 & SDwr_empty & SDwr_full & SDcmd_empty(0) & SDcmd_full(0) 
 		 & SDCalDn & SD_RstO when DDRStatAddr,
-		 SMIRdReg0 when SMIRdDataAd0,
+	    SMIRdReg0 when SMIRdDataAd0,
 		 SMIRdReg1 when SMIRdDataAd1,
-		 "000" & PhyRxBuff_RdCnt(0) when PhyRxWdUsedRdAddr(0),
-		 "000" & PhyRxBuff_RdCnt(1) when PhyRxWdUsedRdAddr(1),
-		 "000" & PhyRxBuff_RdCnt(2) when PhyRxWdUsedRdAddr(2),
-		 "000" & PhyRxBuff_RdCnt(3) when PhyRxWdUsedRdAddr(3),
-		 "000" & PhyRxBuff_RdCnt(4) when PhyRxWdUsedRdAddr(4),
-		 "000" & PhyRxBuff_RdCnt(5) when PhyRxWdUsedRdAddr(5),
-		 "000" & PhyRxBuff_RdCnt(6) when PhyRxWdUsedRdAddr(6),
-		 "000" & PhyRxBuff_RdCnt(7) when PhyRxWdUsedRdAddr(7),
+		 "0000" & PhyRxBuff_RdCnt(0) when PhyRxWdUsedRdAddr(0),
+		 "0000" & PhyRxBuff_RdCnt(1) when PhyRxWdUsedRdAddr(1),
+		 "0000" & PhyRxBuff_RdCnt(2) when PhyRxWdUsedRdAddr(2),
+		 "0000" & PhyRxBuff_RdCnt(3) when PhyRxWdUsedRdAddr(3),
+		 "0000" & PhyRxBuff_RdCnt(4) when PhyRxWdUsedRdAddr(4),
+		 "0000" & PhyRxBuff_RdCnt(5) when PhyRxWdUsedRdAddr(5),
+		 "0000" & PhyRxBuff_RdCnt(6) when PhyRxWdUsedRdAddr(6),
+		 "0000" & PhyRxBuff_RdCnt(7) when PhyRxWdUsedRdAddr(7),
 		 PhyRxBuff_Out(0) when PhyRxRdAddr(0),
 		 PhyRxBuff_Out(1) when PhyRxRdAddr(1),
 		 PhyRxBuff_Out(2) when PhyRxRdAddr(2),
@@ -1753,7 +2515,7 @@ iCD <= X"0" & '0' & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En &
 		 PhyRxBuff_Out(4) when PhyRxRdAddr(4),
 		 PhyRxBuff_Out(5) when PhyRxRdAddr(5),		 
 		 PhyRxBuff_Out(6) when PhyRxRdAddr(6),
-		 PhyRxBuff_Out(7) when PhyRxRdAddr(7),
+	    PhyRxBuff_Out(7) when PhyRxRdAddr(7),
 		 X"00" & Rx_active when FEBFMActiveAD,
 		 FEBRxBuff_Out(0) when FEBFMRdAddr(0),
 		 FEBRxBuff_Out(1) when FEBFMRdAddr(1),
@@ -1769,7 +2531,7 @@ iCD <= X"0" & '0' & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En &
 		 X"0" & '0' & FMRxBuff_Count(3) when FEBFMWdsUsedAddr(3),
 		 X"0" & '0' & FMRxBuff_Count(4) when FEBFMWdsUsedAddr(4),
 		 X"0" & '0' & FMRxBuff_Count(5) when FEBFMWdsUsedAddr(5),
-		 X"0" & '0' & FMRxBuff_Count(6) when FEBFMWdsUsedAddr(6),
+    	 X"0" & '0' & FMRxBuff_Count(6) when FEBFMWdsUsedAddr(6),
 		 X"0" & '0' & FMRxBuff_Count(7) when FEBFMWdsUsedAddr(7),
 		 FEBRxBuff_Full & FEBRxBuff_Empty when FMRxStatAddr,
 		 Rx_CRC_Out(0)(31 downto 16) when RdCRCAddr(0),
@@ -1777,7 +2539,7 @@ iCD <= X"0" & '0' & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En &
 		 Rx_CRC_Out(1)(31 downto 16) when RdCRCAddr(2),
 		 Rx_CRC_Out(1)(15 downto 0)  when RdCRCAddr(3),
 		 Rx_CRC_Out(2)(31 downto 16) when RdCRCAddr(4),
-		 Rx_CRC_Out(2)(15 downto 0)  when RdCRCAddr(5),
+    	 Rx_CRC_Out(2)(15 downto 0)  when RdCRCAddr(5),
 		 Rx_CRC_Out(3)(31 downto 16) when RdCRCAddr(6),
 		 Rx_CRC_Out(3)(15 downto 0)  when RdCRCAddr(7),
 		 Rx_CRC_Out(4)(31 downto 16) when RdCRCAddr(8),
@@ -1788,6 +2550,14 @@ iCD <= X"0" & '0' & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En &
 		 Rx_CRC_Out(6)(15 downto 0)  when RdCRCAddr(13),
 		 Rx_CRC_Out(7)(31 downto 16) when RdCRCAddr(14),
 		 Rx_CRC_Out(7)(15 downto 0)  when RdCRCAddr(15),
+		 PhyActivityCounter(0) when PHYActivityCntAdd(0),
+		 PhyActivityCounter(1) when PHYActivityCntAdd(1),
+		 PhyActivityCounter(2) when PHYActivityCntAdd(2),
+		 PhyActivityCounter(3) when PHYActivityCntAdd(3),
+		 PhyActivityCounter(4) when PHYActivityCntAdd(4),
+		 PhyActivityCounter(5) when PHYActivityCntAdd(5),
+		 PhyActivityCounter(6) when PHYActivityCntAdd(6),
+		 PhyActivityCounter(7) when PHYActivityCntAdd(7),
 		 X"00" & CRCErr_Reg when CRCErrAddr,
 		 X"0" & "00" & RxOut(1).Parity_Err & RxOut(0).Parity_Err & PErrStat when FMRxErrAddr,
 		 X"000" & '0' & MDIORd & ChainSel when SMICtrlAddr,
@@ -1796,14 +2566,20 @@ iCD <= X"0" & '0' & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En &
 		 X"00" & TxEnMask when TxEnMaskAd,
 		 X"00" & not PhyRxBuff_Empty when RxDAVAddr,
 		 X"000" & "00" & PhyTxBuff_Empty & TxEnAck when PhyTxCSRAddr,
-		 X"0" & "00" & PhyTxBuff_Count when PhyTxCntAddr,
+       "00000" & PhyTxBuff_Count when PhyTxCntAddr,
 		 TrigWdCount & DRegSrc & '0' & Debug when DebugAddr,
 		 "00" & SDRdPtr(29 downto 16) when SDRdPtrAddrHi,
 		 SDRdPtr(15 downto 0) when SDRdPtrAddrLo,
        "0000000" & TxFIFOTrace_Out when LinkTxTraceAd,	
 		 LinkTxFullCnt & "00" & LinkTxFull & LinkTxEmpty & 
-				           "000" & LinkStatEn when LinkCtrlAd,		 
-		 X"0000" when others;
+				           "000" & LinkStatEn when LinkCtrlAd,		
+		 tx_overflow_cnt when OverflowCntAd,
+       X"0011" when DebugVersion,							  
+		 X"00" & ReadyStatus when ReadyStatusAddr,
+                 X"00" & CurrentTarget when TxCurrentTargetAddr,                             
+                 X"0000" when others;
+
+
 
 uCD <= iCD when uCRd = '0' and CpldCS = '0' and uCA(11 downto 10) = GA 
 		 else (others => 'Z');
