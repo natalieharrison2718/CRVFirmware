@@ -296,32 +296,13 @@ signal AutoTx_WordIdx     : integer range 0 to 15 := 0; -- supports up to 16-wor
 signal AutoTx_WordPending : std_logic := '0';  -- internal one-cycle writer strobe tracker
 signal AutoTx_Claim : std_logic_vector(7 downto 0) := (others => '0'); -- one-hot claim for main to clear ReadyStatus
 
+signal AutoTx_Active : std_logic := '0';
+
+signal AutoTx_Cooldown : integer range 0 to 16383 := 0;
+
 signal AutoTx_Target       : std_logic_vector(7 downto 0) := (others => '0'); -- one-hot chosen port
 signal AutoTx_BroadcastMode: std_logic := '0'; -- if '1', ignore AutoTx_Target and broadcast to TxEn bits
 signal port_full : std_logic_vector(7 downto 0); -- hook this to your per-port FIFO-full flags
-signal AutoTx_kick_req   : std_logic := '0';
-signal AutoTx_kick_mask  : std_logic_vector(7 downto 0) := (others => '0'); -- ports to consider (one-hot or multi-bit)
-
-signal PhyTxBuff_wr_count   : std_logic_vector(10 downto 0);   -- FIFO write-side count
-signal PhyTxBuff_rst_pulse  : std_logic := '0';
-
--- Local register addresses (self-contained, do not require Proj_Defs changes)
--- Lower 10-bit uC addresses for manual AutoTx kick and TX FIFO reset
--- AutoTxKickAddr: write lower byte one-hot to select port(s) for a manual UBT kick
-constant AutoTxKickAddr    : std_logic_vector(9 downto 0) := "00" & X"4D";  -- 0x04D
--- TxFifoResetAddr: write 0x0001 to pulse a reset on PhyTx_Buff
-constant TxFifoResetAddr   : std_logic_vector(9 downto 0) := "00" & X"4E";  -- 0x04E
--- Optional control (reserved for future use)
-constant TxFifoCtrlAddr    : std_logic_vector(9 downto 0) := "00" & X"4F";  -- 0x04F
-
--- New reset wire for TX FIFO (OR of ResetHi and a one-cycle pulse)
-signal PhyTxBuff_rst       : std_logic := '0';
-
--- Use the existing write-side count published by the FIFO (PhyTxBuff_Count)
--- to generate a synchronized "has data" flag into the CSR/SMI domain.
--- Robust "has data" sync into CSR domain
-signal TxFifoHasData_meta   : std_logic := '0';
-signal TxFifoHasData_sync   : std_logic := '0';
 
 
 -- CurrentTarget is derived at transmit time to guarantee only one port
@@ -556,7 +537,7 @@ SMI_Buff : SMI_FIFO
 
 -- changed 1/7
 	PhyTx_Buff : PhyTxBuff
-	PORT MAP ( rst => PhyTxBuff_rst,   wr_clk => SysClk,
+	PORT MAP ( rst => ResetHi,   wr_clk => SysClk,
 		rd_clk => i50MHz, din => PhyTxDin_mux,
 		wr_en => PhyTxBuff_wr_en_mux, rd_en => PhyTxBuff_rdreq,
 		dout => PhyTxBuff_Out, full => PhyTxBuff_Full,
@@ -927,20 +908,11 @@ end if;
 
 -- TxEn is used to hold off sending Phy data until a block of data has been 
 -- loaded into the transmit FIFO
---if Clk25MHz = '0' and TxEnAck = '0' and TxEnReq = '1' and PhyTxBuff_Empty = '0' then TxEnAck <= '1';
---elsif PhyTxBuff_Empty = '1' and Clk25MHz = '0' then TxEnAck <= '0';
---else TxEnAck <= TxEnAck;
---end if;
-                                
-
-if Clk25MHz = '0' and TxEnAck = '0' and TxEnReq = '1' and TxFifoHasData_sync = '1' then
-  TxEnAck <= '1';
-elsif Clk25MHz = '0' and TxFifoHasData_sync = '0' then
-  TxEnAck <= '0';
-else
-  TxEnAck <= TxEnAck;
+if Clk25MHz = '0' and TxEnAck = '0' and TxEnReq = '1' and PhyTxBuff_Empty = '0' then TxEnAck <= '1';
+elsif PhyTxBuff_Empty = '1' and Clk25MHz = '0' then TxEnAck <= '0';
+else TxEnAck <= TxEnAck;
 end if;
-                                
+
 -- Preamble: X"55",X"55",X"55",X"55",X"55",X"55",X"D5"
 -- Use PreambleTx signal to distinguish between preamble and data. When seven 
 -- bytes of preamble have been sent, start sending data
@@ -1223,69 +1195,11 @@ end process;
 
 SPIMOSI <= SPI_Shift(15);
 
--------------------------------------------------------------------------------
--- uC write decode: manual kick + TX FIFO reset + optional control
--------------------------------------------------------------------------------
-uC_decode_proc : process(SysClk)
-begin
-  if rising_edge(SysClk) then
-    -- Manual AutoTx kick (one-cycle pulse on req; retain mask)
-    if (WRDL = 1) and (uCA(11 downto 10) = GA) and (uCA(9 downto 0) = AutoTxKickAddr) then
-      AutoTx_kick_req  <= '1';
-      AutoTx_kick_mask <= uCD(7 downto 0);
-    else
-      AutoTx_kick_req  <= '0';
-      AutoTx_kick_mask <= AutoTx_kick_mask;
-    end if;
-
-    -- TX FIFO reset pulse
-    if (WRDL = 1) and (uCA(11 downto 10) = GA) and (uCA(9 downto 0) = TxFifoResetAddr) then
-      PhyTxBuff_rst_pulse <= '1';
-    else
-      PhyTxBuff_rst_pulse <= '0';
-    end if;
-    -- Optional control register (store bits if needed)
-    if (WRDL = 1) and (uCA(11 downto 10) = GA) and (uCA(9 downto 0) = TxFifoCtrlAddr) then
-      -- e.g., latch uCD(3 downto 0) into a local control signal for future features
-      -- TxFifoCtrl <= uCD(3 downto 0);
-      null;
-    end if;
-  end if;
-end process;
-
--- Stretch/reset connection (combine with your existing reset)
-PhyTxBuff_rst <= ResetHi or PhyTxBuff_rst_pulse;-- or GlobalReset;
-
--------------------------------------------------------------------------------
--- Ack gate improvement:
--- 
--- use synchronized “has data” instead of raw empty Add this small synchronizer (SysClk domain), using the write-side count from the FIFO:
--------------------------------------------------------------------------------
-has_data_sync_proc : process(SysClk)
-  variable wr_cnt_u : unsigned(10 downto 0);
-begin
-  if rising_edge(SysClk) then
-    wr_cnt_u := unsigned(PhyTxBuff_Count);
-    if wr_cnt_u > to_unsigned(PHYTX_RESERVED_SLOTS, 11) then
-      TxFifoHasData_meta <= '1';
-    else
-      TxFifoHasData_meta <= '0';
-    end if;
-    TxFifoHasData_sync <= TxFifoHasData_meta;
-  end if;
-end process;
-
--- Wherever you currently compute TxEnAck_next, qualify with TxFifoHasData_sync:
--- Example (adjust to your SMI/CSR logic):
--- TxEnAck_next <= '1' when (TxEnReq = '1' and TxFifoHasData_sync = '1') else '0';
-
-
-AutoTx_Proc : process(SysClk, CpldRst)  variable p : integer;  
+AutoTx_Proc : process(SysClk, CpldRst)
+  variable p : integer;
   variable found_port : integer range 0 to 7;
   variable have_port : boolean;
-  variable occ : integer;
-  variable buf_flag : std_logic;
- begin
+begin
   if CpldRst = '0' then
     PhyTxDin_FPGA      <= (others => '0');
     PhyTxWrReq_FPGA    <= '0';
@@ -1293,201 +1207,62 @@ AutoTx_Proc : process(SysClk, CpldRst)  variable p : integer;
     AutoTx_Port        <= 0;
     AutoTx_WordIdx     <= 0;
     AutoTx_WordPending <= '0';
-    AutoTx_Claim       <= X"00";  -- ensure claim is deasserted on reset
-	 AutoTx_Target      <= ZERO8;
+    AutoTx_Claim       <= X"00";
+    AutoTx_Target      <= ZERO8;
+    AutoTx_Cooldown    <= 0;
   elsif rising_edge(SysClk) then
-    -- default: clear any claim every cycle; set one-hot when we actually claim
     AutoTx_Claim <= X"00";
-	 PhyTxWrReq_FPGA <= '0';
+    PhyTxWrReq_FPGA <= '0';
     if AutoTx_WordPending = '1' then
       AutoTx_WordPending <= '0';
     end if;
 
-    -- compute current PhyTx FIFO occupancy and buffer-full hint
-    occ := to_integer(unsigned(PhyTxBuff_Count));
-    if occ >= (PHYTX_FIFO_DEPTH - PHYTX_RESERVED_SLOTS) then
-      buf_flag := '1';
-    else
-      buf_flag := '0';
-    end if;
-
--- comment on 1.7
-    -- Default single-cycle pulse behavior: ensure FPGA single-cycle writes
---    if AutoTx_WordPending = '1' then
---      PhyTxWrReq_FPGA <= '0';
---      AutoTx_WordPending <= '0';
---    else
---      PhyTxWrReq_FPGA <= '0';
---    end if;
---
---    case AutoTx_State is
---      when "00" =>  -- Idle: find a port with ReadyStatus set
---        found_port := 0;
---        have_port := false;
---        for p in 0 to 7 loop
---          if ReadyStatus(p) = '1' then
---            found_port := p;
---            have_port := true;
---            exit;
---          end if;
---        end loop;
---
---        -- Allow start when occupancy is <= threshold so READY packet may be sent with buf_flag asserted.
---        if have_port and occ <= (PHYTX_FIFO_DEPTH - PHYTX_RESERVED_SLOTS) then
---          AutoTx_Port <= found_port;
---          AutoTx_WordIdx <= 0;
---          AutoTx_Claim(found_port) <= '1';  -- request main to clear ReadyStatus next cycle
---          -- set AutoTx_Target so only the selected PHY receives the READY packet
---          AutoTx_Target <= "00000000";
---          AutoTx_Target(found_port) <= '1';
---			 
---          AutoTx_State <= "01";
---        end if;
---
---      when "01" =>  -- Sending: issue words one at a time
---        -- Recompute occupancy and buf_flag right before attempting each word
---        occ := to_integer(unsigned(PhyTxBuff_Count));
---        if occ >= (PHYTX_FIFO_DEPTH - PHYTX_RESERVED_SLOTS) then
---          buf_flag := '1';
---        else
---          buf_flag := '0';
---        end if;
---
---        -- only attempt to queue a word if FIFO not full and we don't have a pending single-cycle pulse
---        if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0' then
---          -- prepare the next word to send, include buf_flag in packet word
---          PhyTxDin_FPGA <= ready_packet_word(AutoTx_Port, AutoTx_WordIdx, buf_flag);
---          PhyTxWrReq_FPGA <= '1';         -- pulse for one cycle (cleared by top of proc next cycle)
---          AutoTx_WordPending <= '1';      -- indicate we must clear the pulse next cycle
---
---          -- increment index for next word
---			 if AutoTx_WordIdx + 1 >= READY_WORD_COUNT then
---            -- last word queued; return to idle on next cycle
---            AutoTx_State <= "00";
---            AutoTx_WordIdx <= 0;
---            -- clear AutoTx target once we've queued the final READY word
---            AutoTx_Target <= "00000000";
---          else
---            AutoTx_WordIdx <= AutoTx_WordIdx + 1;
---            AutoTx_State <= "01";
---          end if;
---        else
---          -- wait until FIFO has room or previous pulse clears
---          AutoTx_State <= "01";
---        end if;
---
---      when others =>
---        AutoTx_State <= "00";
-		  -- end comment 1/7
-		  
-		  -- comment 1/9
---		  case AutoTx_State is
---      when "00" =>
---        found_port := 0; have_port := false;
---        for p in 0 to 7 loop
---          if ReadyStatus(p) = '1' then
---            found_port := p; have_port := true; exit;
---          end if;
---        end loop;
---        if have_port and occ <= (PHYTX_FIFO_DEPTH - PHYTX_RESERVED_SLOTS) then
---          AutoTx_Port    <= found_port;
---          AutoTx_WordIdx <= 0;
---          AutoTx_Claim(found_port) <= '1';
---          AutoTx_Target <= ZERO8;
---          AutoTx_Target(found_port) <= '1';
---          AutoTx_State <= "01";
---        end if;
---      when "01" =>
---        occ := to_integer(unsigned(PhyTxBuff_Count));
---        if occ >= (PHYTX_FIFO_DEPTH - PHYTX_RESERVED_SLOTS) then
---          buf_flag := '1';
---        else
---          buf_flag := '0';
---        end if;
---
---        if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0' then
---          PhyTxDin_FPGA   <= ready_packet_word(AutoTx_Port, AutoTx_WordIdx, buf_flag);
---          PhyTxWrReq_FPGA <= '1';
---          AutoTx_WordPending <= '1';
---          if AutoTx_WordIdx + 1 >= READY_WORD_COUNT then
---            AutoTx_State    <= "00";
---            AutoTx_WordIdx  <= 0;
---            AutoTx_Target   <= ZERO8;
---          else
---            AutoTx_WordIdx <= AutoTx_WordIdx + 1;
---            AutoTx_State   <= "01";
---          end if;
---        end if;
---      when others =>
---        AutoTx_State <= "00";
---    end case;
---  end if;
--- end comment 1/9
-
--- new 1/9
--- Inside AutoTx_Proc rising_edge(SysClk):
-
-case AutoTx_State is
-  when "00" =>
-    -- Manual kick has priority over RX-derived ReadyStatus
-    if AutoTx_kick_req = '1' and PhyTxBuff_Full = '0' and PhyTxBuff_wreq = '0' then
-      -- Choose the lowest set bit in the kick mask
-      found_port := 0; have_port := false;
-      for p in 0 to 7 loop
-        if AutoTx_kick_mask(p) = '1' then
-          found_port := p; have_port := true; exit;
+    case AutoTx_State is
+      when "00" =>
+        if AutoTx_Cooldown > 0 then
+          AutoTx_Cooldown <= AutoTx_Cooldown - 1;
+        else
+          found_port := 0; have_port := false;
+          for p in 0 to 7 loop
+            if ReadyStatus(p) = '1' then
+              found_port := p; have_port := true; exit;
+            end if;
+          end loop;
+          
+          if have_port and PhyTxBuff_Full = '0' and PhyTxBuff_wreq = '0' then
+            AutoTx_Port    <= found_port;
+            AutoTx_WordIdx <= 0;
+            AutoTx_Claim(found_port) <= '1';
+            AutoTx_Target  <= ZERO8;
+            AutoTx_Target(found_port) <= '1';
+            AutoTx_State   <= "01";
+            AutoTx_Cooldown <= 10000;  -- 100?s cooldown @ 100MHz
+          end if;
         end if;
-      end loop;
-      if have_port then
-        AutoTx_Port        <= found_port;
-        AutoTx_WordIdx     <= 0;
-        AutoTx_Claim       <= X"00";        -- no ReadyStatus to clear for manual kick
-        -- Optional: gate TX to chosen port by setting AutoTx_Target one-hot
-        AutoTx_Target      <= (others => '0');
-        AutoTx_Target(found_port) <= '1';
-        AutoTx_State       <= "01";
-      end if;
 
-    else
-      -- Original ReadyStatus-driven start (as you have now)
-      found_port := 0; have_port := false;
-      for p in 0 to 7 loop
-        if ReadyStatus(p) = '1' then
-          found_port := p; have_port := true; exit;
+      when "01" =>
+        if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0' and PhyTxBuff_wreq = '0' then
+          PhyTxDin_FPGA      <= ubt_ascii_word(AutoTx_WordIdx, '1');
+          PhyTxWrReq_FPGA    <= '1';
+          AutoTx_WordPending <= '1';
+          
+          if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
+            AutoTx_State   <= "00";
+            AutoTx_WordIdx <= 0;
+            AutoTx_Target  <= ZERO8;
+          else
+            AutoTx_WordIdx <= AutoTx_WordIdx + 1;
+          end if;
         end if;
-      end loop;
-      if have_port and PhyTxBuff_Full = '0' and PhyTxBuff_wreq = '0' then
-        AutoTx_Port        <= found_port;
-        AutoTx_WordIdx     <= 0;
-        AutoTx_Claim(found_port) <= '1';
-        -- Optional gating:
-        AutoTx_Target      <= (others => '0');
-        AutoTx_Target(found_port) <= '1';
-        AutoTx_State       <= "01";
-      end if;
-    end if;
 
-  when "01" =>
-    -- Your existing UBT queuing logic (defer to uC writes; queue ubt_ascii_word; advance index)
-    if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0' and PhyTxBuff_wreq = '0' then
-      PhyTxDin_FPGA      <= ubt_ascii_word(AutoTx_WordIdx, '1');
-      PhyTxWrReq_FPGA    <= '1';
-      AutoTx_WordPending <= '1';
-      if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
-        AutoTx_State   <= "00";
-        AutoTx_WordIdx <= 0;
-        AutoTx_Target  <= (others => '0');  -- release gating
-      else
-        AutoTx_WordIdx <= AutoTx_WordIdx + 1;
-        AutoTx_State   <= "01";
-      end if;
-    end if;
-
-  when others =>
-    AutoTx_State <= "00";
-end case;
-end if;
+      when others =>
+        AutoTx_State <= "00";
+    end case;
+  end if;
 end process;
+
+
+
 
 ----------------------- 100 Mhz clocked logic -----------------------------
 
@@ -1545,12 +1320,12 @@ elsif rising_edge (SysClk) then
 
     for p in 0 to 7 loop
       -- two-stage sample of FIFO empty flag for safe edge detection
-      phy_empty_d(p)(1) <= phy_empty_d(p)(0);
-      phy_empty_d(p)(0) <= PhyRxBuff_Empty(p);
+     -- phy_empty_d(p)(1) <= phy_empty_d(p)(0);
+     -- phy_empty_d(p)(0) <= PhyRxBuff_Empty(p);
 
       -- rising edge detected: PhyRxBuff became empty (0 -> 1)
       if phy_empty_d(p)(0) = '1' and phy_empty_d(p)(1) = '0' then
-        if ReadyStatus(p) = '0' then
+        if ReadyStatus(p) = '0' and AutoTx_Active = '0' then
           ReadyStatus(p) <= '1';   -- latch that port is ready for new data
           --ReadyIRQ <= '1';         -- single-cycle pulse; clear below
         end if;
@@ -1584,8 +1359,16 @@ end if;
 --  ReadyStatus <= ReadyStatus;
 --end if;
 -- clear ReadyStatus bits requested by AutoTx (AutoTx_Claim is single-writer from AutoTx_Proc)
+--if AutoTx_Claim /= X"00" then
+ -- ReadyStatus <= ReadyStatus and (not AutoTx_Claim);
+--end if;
+
+-- Clear ReadyStatus immediately when claimed AND when not active
 if AutoTx_Claim /= X"00" then
   ReadyStatus <= ReadyStatus and (not AutoTx_Claim);
+elsif AutoTx_State /= "00" then
+  -- Don't let new ReadyStatus bits set while AutoTx is active
+  ReadyStatus <= ReadyStatus;  -- hold current value
 end if;
 
 -- clear ReadyStatus on microcontroller read of the ReadyStatus register
@@ -1829,8 +1612,7 @@ end if;
  if WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = TxEnMaskAd
    then TxEnMask <= uCD(7 downto 0);
   else TxEnMask <= TxEnMask;
- end if;-- In main process, decode writes to AutoTxKickAddr (use GA match)
-
+ end if;
 
 -------------------------------- DDR Macro Interfaces -------------------------------
 
@@ -2568,8 +2350,7 @@ iCD <= "00000" & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En & "0
 		 tx_overflow_cnt when OverflowCntAd,
        X"0011" when DebugVersion,							  
 		 X"00" & ReadyStatus when ReadyStatusAddr,
-                 X"00" & CurrentTarget when TxCurrentTargetAddr,                             
-                 X"0000" when others;
+		 X"0000" when others;
 
 
 
