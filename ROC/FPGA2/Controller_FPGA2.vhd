@@ -296,10 +296,6 @@ signal AutoTx_WordIdx     : integer range 0 to 15 := 0; -- supports up to 16-wor
 signal AutoTx_WordPending : std_logic := '0';  -- internal one-cycle writer strobe tracker
 signal AutoTx_Claim : std_logic_vector(7 downto 0) := (others => '0'); -- one-hot claim for main to clear ReadyStatus
 
-signal AutoTx_Active : std_logic := '0';
-
-signal AutoTx_Cooldown : integer range 0 to 16383 := 0;
-
 signal AutoTx_Target       : std_logic_vector(7 downto 0) := (others => '0'); -- one-hot chosen port
 signal AutoTx_BroadcastMode: std_logic := '0'; -- if '1', ignore AutoTx_Target and broadcast to TxEn bits
 signal port_full : std_logic_vector(7 downto 0); -- hook this to your per-port FIFO-full flags
@@ -1195,10 +1191,11 @@ end process;
 
 SPIMOSI <= SPI_Shift(15);
 
-AutoTx_Proc : process(SysClk, CpldRst)
-  variable p : integer;
+AutoTx_Proc : process(SysClk, CpldRst)  variable p : integer;
   variable found_port : integer range 0 to 7;
   variable have_port : boolean;
+  variable occ : integer;
+  variable buf_flag : std_logic;
 begin
   if CpldRst = '0' then
     PhyTxDin_FPGA      <= (others => '0');
@@ -1207,62 +1204,69 @@ begin
     AutoTx_Port        <= 0;
     AutoTx_WordIdx     <= 0;
     AutoTx_WordPending <= '0';
-    AutoTx_Claim       <= X"00";
-    AutoTx_Target      <= ZERO8;
-    AutoTx_Cooldown    <= 0;
+    AutoTx_Claim       <= X"00";  -- ensure claim is deasserted on reset
   elsif rising_edge(SysClk) then
+    -- default: clear any claim every cycle; set one-hot when we actually claim
     AutoTx_Claim <= X"00";
-    PhyTxWrReq_FPGA <= '0';
+	 PhyTxWrReq_FPGA <= '0';
     if AutoTx_WordPending = '1' then
       AutoTx_WordPending <= '0';
     end if;
 
-    case AutoTx_State is
-      when "00" =>
-        if AutoTx_Cooldown > 0 then
-          AutoTx_Cooldown <= AutoTx_Cooldown - 1;
-        else
-          found_port := 0; have_port := false;
-          for p in 0 to 7 loop
-            if ReadyStatus(p) = '1' then
-              found_port := p; have_port := true; exit;
-            end if;
-          end loop;
-          
-          if have_port and PhyTxBuff_Full = '0' and PhyTxBuff_wreq = '0' then
-            AutoTx_Port    <= found_port;
-            AutoTx_WordIdx <= 0;
-            AutoTx_Claim(found_port) <= '1';
-            AutoTx_Target  <= ZERO8;
-            AutoTx_Target(found_port) <= '1';
-            AutoTx_State   <= "01";
-            AutoTx_Cooldown <= 10000;  -- 100?s cooldown @ 100MHz
-          end if;
-        end if;
+    -- compute current PhyTx FIFO occupancy and buffer-full hint
+    occ := to_integer(unsigned(PhyTxBuff_Count));
+    if occ >= (PHYTX_FIFO_DEPTH - PHYTX_RESERVED_SLOTS) then
+      buf_flag := '1';
+    else
+      buf_flag := '0';
+    end if;
 
-      when "01" =>
-        if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0' and PhyTxBuff_wreq = '0' then
-          PhyTxDin_FPGA      <= ubt_ascii_word(AutoTx_WordIdx, '1');
-          PhyTxWrReq_FPGA    <= '1';
-          AutoTx_WordPending <= '1';
-          
-          if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
-            AutoTx_State   <= "00";
-            AutoTx_WordIdx <= 0;
-            AutoTx_Target  <= ZERO8;
-          else
-            AutoTx_WordIdx <= AutoTx_WordIdx + 1;
-          end if;
-        end if;
 
-      when others =>
-        AutoTx_State <= "00";
-    end case;
+
+case AutoTx_State is
+  when "00" =>
+    -- find a port that is ready (ReadyStatus=1)
+    found_port := 0; have_port := false;
+    for p in 0 to 7 loop
+      if ReadyStatus(p) = '1' then
+        found_port := p; have_port := true; exit;
+      end if;
+    end loop;
+    --if have_port and PhyTxBuff_Full = '0' then
+    --  AutoTx_Port    <= found_port;
+    --  AutoTx_Target  <= ZERO8; AutoTx_Target(found_port) <= '1';
+    --  AutoTx_Claim(found_port) <= '1';        -- clear ReadyStatus
+    --  AutoTx_WordIdx <= 0;
+    --  AutoTx_State   <= "01";
+    --end if;
+	 if have_port and PhyTxBuff_Full = '0' and PhyTxBuff_wreq = '0' then
+		AutoTx_Port    <= found_port;
+		AutoTx_WordIdx <= 0;
+		AutoTx_Claim(found_port) <= '1';
+		AutoTx_State   <= "01";
+	end if;
+
+	when "01" =>
+  -- Defer to uC writes if present to keep ASCII burst contiguous
+  if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0' and PhyTxBuff_wreq = '0' then
+    PhyTxDin_FPGA      <= ubt_ascii_word(AutoTx_WordIdx, '1');  -- or ubd_ascii_word(...) when sending UBD
+    PhyTxWrReq_FPGA    <= '1';
+    AutoTx_WordPending <= '1';
+    if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
+      AutoTx_State   <= "00";
+      AutoTx_WordIdx <= 0;
+      -- release any gating you use
+    else
+      AutoTx_WordIdx <= AutoTx_WordIdx + 1;
+      AutoTx_State   <= "01";
+    end if;
   end if;
+
+  when others =>
+    AutoTx_State <= "00";
+end case;
+end if;
 end process;
-
-
-
 
 ----------------------- 100 Mhz clocked logic -----------------------------
 
@@ -1320,12 +1324,12 @@ elsif rising_edge (SysClk) then
 
     for p in 0 to 7 loop
       -- two-stage sample of FIFO empty flag for safe edge detection
-     -- phy_empty_d(p)(1) <= phy_empty_d(p)(0);
-     -- phy_empty_d(p)(0) <= PhyRxBuff_Empty(p);
+      phy_empty_d(p)(1) <= phy_empty_d(p)(0);
+      phy_empty_d(p)(0) <= PhyRxBuff_Empty(p);
 
       -- rising edge detected: PhyRxBuff became empty (0 -> 1)
       if phy_empty_d(p)(0) = '1' and phy_empty_d(p)(1) = '0' then
-        if ReadyStatus(p) = '0' and AutoTx_Active = '0' then
+        if ReadyStatus(p) = '0' then
           ReadyStatus(p) <= '1';   -- latch that port is ready for new data
           --ReadyIRQ <= '1';         -- single-cycle pulse; clear below
         end if;
@@ -1359,16 +1363,8 @@ end if;
 --  ReadyStatus <= ReadyStatus;
 --end if;
 -- clear ReadyStatus bits requested by AutoTx (AutoTx_Claim is single-writer from AutoTx_Proc)
---if AutoTx_Claim /= X"00" then
- -- ReadyStatus <= ReadyStatus and (not AutoTx_Claim);
---end if;
-
--- Clear ReadyStatus immediately when claimed AND when not active
 if AutoTx_Claim /= X"00" then
   ReadyStatus <= ReadyStatus and (not AutoTx_Claim);
-elsif AutoTx_State /= "00" then
-  -- Don't let new ReadyStatus bits set while AutoTx is active
-  ReadyStatus <= ReadyStatus;  -- hold current value
 end if;
 
 -- clear ReadyStatus on microcontroller read of the ReadyStatus register
