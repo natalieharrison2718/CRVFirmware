@@ -304,6 +304,7 @@ signal AutoTx_BroadcastMode: std_logic := '0'; -- if '1', ignore AutoTx_Target a
 signal AutoTx_Cooldown : integer range 0 to 1000000 := 0;  -- ~10ms at 100MHz
 signal AutoTxKickMask  : std_logic_vector(7 downto 0) := (others => '0');
 signal AutoTxKickPulse : std_logic := '0';
+signal AutoTx_TxEnReqPulse : std_logic := '0';
 signal KickDataReg : std_logic_vector(7 downto 0) := (others => '0');
 signal KickAddrHit : std_logic := '0';
 signal SeenData : std_logic_vector(7 downto 0) := (others => '0');
@@ -1217,13 +1218,16 @@ begin
     AutoTx_WordIdx     <= 0;
     AutoTx_WordPending <= '0';
     AutoTx_Claim       <= X"00";  -- ensure claim is deasserted on reset
+
   elsif rising_edge(SysClk) then
     -- default: clear any claim every cycle; set one-hot when we actually claim
     AutoTx_Claim <= X"00";
 	 PhyTxWrReq_FPGA <= '0';
+	 AutoTx_TxEnReqPulse <= '0';
     if AutoTx_WordPending = '1' then
       AutoTx_WordPending <= '0';
     end if;
+
 
     -- compute current PhyTx FIFO occupancy and buffer-full hint
     occ := to_integer(unsigned(PhyTxBuff_Count));
@@ -1292,10 +1296,12 @@ case AutoTx_State is
     PhyTxWrReq_FPGA    <= '1';
     AutoTx_WordPending <= '1';
     if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
-      AutoTx_State   <= "00";
+      AutoTx_TxEnReqPulse <= '1';
+		AutoTx_State   <= "00";
       AutoTx_WordIdx <= 0;
 		AutoTx_Active <= '0';
 		AutoTx_Target  <= (others => '0'); 
+
       -- release any gating you use
     else
       AutoTx_WordIdx <= AutoTx_WordIdx + 1;
@@ -1653,20 +1659,21 @@ then RxIn(1).Clr_Err <= uCD(10);
 else RxIn(1).Clr_Err <= '0';
 end if;
 
--- If there is at least one complete packet in the buffer, enable phy transmit
-if TxEnReq = '0' and TxEnAck = '0' and WRDL = 1 and  
-   ((uCA(11 downto 10) = GA and uCA(9 downto 0) = PhyTxCSRAddr and uCD(0) = '1')
- or (uCA(9 downto 0) = PhyTxCSRBroadCastAd and uCD(0) = '1'))
- then TxEnReq <= '1';
-elsif TxEnReq = '1' and TxEnAck = '1'
- then TxEnReq <= '0';
-else TxEnReq <= TxEnReq;
+-- Enable PHY transmit either from a uC CSR write OR from AutoTx completion
+if TxEnReq = '0' and TxEnAck = '0' and (
+     (WRDL = 1 and (
+        (uCA(11 downto 10) = GA and uCA(9 downto 0) = PhyTxCSRAddr and uCD(0) = '1')
+        or (uCA(9 downto 0) = PhyTxCSRBroadCastAd and uCD(0) = '1')
+     ))
+     or (AutoTx_TxEnReqPulse = '1')  -- NEW: AutoTx requests a transmit start
+   )
+then
+  TxEnReq <= '1';
+elsif TxEnReq = '1' and TxEnAck = '1' then
+  TxEnReq <= '0';
+else
+  TxEnReq <= TxEnReq;
 end if;
-
- if WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = TxEnMaskAd
-   then TxEnMask <= uCD(7 downto 0);
-  else TxEnMask <= TxEnMask;
- end if;
 
 -------------------------------- DDR Macro Interfaces -------------------------------
 
