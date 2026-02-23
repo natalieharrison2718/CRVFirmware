@@ -2344,6 +2344,7 @@ iCD <= "00000" & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En & "0
 		 X"00" & not PhyRxBuff_Empty when RxDAVAddr,
 		 X"000" & "00" & PhyTxBuff_Empty & TxEnAck when PhyTxCSRAddr,
        "00000" & PhyTxBuff_Count when PhyTxCntAddr,
+		 X"00" & CurrentTarget when TxCurrentTargetAddr,
 		 TrigWdCount & DRegSrc & '0' & Debug when DebugAddr,
 		 "00" & SDRdPtr(29 downto 16) when SDRdPtrAddrHi,
 		 SDRdPtr(15 downto 0) when SDRdPtrAddrLo,
