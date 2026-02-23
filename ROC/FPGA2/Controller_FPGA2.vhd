@@ -295,9 +295,10 @@ signal AutoTx_Port        : integer range 0 to 7 := 0;
 signal AutoTx_WordIdx     : integer range 0 to 15 := 0; -- supports up to 16-word packets if needed
 signal AutoTx_WordPending : std_logic := '0';  -- internal one-cycle writer strobe tracker
 signal AutoTx_Claim : std_logic_vector(7 downto 0) := (others => '0'); -- one-hot claim for main to clear ReadyStatus
-
+signal AutoTx_Active      : std_logic := '0';  
 signal AutoTx_Target       : std_logic_vector(7 downto 0) := (others => '0'); -- one-hot chosen port
-signal AutoTx_BroadcastMode: std_logic := '0'; -- if '1', ignore AutoTx_Target and broadcast to TxEn bits
+signal AutoTx_BroadcastMode: std_logic := '0'; -- if '1', ignore AutoTx_Target and broadcast to TxEn bitssignal AutoTx_Cooldown : integer range 0 to 1000000 := 0;  -- ~10ms at 100MHz
+signal AutoTx_Cooldown : integer range 0 to 1000000 := 0;  -- ~10ms at 100MHz
 signal port_full : std_logic_vector(7 downto 0); -- hook this to your per-port FIFO-full flags
 
 
@@ -1225,13 +1226,17 @@ begin
 
 case AutoTx_State is
   when "00" =>
+	 if AutoTx_Cooldown > 0 then
+      AutoTx_Cooldown <= AutoTx_Cooldown - 1;  -- counting down
+    else
     -- find a port that is ready (ReadyStatus=1)
-    found_port := 0; have_port := false;
-    for p in 0 to 7 loop
-      if ReadyStatus(p) = '1' then
-        found_port := p; have_port := true; exit;
-      end if;
-    end loop;
+		found_port := 0; have_port := false;
+		for p in 0 to 7 loop
+			if ReadyStatus(p) = '1' then
+				found_port := p; have_port := true; exit;
+			end if;
+		end loop;
+		AutoTx_Active <= '0';
     --if have_port and PhyTxBuff_Full = '0' then
     --  AutoTx_Port    <= found_port;
     --  AutoTx_Target  <= ZERO8; AutoTx_Target(found_port) <= '1';
@@ -1239,14 +1244,15 @@ case AutoTx_State is
     --  AutoTx_WordIdx <= 0;
     --  AutoTx_State   <= "01";
     --end if;
-	 if have_port and PhyTxBuff_Full = '0' and PhyTxBuff_wreq = '0' then
-		AutoTx_Port    <= found_port;
-		AutoTx_WordIdx <= 0;
-		AutoTx_Claim(found_port) <= '1';
-		AutoTx_State   <= "01";
-	end if;
-
-	when "01" =>
+		if have_port and PhyTxBuff_Full = '0' and PhyTxBuff_wreq = '0' then
+			AutoTx_Port    <= found_port;
+			AutoTx_WordIdx <= 0;
+			AutoTx_Claim(found_port) <= '1';
+			AutoTx_Active <= '1';
+			AutoTx_State   <= "01";
+		end if;
+		end if;
+  when "01" =>
   -- Defer to uC writes if present to keep ASCII burst contiguous
   if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0' and PhyTxBuff_wreq = '0' then
     PhyTxDin_FPGA      <= ubt_ascii_word(AutoTx_WordIdx, '1');  -- or ubd_ascii_word(...) when sending UBD
@@ -1255,6 +1261,7 @@ case AutoTx_State is
     if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
       AutoTx_State   <= "00";
       AutoTx_WordIdx <= 0;
+		AutoTx_Active <= '0';
       -- release any gating you use
     else
       AutoTx_WordIdx <= AutoTx_WordIdx + 1;
@@ -1329,7 +1336,7 @@ elsif rising_edge (SysClk) then
 
       -- rising edge detected: PhyRxBuff became empty (0 -> 1)
       if phy_empty_d(p)(0) = '1' and phy_empty_d(p)(1) = '0' then
-        if ReadyStatus(p) = '0' then
+        if ReadyStatus(p) = '0' and AutoTx_Active = '0' then
           ReadyStatus(p) <= '1';   -- latch that port is ready for new data
           --ReadyIRQ <= '1';         -- single-cycle pulse; clear below
         end if;
