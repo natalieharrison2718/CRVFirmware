@@ -98,6 +98,9 @@ signal AddrReg : std_logic_vector(11 downto 0);
 -- TClk begin spill, end spill events
 signal TrigCtrlReg : std_logic_vector(1 downto 0);
 
+signal uCD_wr_stage : std_logic_vector(7 downto 0) := (others => '0');
+signal uCA_wr_stage : std_logic_vector(11 downto 0) := (others => '0');
+
 -- Timing interval counters
 signal Counter1us : std_logic_vector (7 downto 0);
 signal Counter10us : std_logic_vector (9 downto 0);
@@ -299,6 +302,12 @@ signal AutoTx_Active      : std_logic := '0';
 signal AutoTx_Target       : std_logic_vector(7 downto 0) := (others => '0'); -- one-hot chosen port
 signal AutoTx_BroadcastMode: std_logic := '0'; -- if '1', ignore AutoTx_Target and broadcast to TxEn bitssignal AutoTx_Cooldown : integer range 0 to 1000000 := 0;  -- ~10ms at 100MHz
 signal AutoTx_Cooldown : integer range 0 to 1000000 := 0;  -- ~10ms at 100MHz
+signal AutoTxKickMask  : std_logic_vector(7 downto 0) := (others => '0');
+signal AutoTxKickPulse : std_logic := '0';
+signal KickDataReg : std_logic_vector(7 downto 0) := (others => '0');
+signal KickAddrHit : std_logic := '0';
+signal SeenData : std_logic_vector(7 downto 0) := (others => '0');
+
 signal port_full : std_logic_vector(7 downto 0); -- hook this to your per-port FIFO-full flags
 
 
@@ -695,6 +704,7 @@ begin
 	 RdCRCEn(i) <= '0'; RxCRCRst(i) <= '1';
 	 StartCount(i) <= "000";
 	 PhyActivityCounter(i) <= (others => '0');
+
 
  elsif rising_edge(RxFMClk) then
  
@@ -1197,6 +1207,7 @@ AutoTx_Proc : process(SysClk, CpldRst)  variable p : integer;
   variable have_port : boolean;
   variable occ : integer;
   variable buf_flag : std_logic;
+  variable onehot : std_logic_vector(7 downto 0);  -- NEW
 begin
   if CpldRst = '0' then
     PhyTxDin_FPGA      <= (others => '0');
@@ -1226,17 +1237,38 @@ begin
 
 case AutoTx_State is
   when "00" =>
-	 if AutoTx_Cooldown > 0 then
-      AutoTx_Cooldown <= AutoTx_Cooldown - 1;  -- counting down
-    else
+    AutoTx_Active <= '0';
+	 AutoTx_Target <= (others => '0');  -- keep cleared unless we launch a send
+	 if AutoTxKickPulse = '1' and PhyTxBuff_Full = '0' and PhyTxBuff_wreq = '0' then
+		-- choose lowest-index set bit from AutoTxKickMask (sanitize to one-hot)
+  onehot := (others => '0');
+  for p in 0 to 7 loop
+    if AutoTxKickMask(p) = '1' then
+      onehot(p) := '1';
+      exit;
+    end if;
+  end loop;
+
+  -- Only start if mask was nonzero
+  if onehot /= X"00" then
+    AutoTx_Target  <= onehot;
+    AutoTx_Port    <= 0;
+    AutoTx_WordIdx <= 0;
+    AutoTx_Active  <= '1';
+    AutoTx_State   <= "01";
+  end if;
+	 else
+		if AutoTx_Cooldown > 0 then
+			AutoTx_Cooldown <= AutoTx_Cooldown - 1;  -- counting down
+		else
     -- find a port that is ready (ReadyStatus=1)
-		found_port := 0; have_port := false;
-		for p in 0 to 7 loop
-			if ReadyStatus(p) = '1' then
-				found_port := p; have_port := true; exit;
-			end if;
-		end loop;
-		AutoTx_Active <= '0';
+			found_port := 0; have_port := false;
+			for p in 0 to 7 loop
+				if ReadyStatus(p) = '1' then
+					found_port := p; have_port := true; exit;
+				end if;
+			end loop;
+			AutoTx_Active <= '0';
     --if have_port and PhyTxBuff_Full = '0' then
     --  AutoTx_Port    <= found_port;
     --  AutoTx_Target  <= ZERO8; AutoTx_Target(found_port) <= '1';
@@ -1244,13 +1276,14 @@ case AutoTx_State is
     --  AutoTx_WordIdx <= 0;
     --  AutoTx_State   <= "01";
     --end if;
-		if have_port and PhyTxBuff_Full = '0' and PhyTxBuff_wreq = '0' then
-			AutoTx_Port    <= found_port;
-			AutoTx_WordIdx <= 0;
-			AutoTx_Claim(found_port) <= '1';
-			AutoTx_Active <= '1';
-			AutoTx_State   <= "01";
-		end if;
+			if have_port and PhyTxBuff_Full = '0' and PhyTxBuff_wreq = '0' then
+				AutoTx_Port    <= found_port;
+				AutoTx_WordIdx <= 0;
+				AutoTx_Claim(found_port) <= '1';
+				AutoTx_Active <= '1';
+				AutoTx_State   <= "01";
+			end if;
+			end if;
 		end if;
   when "01" =>
   -- Defer to uC writes if present to keep ASCII burst contiguous
@@ -1262,6 +1295,7 @@ case AutoTx_State is
       AutoTx_State   <= "00";
       AutoTx_WordIdx <= 0;
 		AutoTx_Active <= '0';
+		AutoTx_Target  <= (others => '0'); 
       -- release any gating you use
     else
       AutoTx_WordIdx <= AutoTx_WordIdx + 1;
@@ -1329,24 +1363,25 @@ main : process(SysClk, CpldRst)
 
 elsif rising_edge (SysClk) then 
 
-    for p in 0 to 7 loop
-      -- two-stage sample of FIFO empty flag for safe edge detection
-      phy_empty_d(p)(1) <= phy_empty_d(p)(0);
-      phy_empty_d(p)(0) <= PhyRxBuff_Empty(p);
+-- In main SysClk process, inside rising_edge(SysClk)
+for p in 0 to 7 loop
+  -- sample empty (2-stage)
+  phy_empty_d(p)(1) <= phy_empty_d(p)(0);
+  phy_empty_d(p)(0) <= PhyRxBuff_Empty(p);
 
-      -- rising edge detected: PhyRxBuff became empty (0 -> 1)
-      if phy_empty_d(p)(0) = '1' and phy_empty_d(p)(1) = '0' then
-        if ReadyStatus(p) = '0' and AutoTx_Active = '0' then
-          ReadyStatus(p) <= '1';   -- latch that port is ready for new data
-          --ReadyIRQ <= '1';         -- single-cycle pulse; clear below
-        end if;
-      end if;
+  -- arm once we observe any non-empty condition
+  if PhyRxBuff_Empty(p) = '0' then
+    SeenData(p) <= '1';
+  end if;
 
-	-- comment out 1/7
-		--if not is_all_zero(PhyRxBuff_RdCnt(p)) then
-		--	ReadyStatus(p) <= '0';
-		--end if;
-    end loop;
+  -- fire only on transition to empty, and only if we've seen data since last fire
+  if (phy_empty_d(p)(0) = '1' and phy_empty_d(p)(1) = '0') then  -- became empty
+    if SeenData(p) = '1' and AutoTx_Active = '0' then
+      ReadyStatus(p) <= '1';    -- request a single UBT-1 for this port
+      SeenData(p)    <= '0';    -- disarm so it won't repeat while staying empty
+    end if;
+  end if;
+end loop;
 
    
 -- Synchronous edge detectors for read and write strobes
@@ -1466,6 +1501,22 @@ end if;
 if WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = ReadyClearAddr then
   ReadyStatus <= ReadyStatus and (not uCD(7 downto 0));
 end if;
+
+-- Capture the lower byte of the uC data bus on any write strobe
+if WRDL = 1 then
+  uCA_wr_stage <= uCA;
+  uCD_wr_stage <= uCD(7 downto 0);
+end if;
+
+-- Default: no kick pulse
+AutoTxKickPulse <= '0';
+
+-- AutoTxKick: use latched address (AddrReg) + staged write data (uCD_wr_stage)
+if WRDL = 1 and uCA_wr_stage(11 downto 10) = GA and uCA_wr_stage(9 downto 0) = AutoTxKickAddr then
+  AutoTxKickMask  <= uCD_wr_stage;
+  AutoTxKickPulse <= '1';  -- one SysClk cycle pulse
+end if;
+
 
 -- When at least one packet has bee received, examine it. If it is a trigger request packet,
 -- Start the data transfer from DRAM to the serial link transmitter
