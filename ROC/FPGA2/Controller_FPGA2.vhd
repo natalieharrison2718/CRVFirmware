@@ -201,6 +201,8 @@ signal PreambleCnt : std_logic_vector (2 downto 0);
 signal TxReg : std_logic_vector (3 downto 0);
 signal Preamble,CRCErr_Reg,TxEnMask : std_logic_vector (7 downto 0);
 signal PhyTxBuff_Out,PhyTxBuff_Dat : std_logic_vector (15 downto 0);
+-- Add this signal declaration:
+signal PhyTxBuff_Out_r : std_logic_vector(15 downto 0);
 signal TxNibbleCount : std_logic_vector (1 downto 0);
 
 -- Phy Rx Signals
@@ -826,6 +828,7 @@ SMIRdReg1 <= (others => '0'); SMI_Shift <= Idle;
 TxNibbleCount <= "00";
 PhyTxBuff_rdreq <= '0'; TxEnAck <= '0'; PreambleTx <= '0';
 PreambleCnt <= "000"; Preamble <= X"00";
+PhyTxBuff_Out_r <= (others => '0');
 
 -- Clock fanout SPI signals
 SPI_Adddr <= X"0800"; SPI_Shift <= (others => '0');
@@ -929,6 +932,12 @@ elsif PhyTxBuff_Empty = '1' and Clk25MHz = '0' then TxEnAck <= '0';
 else TxEnAck <= TxEnAck;
 end if;
 
+
+-- Register FIFO output every cycle; use _r in the nibble mux
+-- This adds one i50MHz cycle of latency = 20ns, well within nibble period (40ns)
+PhyTxBuff_Out_r <= PhyTxBuff_Out;
+
+
 -- Preamble: X"55",X"55",X"55",X"55",X"55",X"55",X"D5"
 -- Use PreambleTx signal to distinguish between preamble and data. When seven 
 -- bytes of preamble have been sent, start sending data
@@ -967,19 +976,19 @@ end if;
 Case TxNibbleCount is
   When "00" =>
     if PreambleTx = '1' then TxReg <= Preamble(3 downto 0);
-    else TxReg <= PhyTxBuff_Out(3 downto 0);
+    else TxReg <= PhyTxBuff_Out_r(3 downto 0);
     end if;
   When "01" =>
     if PreambleTx = '1' then TxReg <= Preamble(7 downto 4);
-    else TxReg <= PhyTxBuff_Out(7 downto 4);
+    else TxReg <= PhyTxBuff_Out_r(7 downto 4);
     end if;
   When "10" =>
     if PreambleTx = '1' then TxReg <= Preamble(3 downto 0);
-    else TxReg <= PhyTxBuff_Out(11 downto 8);
+    else TxReg <= PhyTxBuff_Out_r(11 downto 8);
     end if;
   When "11" =>
     if PreambleTx = '1' then TxReg <= Preamble(7 downto 4);
-    else TxReg <= PhyTxBuff_Out(15 downto 12);
+    else TxReg <= PhyTxBuff_Out_r(15 downto 12);
     end if;
   When others =>
     TxReg <= TxReg;
@@ -990,7 +999,7 @@ end Case;
 -- When four nibbles have been sent, get the next word from the buffer
 -- Move rdreq from NibbleCount=2 to NibbleCount=3 to allow FIFO output to settle
 -- before the first nibble of the next word is sample
-if TxNibbleCount = 3 and Clk25MHz = '0' and PreambleTx = '0' then PhyTxBuff_rdreq <= '1'; 
+if TxNibbleCount = 2 and Clk25MHz = '0' and PreambleTx = '0' then PhyTxBuff_rdreq <= '1'; 
 else PhyTxBuff_rdreq <= '0'; 
 end if;
 
