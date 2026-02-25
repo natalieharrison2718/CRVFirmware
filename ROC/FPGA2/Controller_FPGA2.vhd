@@ -1158,56 +1158,58 @@ begin
 
 
 case AutoTx_State is
-  when "00" =>
-    AutoTx_Active <= '0';
-	 AutoTx_Target <= (others => '0');  -- keep cleared unless we launch a send
-	 if AutoTxKickPulse = '1' and PhyTxBuff_Full = '0' and PhyTxBuff_wreq = '0' then
-		-- choose lowest-index set bit from AutoTxKickMask (sanitize to one-hot)
-  onehot := (others => '0');
-  for p in 0 to 7 loop
-    if AutoTxKickMask(p) = '1' then
-      onehot(p) := '1';
-      exit;
-    end if;
-  end loop;
+when "00" =>
+  AutoTx_Active <= '0';
+  AutoTx_Target <= (others => '0');  -- keep cleared unless we launch a send
 
-  -- Only start if mask was nonzero
-  if onehot /= X"00" then
-    AutoTx_Target  <= onehot;
-	 AutoTx_TargetLatch <= onehot;
-    AutoTx_Port    <= 0;
-    AutoTx_WordIdx <= 0;
-    AutoTx_Active  <= '1';
-    AutoTx_State   <= "01";
+  if AutoTxKickPulse = '1' and PhyTxBuff_Full = '0' and PhyTxBuff_wreq = '0' then
+    -- choose lowest-index set bit from AutoTxKickMask (sanitize to one-hot)
+    onehot := (others => '0');
+    for p in 0 to 7 loop
+      if AutoTxKickMask(p) = '1' then
+        onehot(p) := '1';
+        exit;
+      end if;
+    end loop;
+
+    if onehot /= X"00" then
+      AutoTx_Target      <= onehot;
+      AutoTx_TargetLatch <= onehot;   -- fix: set latch on kick path
+      AutoTx_Port        <= 0;
+      AutoTx_WordIdx     <= 0;
+      AutoTx_Active      <= '1';
+      AutoTx_State       <= "01";
+    end if;
+
+  else
+    if AutoTx_Cooldown > 0 then
+      AutoTx_Cooldown <= AutoTx_Cooldown - 1;
+    else
+      -- find a port that is ready (ReadyStatus=1)
+      found_port := 0; have_port := false;
+      for p in 0 to 7 loop
+        if ReadyStatus(p) = '1' then
+          found_port := p; have_port := true; exit;
+        end if;
+      end loop;
+
+      AutoTx_Active <= '0';
+
+      if have_port and PhyTxBuff_Full = '0' and PhyTxBuff_wreq = '0' then
+        -- build one-hot from found_port
+        onehot := (others => '0');
+        onehot(found_port) := '1';
+
+        AutoTx_Port        <= found_port;
+        AutoTx_Target      <= onehot;        -- fix: was never set in this path
+        AutoTx_TargetLatch <= onehot;        -- fix: set latch in this path too
+        AutoTx_WordIdx     <= 0;
+        AutoTx_Claim(found_port) <= '1';
+        AutoTx_Active      <= '1';
+        AutoTx_State       <= "01";
+      end if;
+    end if;
   end if;
-	 else
-		if AutoTx_Cooldown > 0 then
-			AutoTx_Cooldown <= AutoTx_Cooldown - 1;  -- counting down
-		else
-    -- find a port that is ready (ReadyStatus=1)
-			found_port := 0; have_port := false;
-			for p in 0 to 7 loop
-				if ReadyStatus(p) = '1' then
-					found_port := p; have_port := true; exit;
-				end if;
-			end loop;
-			AutoTx_Active <= '0';
-    --if have_port and PhyTxBuff_Full = '0' then
-    --  AutoTx_Port    <= found_port;
-    --  AutoTx_Target  <= ZERO8; AutoTx_Target(found_port) <= '1';
-    --  AutoTx_Claim(found_port) <= '1';        -- clear ReadyStatus
-    --  AutoTx_WordIdx <= 0;
-    --  AutoTx_State   <= "01";
-    --end if;
-			if have_port and PhyTxBuff_Full = '0' and PhyTxBuff_wreq = '0' then
-				AutoTx_Port    <= found_port;
-				AutoTx_WordIdx <= 0;
-				AutoTx_Claim(found_port) <= '1';
-				AutoTx_Active <= '1';
-				AutoTx_State   <= "01";
-			end if;
-			end if;
-		end if;
   when "01" =>
   -- Defer to uC writes if present to keep ASCII burst contiguous
   if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0' and PhyTxBuff_wreq = '0' then
@@ -1220,7 +1222,6 @@ case AutoTx_State is
       AutoTx_WordIdx <= 0;
 		AutoTx_Active <= '0';
 		AutoTx_Target  <= (others => '0'); 
-		AutoTx_TargetLatch <= (others => '0');
 
       -- release any gating you use
     else

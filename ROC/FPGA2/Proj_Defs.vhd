@@ -61,6 +61,8 @@ constant PhyTxCntAddr : AddrPtr := "00" & X"13";
 
 constant TxCurrentTargetAddr : AddrPtr := "00" & X"4A";
 
+
+
 constant PHYTX_FIFO_DEPTH : natural := 1024; -- FIFO depth
 constant PHYTX_RESERVED_SLOTS : natural := 2; -- really conservative. Adjust
 
@@ -145,11 +147,16 @@ constant AutoTxKickAddr     : std_logic_vector(9 downto 0) := "00" & X"4D";  -- 
   -- TX FIFO control/debug:
   constant TxFifoResetAddr    : std_logic_vector(9 downto 0) := "00" & X"4E";  -- pulse to reset TX FIFO
   constant TxFifoCtrlAddr     : std_logic_vector(9 downto 0) := "00" & X"4F";  -- optional control bits
-  constant TxFifoWrCountAddr  : std_logic_vector(9 downto 0) := "00" & X"5E";  -- read mirrored wr_data_count
-  constant TxFifoRawEmptyAddr : std_logic_vector(9 downto 0) := "00" & X"5F";  -- read raw empty bit
+  constant TxFifoWrCountAddr  : std_logic_vector(9 downto 0) := "00" & X"4B";  -- read mirrored wr_data_count
+  constant TxFifoRawEmptyAddr : std_logic_vector(9 downto 0) := "00" & X"4C";  -- read raw empty bit
 
   -- Reserved slots already defined in Proj_Defs: PHYTX_RESERVED_SLOTS
   -- Use wr_data_count > PHYTX_RESERVED_SLOTS to qualify "has data" robustly.
+
+
+-- Sticky last-TX target register: latches CurrentTarget at each PhyTxBuff_rdreq pulse.
+-- Read to see which lane was last targeted; write any value to clear.
+constant LastTxTargetAddr : std_logic_vector(9 downto 0) := "00" & X"4B";  -- 0x04B
 
 
 ---------------------- Broadcast addresses ------------------------------
