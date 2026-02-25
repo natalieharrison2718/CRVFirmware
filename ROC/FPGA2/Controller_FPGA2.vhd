@@ -988,7 +988,9 @@ end Case;
 
 
 -- When four nibbles have been sent, get the next word from the buffer
-if TxNibbleCount = 2 and Clk25MHz = '0' and PreambleTx = '0' then PhyTxBuff_rdreq <= '1'; 
+-- Move rdreq from NibbleCount=2 to NibbleCount=3 to allow FIFO output to settle
+-- before the first nibble of the next word is sample
+if TxNibbleCount = 3 and Clk25MHz = '0' and PreambleTx = '0' then PhyTxBuff_rdreq <= '1'; 
 else PhyTxBuff_rdreq <= '0'; 
 end if;
 
