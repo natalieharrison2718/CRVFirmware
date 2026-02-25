@@ -311,7 +311,9 @@ signal AutoTx_TxEnReqPulse : std_logic := '0';
 signal KickDataReg : std_logic_vector(7 downto 0) := (others => '0');
 signal KickAddrHit : std_logic := '0';
 signal SeenData : std_logic_vector(7 downto 0) := (others => '0');
-signal PhyTxFifoRst_pulse : std_logic := '0';  -- one-shot reset for PhyTx FIFO
+signal PhyTxFifoRst_pulse : std_logic := '0';  -- one-shot reset for PhyTx FIFO-- Sticky latch: holds CurrentTarget value from the most recent PhyTxBuff_rdreq pulse.
+-- Cleared by microcontroller write to LastTxTargetAddr.
+signal LastTxTarget : std_logic_vector(7 downto 0) := (others => '0');
 
 signal port_full : std_logic_vector(7 downto 0); -- hook this to your per-port FIFO-full flags
 
@@ -983,61 +985,7 @@ Case TxNibbleCount is
     TxReg <= TxReg;
 end Case;
 
--- comment 1/7
--- Multiplexer to choose which preamble nibble or which nibble
--- of the transmit data word goes to the Tx Outs
---Case TxNibbleCount is
---	When "00" =>
---	if PreambleTx = '1' then TxReg <= Preamble(3 downto 0);
---	else TxReg <= PhyTxBuff_Out(3 downto 0);
---	end if;
---	When "01" =>
---	if PreambleTx = '1' then TxReg <= Preamble(7 downto 4);
---	else TxReg <= PhyTxBuff_Out(7 downto 4);
---	end if;
---	When "10" =>
---	if PreambleTx = '1' then TxReg <= Preamble(3 downto 0);
---	else TxReg <= PhyTxBuff_Out(11 downto 8);
---	end if;
---	When "11" =>
---	if PreambleTx = '1' then TxReg <= Preamble(7 downto 4);
---	else TxReg <= PhyTxBuff_Out(15 downto 12);
---	end if;
---	When others =>
---		TxReg <= TxReg;
---end Case;
--- end comment 1/7
 
-
--- Time the transmit data w.r.t the 25MHz Tx clocks
--- Gate the 4-bit nibble (TxReg) onto each PHY port when the corresponding
--- TxEn bit is asserted. If a port is not enabled, drive an idle pattern.
---if Clk25MHz = '0' then
---  -- If AutoTx_Target is active (one-hot) or AutoTx_BroadcastMode asserted,
---  -- limit drive to the target(s). Otherwise preserve pre-existing behavior.
---  if AutoTx_Target /= (others => '0') or AutoTx_BroadcastMode = '1' then
---    for i in 0 to 7 loop
---      if TxEn(i) = '1' and (AutoTx_BroadcastMode = '1' or AutoTx_Target(i) = '1') then
---        PhyTx(i) <= TxReg;
---      else
---        PhyTx(i) <= (others => '0');
---      end if;
---    end loop;
---  else
---    for i in 0 to 7 loop
---      if TxEn(i) = '1' then
---        PhyTx(i) <= TxReg;            -- PhyTx(i) is std_logic_vector(3 downto 0)
---      else
---        PhyTx(i) <= (others => '0');  -- idle when not enabled (safe default)
---      end if;
---    end loop;
---  end if;
---else
---  -- keep outputs stable when clock high (explicit re-assignment avoids latches)
---  for i in 0 to 7 loop
---    PhyTx(i) <= PhyTx(i);
---  end loop;
---end if;
 
 -- When four nibbles have been sent, get the next word from the buffer
 if TxNibbleCount = 2 and Clk25MHz = '0' and PreambleTx = '0' then PhyTxBuff_rdreq <= '1'; 
@@ -1115,47 +1063,6 @@ end if; -- CpldRst
 
 end process SMI_Proc;
 
--- comment out 1/7
---phy_out_gating : process(Clk25MHz)
---  variable tgt : std_logic_vector(7 downto 0);
---begin
---  if falling_edge(Clk25MHz) then
---    -- Determine single target mask for this transmit cycle.
---    -- Priority:
---    -- 1) If AutoTx_BroadcastMode = '1' then drive any TxEn bits (legacy broadcast).
---    -- 2) Else if AutoTx_Target is non-zero use it (one-hot selected by AutoTx FSM).
---    -- 3) Else select lowest-index set bit from TxEn (defensive: pick one port).
---	if AutoTx_BroadcastMode = '1' then
---      tgt := TxEn; -- broadcast mode: allow multiple ports (legacy)
---    elsif not is_all_zero(AutoTx_Target) then
---      tgt := AutoTx_Target;
---    else
---      -- pick lowest bit of TxEn
---      tgt := "00000000";
---      for i in 0 to 7 loop
---        if TxEn(i) = '1' then
---          tgt := "00000000";
---          tgt(i) := '1';
---          exit;
---        end if;
---      end loop;
---    end if;
---
---    -- Optionally capture target into a register visible elsewhere
---    CurrentTarget <= tgt;
---
---    -- Drive PHY outputs: only the chosen target(s) get the nibble
---    for i in 0 to 7 loop
---      if tgt(i) = '1' then
---        PhyTx(i) <= TxReg;
---      else
---        PhyTx(i) <= ZERO4;
---      end if;
---    end loop;
---  end if;
---end process;
--- end comment from 1/7
-
 -- Deterministic transmit gating: hold selected target for exactly 4 nibbles
 phy_out_gating : process(Clk25MHz)
   variable tgt_candidate : std_logic_vector(7 downto 0);
@@ -1185,6 +1092,11 @@ begin
         TxTarget_hold <= tgt_candidate;
       end if;
       nibble_hold_cnt <= 4;
+		
+		-- STICKY LATCH: capture the chosen target at the moment of each FIFO read.
+      -- This persists across clock domains and survives the ~320ns transmission window.
+     
+		
     end if;
 
     if nibble_hold_cnt > 0 then
@@ -1371,6 +1283,7 @@ main : process(SysClk, CpldRst)
 	word_number <= (others => '0');
 	EvWdCountTot <= (others => '0');
 	ReadyStatus <= (others => '0');
+	LastTxTarget <= (others => '0');
 --Debug(10 downto 8) <= (others => '0'); 
 
 elsif rising_edge (SysClk) then 
@@ -1425,7 +1338,14 @@ end if;
 if RDDL = 2 and AddrReg(11 downto 10) = GA and AddrReg(9 downto 0) = ReadyStatusAddr then
   ReadyStatus <= (others => '0');
 end if;
-       
+  
+-- In main process, clocked section:
+-- Latch which port AutoTx just finished sending to, clear on uC read
+if AutoTx_TxEnReqPulse = '1' then
+  LastTxTarget <= AutoTx_Target;  -- both signals live on SysClk
+elsif WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = LastTxTargetAddr then
+  LastTxTarget <= (others => '0');
+end if;
 
 -- 1us time base
 if Counter1us /= Count1us then Counter1us <= Counter1us + 1;
@@ -2429,6 +2349,7 @@ iCD <= "00000" & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En & "0
 				           "000" & LinkStatEn when LinkCtrlAd,		
 		 tx_overflow_cnt when OverflowCntAd,
 		 (15 downto 1 => '0') & PhyTxBuff_Empty when TxFifoRawEmptyAddr,
+		 X"00" & LastTxTarget  when LastTxTargetAddr,
        X"0011" when DebugVersion,							  
 		 X"00" & ReadyStatus when ReadyStatusAddr,
 		 X"0000" when others;
