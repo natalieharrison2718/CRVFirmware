@@ -314,7 +314,7 @@ signal SeenData : std_logic_vector(7 downto 0) := (others => '0');
 signal PhyTxFifoRst_pulse : std_logic := '0';  -- one-shot reset for PhyTx FIFO-- Sticky latch: holds CurrentTarget value from the most recent PhyTxBuff_rdreq pulse.
 -- Cleared by microcontroller write to LastTxTargetAddr.
 signal LastTxTarget : std_logic_vector(7 downto 0) := (others => '0');
-
+signal AutoTx_TargetLatch : std_logic_vector(7 downto 0) := (others => '0');
 signal port_full : std_logic_vector(7 downto 0); -- hook this to your per-port FIFO-full flags
 
 
@@ -1174,6 +1174,7 @@ case AutoTx_State is
   -- Only start if mask was nonzero
   if onehot /= X"00" then
     AutoTx_Target  <= onehot;
+	 AutoTx_TargetLatch <= onehot;
     AutoTx_Port    <= 0;
     AutoTx_WordIdx <= 0;
     AutoTx_Active  <= '1';
@@ -1219,6 +1220,7 @@ case AutoTx_State is
       AutoTx_WordIdx <= 0;
 		AutoTx_Active <= '0';
 		AutoTx_Target  <= (others => '0'); 
+		AutoTx_TargetLatch <= (others => '0');
 
       -- release any gating you use
     else
@@ -1342,7 +1344,7 @@ end if;
 -- In main process, clocked section:
 -- Latch which port AutoTx just finished sending to, clear on uC read
 if AutoTx_TxEnReqPulse = '1' then
-  LastTxTarget <= AutoTx_Target;  -- both signals live on SysClk
+  LastTxTarget <= AutoTx_TargetLatch;  -- both signals live on SysClk
 elsif WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = LastTxTargetAddr then
   LastTxTarget <= (others => '0');
 end if;
