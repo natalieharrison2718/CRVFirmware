@@ -308,6 +308,7 @@ signal AutoTx_TxEnReqPulse : std_logic := '0';
 signal KickDataReg : std_logic_vector(7 downto 0) := (others => '0');
 signal KickAddrHit : std_logic := '0';
 signal SeenData : std_logic_vector(7 downto 0) := (others => '0');
+signal PhyTxFifoRst_pulse : std_logic := '0';  -- one-shot reset for PhyTx FIFO
 
 signal port_full : std_logic_vector(7 downto 0); -- hook this to your per-port FIFO-full flags
 
@@ -542,14 +543,15 @@ SMI_Buff : SMI_FIFO
 --    Find the existing block (search for "PhyTx_Buff : PhyTxBuff PORT MAP ( rst => ResetHi,   wr_clk => SysClk,")
 --    Replace the PORT MAP arguments `din => uCD, wr_en => PhyTxBuff_wreq,` with the two lines below:
 
--- changed 1/7
-	PhyTx_Buff : PhyTxBuff
-	PORT MAP ( rst => ResetHi,   wr_clk => SysClk,
-		rd_clk => i50MHz, din => PhyTxDin_mux,
-		wr_en => PhyTxBuff_wr_en_mux, rd_en => PhyTxBuff_rdreq,
-		dout => PhyTxBuff_Out, full => PhyTxBuff_Full,
-		empty => PhyTxBuff_Empty,
-		wr_data_count => PhyTxBuff_Count);
+
+PhyTx_Buff : PhyTxBuff
+PORT MAP ( rst => (ResetHi or PhyTxFifoRst_pulse),   wr_clk => SysClk,
+  rd_clk => i50MHz, din => PhyTxDin_mux,
+  wr_en => PhyTxBuff_wr_en_mux, rd_en => PhyTxBuff_rdreq,
+  dout => PhyTxBuff_Out, full => PhyTxBuff_Full,
+  empty => PhyTxBuff_Empty,
+  wr_data_count => PhyTxBuff_Count);
+
 
 	PhyTxDin_mux <= uCD when PhyTxBuff_wreq = '1' else PhyTxDin_FPGA;
 	PhyTxBuff_wr_en_mux <= PhyTxBuff_wreq or PhyTxWrReq_FPGA;
@@ -705,6 +707,7 @@ begin
 	 RdCRCEn(i) <= '0'; RxCRCRst(i) <= '1';
 	 StartCount(i) <= "000";
 	 PhyActivityCounter(i) <= (others => '0');
+	
 
 
  elsif rising_edge(RxFMClk) then
@@ -1382,7 +1385,7 @@ for p in 0 to 7 loop
 
   -- fire only on transition to empty, and only if we've seen data since last fire
   if (phy_empty_d(p)(0) = '1' and phy_empty_d(p)(1) = '0') then  -- became empty
-    if SeenData(p) = '1' and AutoTx_Active = '0' then
+    if SeenData(p) = '1' then
       ReadyStatus(p) <= '1';    -- request a single UBT-1 for this port
       SeenData(p)    <= '0';    -- disarm so it won't repeat while staying empty
     end if;
@@ -1523,6 +1526,13 @@ if WRDL = 1 and uCA_wr_stage(11 downto 10) = GA and uCA_wr_stage(9 downto 0) = A
   AutoTxKickPulse <= '1';  -- one SysClk cycle pulse
 end if;
 
+-- default: no FIFO reset pulse
+PhyTxFifoRst_pulse <= '0';
+
+-- pulse to reset the PhyTx FIFO (write-anything to TxFifoResetAddr)
+if WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = TxFifoResetAddr then
+  PhyTxFifoRst_pulse <= '1';  -- one SysClk pulse; FIFO core will reset
+end if;
 
 -- When at least one packet has bee received, examine it. If it is a trigger request packet,
 -- Start the data transfer from DRAM to the serial link transmitter
@@ -2410,6 +2420,7 @@ iCD <= "00000" & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En & "0
 		 LinkTxFullCnt & "00" & LinkTxFull & LinkTxEmpty & 
 				           "000" & LinkStatEn when LinkCtrlAd,		
 		 tx_overflow_cnt when OverflowCntAd,
+		 X"000" & "000" & PhyTxBuff_Empty when TxFifoRawEmptyAddr,
        X"0011" when DebugVersion,							  
 		 X"00" & ReadyStatus when ReadyStatusAddr,
 		 X"0000" when others;
