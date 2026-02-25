@@ -124,6 +124,9 @@ signal GateReq : std_logic_vector (1 downto 0);
 -- Test Pulse generator signals
 signal Freq_Reg,PhaseAcc : std_logic_vector (31 downto 0);
 
+-- Replace the single-cycle pulse with a counter-based stretch
+signal PhyTxFifoRst_stretch : std_logic_vector(3 downto 0) := (others => '0');
+
 -- MIG LPDDR controller signals 
 signal AuxClk : std_logic;
 signal SDRdDat,SDWrtDat : std_logic_vector(31 downto 0);
@@ -1511,28 +1514,33 @@ if WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = ReadyClearAddr then
   ReadyStatus <= ReadyStatus and (not uCD(7 downto 0));
 end if;
 
--- Capture the lower byte of the uC data bus on any write strobe
-if WRDL = 1 then
-  uCA_wr_stage <= uCA;
-  uCD_wr_stage <= uCD(7 downto 0);
-end if;
 
 -- Default: no kick pulse
 AutoTxKickPulse <= '0';
 
--- AutoTxKick: use latched address (AddrReg) + staged write data (uCD_wr_stage)
-if WRDL = 1 and uCA_wr_stage(11 downto 10) = GA and uCA_wr_stage(9 downto 0) = AutoTxKickAddr then
-  AutoTxKickMask  <= uCD_wr_stage;
-  AutoTxKickPulse <= '1';  -- one SysClk cycle pulse
+-- Correct: decode kick on WRDL=1 using uCA and uCD directly
+-- Override: assert kick pulse for one cycle on address match
+if WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = AutoTxKickAddr then
+  AutoTxKickMask  <= uCD(7 downto 0);
+  AutoTxKickPulse <= '1';
 end if;
 
--- default: no FIFO reset pulse
-PhyTxFifoRst_pulse <= '0';
-
--- pulse to reset the PhyTx FIFO (write-anything to TxFifoResetAddr)
+-- stretch pulse
 if WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = TxFifoResetAddr then
-  PhyTxFifoRst_pulse <= '1';  -- one SysClk pulse; FIFO core will reset
+  PhyTxFifoRst_stretch <= X"F";  -- hold for 16 cycles = 160ns > 3x i50MHz periods
+elsif PhyTxFifoRst_stretch /= 0 then
+  PhyTxFifoRst_stretch <= PhyTxFifoRst_stretch - 1;
 end if;
+
+if PhyTxFifoRst_stretch /= 0 then
+  PhyTxFifoRst_pulse <= '1';
+else
+  PhyTxFifoRst_pulse <= '0';
+end if;
+
+
+
+
 
 -- When at least one packet has bee received, examine it. If it is a trigger request packet,
 -- Start the data transfer from DRAM to the serial link transmitter
@@ -2420,7 +2428,7 @@ iCD <= "00000" & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En & "0
 		 LinkTxFullCnt & "00" & LinkTxFull & LinkTxEmpty & 
 				           "000" & LinkStatEn when LinkCtrlAd,		
 		 tx_overflow_cnt when OverflowCntAd,
-		 X"000" & "000" & PhyTxBuff_Empty when TxFifoRawEmptyAddr,
+		 (15 downto 1 => '0') & PhyTxBuff_Empty when TxFifoRawEmptyAddr,
        X"0011" when DebugVersion,							  
 		 X"00" & ReadyStatus when ReadyStatusAddr,
 		 X"0000" when others;
