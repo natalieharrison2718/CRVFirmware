@@ -339,7 +339,10 @@ signal UBTTarget_rd_en : std_logic := '0';
 signal UBTTarget_full  : std_logic := '0';
 signal UBTTarget_empty : std_logic := '0';
 signal UBTPacket_start : std_logic := '0'; -- pulses when first word of new packet is written
-
+signal UBTTarget_rd_en_sync : std_logic_vector(1 downto 0) := "00";
+signal UBTTarget_wr_en_50  : std_logic := '0';
+signal UBTTarget_wr_en_sync_50 : std_logic_vector(3 downto 0) := "0000";
+-- (3 stages: 2 for metastability, 1 for edge detect)
 
 constant READY_WORD_COUNT : integer := 2; -- number of words in the READY packet (update if you change helper)
 
@@ -394,17 +397,6 @@ SysPLL : Sys_PLL
 -- Lane 1 V1DDDV1dddV1DDDV1ddd
 -- Lane 0 DDDDDdddddDDDDDddddd
 
-UBTTarget_FIFO : UBTTargetFIFO
-  port map (
-    clk   => SysClk,
-    rst   => ResetHi,
-    din   => UBTTarget_din,
-    wr_en => UBTTarget_wr_en,
-    rd_en => UBTTarget_rd_en,
-    dout  => UBTTarget_dout,
-    full  => UBTTarget_full,
-    empty => UBTTarget_empty
-  );
 
 FPGALinkTx : LinkTx
 generic map ( sys_w => 4,   -- width of the data for the system
@@ -1070,12 +1062,69 @@ end if; -- CpldRst
 
 end process SMI_Proc;
 
+-- Behavioral 8-entry x 8-bit FIFO to replace missing UBTTargetFIFO CoreGen macro.
+-- Depth of 8 is sufficient: at most one entry per PHY port.
+UBTTarget_FIFO_proc : process(i50MHz)
+  type mem_t is array(0 to 7) of std_logic_vector(7 downto 0);
+  variable mem   : mem_t := (others => (others => '0'));
+  variable wptr  : integer range 0 to 7 := 0;
+  variable rptr  : integer range 0 to 7 := 0;
+  variable count : integer range 0 to 8 := 0;
+begin
+  if rising_edge(i50MHz) then
+    if ResetHi = '1' then
+      wptr  := 0;
+      rptr  := 0;
+      count := 0;
+      UBTTarget_full  <= '0';
+      UBTTarget_empty <= '1';
+      UBTTarget_dout  <= (others => '0');
+    else
+      -- Write port: use rising-edge detect of synchronized wr_en
+      -- (UBTTarget_din is stable for many SysClk cycles so no sync needed for data)
+      if UBTTarget_wr_en_sync_50(3) = '0' and UBTTarget_wr_en_sync_50(2) = '1'
+         and count < 8 then
+        mem(wptr) := UBTTarget_din;  -- din stable long enough to sample here
+        wptr      := (wptr + 1) mod 8;
+        count     := count + 1;
+      end if; 
+      -- Read port
+      if UBTTarget_rd_en = '1' and count > 0 then
+        rptr  := (rptr + 1) mod 8;
+        count := count - 1;
+      end if;
+      -- Status flags
+      if count >= 8 then UBTTarget_full  <= '1'; else UBTTarget_full  <= '0'; end if;
+      if count = 0  then UBTTarget_empty <= '1'; else UBTTarget_empty <= '0'; end if;
+      -- First-word fall-through output
+      UBTTarget_dout <= mem(rptr);
+    end if;
+  end if;
+end process UBTTarget_FIFO_proc;
+
+UBTWrSync_proc : process(i50MHz)
+begin
+  if rising_edge(i50MHz) then
+    if ResetHi = '1' then
+      UBTTarget_wr_en_sync_50 <= "0000";
+    else
+      -- Shift register synchronizer: SysClk write pulse ? i50MHz domain
+		-- 4-stage shift: bit(0) = raw input, bits(1..2) = metastability FFs,
+      -- bit(3) = delayed copy for edge detect
+      UBTTarget_wr_en_sync_50 <= UBTTarget_wr_en_sync_50(2 downto 0) & UBTTarget_wr_en;
+    end if;
+  end if;
+end process;
+-- Rising-edge detect on synchronized signal (use in FIFO proc):
+-- UBTTarget_wr_en_sync_50(2)='0' and UBTTarget_wr_en_sync_50(1)='1' = rising edge
+
 -- Deterministic transmit gating: hold selected target for exactly 4 nibbles
-phy_out_gating : process(Clk25MHz)
+phy_out_gating : process(i50MHz)
   variable tgt_candidate : std_logic_vector(7 downto 0);
   variable lowest_mask   : std_logic_vector(7 downto 0);
 begin
-  if falling_edge(Clk25MHz) then
+  if rising_edge(i50MHz) then
+    if Clk25MHz = '1' then  -- execute only on the falling edge of the 25MHz phase
     if AutoTx_BroadcastMode = '1' then
       tgt_candidate := TxEn;
     elsif not is_all_zero(AutoTx_Target) then
@@ -1109,7 +1158,7 @@ begin
     if nibble_hold_cnt > 0 then
       CurrentTarget <= TxTarget_hold;
       nibble_hold_cnt <= nibble_hold_cnt - 1;
-      if nibble_hold_cnt = 0 then
+      if nibble_hold_cnt = 1 then
         TxTarget_hold <= ZERO8;
       end if;
     else
@@ -1123,6 +1172,7 @@ begin
         PhyTx(i) <= ZERO4;
       end if;
     end loop;
+  end if;
   end if;
 end process;
 
@@ -1233,6 +1283,7 @@ begin
 
           if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
             -- finished this port's packet
+				AutoTx_TargetLatch  <= AutoTx_Target;
             AutoTx_TxEnReqPulse <= '1';
             AutoTx_WordIdx      <= 0;
             AutoTx_Active       <= '0';
@@ -1286,7 +1337,7 @@ end process;
 ResetHi <= not CpldRst;  -- Generate and active high reset for the Xilinx macros
 
 main : process(SysClk, CpldRst)
-
+variable rs_next : std_logic_vector(7 downto 0);
  begin 
 
 -- asynchronous reset/preset
@@ -1346,15 +1397,42 @@ for p in 0 to 7 loop
   if PhyRxBuff_Empty(p) = '0' then
     SeenData(p) <= '1';
   end if;
+end loop;
+
+
+-- Single writer for ReadyStatus with explicit priority:
+-- Priority 1 (highest): microcontroller explicit clear
+-- Priority 2: AutoTx claim clear  
+-- Priority 3 (lowest): per-port set on FIFO-empty transition
+
+  rs_next := ReadyStatus;
+  -- P3: set bits (lowest priority, applied first)
+  for p in 0 to 7 loop
+    if (phy_empty_d(p)(0) = '1' and phy_empty_d(p)(1) = '0')
+       and SeenData(p) = '1' and AutoTx_Claim(p) = '0' then
+      rs_next(p) := '1';
+      SeenData(p) <= '0';
+    end if;
+  end loop;
+  -- P2: AutoTx claim clears (overrides sets)
+  if AutoTx_Claim /= X"00" then
+    rs_next := rs_next and (not AutoTx_Claim);
+  end if;
+  -- P1: microcontroller explicit clear (highest priority)
+  if WRDL = 1 and uCA(11 downto 10) = GA
+     and uCA(9 downto 0) = ReadyClearAddr then
+    rs_next := rs_next and (not uCD(7 downto 0));
+  end if;
+  ReadyStatus <= rs_next;
 
   -- fire only on transition to empty, and only if we've seen data since last fire
-  if (phy_empty_d(p)(0) = '1' and phy_empty_d(p)(1) = '0') then  -- became empty
-    if SeenData(p) = '1' then
-      ReadyStatus(p) <= '1';    -- request a single UBT-1 for this port
-      SeenData(p)    <= '0';    -- disarm so it won't repeat while staying empty
-    end if;
-  end if;
-end loop;
+--  if (phy_empty_d(p)(0) = '1' and phy_empty_d(p)(1) = '0') then  -- became empty
+--    if SeenData(p) = '1' and AutoTx_Claim(p) = '0' then
+--      ReadyStatus(p) <= '1';    -- request a single UBT-1 for this port
+--      SeenData(p)    <= '0';    -- disarm so it won't repeat while staying empty
+--    end if;
+--  end if;
+--end loop;
 
    
 -- Synchronous edge detectors for read and write strobes
@@ -1365,6 +1443,7 @@ WRDL(0) <= not uCWR and not CpldCS;
 WRDL(1) <= WRDL(0);
 
 debug_ReadyStatus <= ReadyStatus;
+UBTTarget_rd_en_sync <= UBTTarget_rd_en_sync(0) & UBTTarget_rd_en;
 
 -- Latch the address for post increment during reads
 if RDDL = 1 or WRDL = 1 then AddrReg <= uCA;
@@ -1378,21 +1457,31 @@ end if;
 --  ReadyStatus <= ReadyStatus;
 --end if;
 -- clear ReadyStatus bits requested by AutoTx (AutoTx_Claim is single-writer from AutoTx_Proc)
-if AutoTx_Claim /= X"00" then
-  ReadyStatus <= ReadyStatus and (not AutoTx_Claim);
-end if;
+--if AutoTx_Claim /= X"00" then
+--  ReadyStatus <= ReadyStatus and (not AutoTx_Claim);
+--end if;
 
 -- clear ReadyStatus on microcontroller read of the ReadyStatus register
-if RDDL = 2 and AddrReg(11 downto 10) = GA and AddrReg(9 downto 0) = ReadyStatusAddr then
-  ReadyStatus <= (others => '0');
-end if;
+--if RDDL = 2 and AddrReg(11 downto 10) = GA and AddrReg(9 downto 0) = ReadyStatusAddr then
+--  ReadyStatus <= (others => '0');
+--end if;
   
 -- In main process, clocked section:
 -- Latch which port AutoTx just finished sending to, clear on uC read
+
+--if AutoTx_TxEnReqPulse = '1' then
+--  LastTxTarget <= AutoTx_Target;  -- AutoTx_Target holds the one-hot port at pulse time
+--elsif WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = LastTxTargetAddr then
+--  LastTxTarget <= (others => '0');
+--end if;
+
+
+-- Sticky latch: capture which port AutoTx just finished targeting
 if AutoTx_TxEnReqPulse = '1' then
-  LastTxTarget <= AutoTx_TargetLatch;  -- both signals live on SysClk
-elsif WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = LastTxTargetAddr then
-  LastTxTarget <= (others => '0');
+  LastTxTarget <= AutoTx_TargetLatch;
+elsif WRDL = 1 and uCA(11 downto 10) = GA 
+      and uCA(9 downto 0) = LastTxTargetAddr then
+  LastTxTarget <= (others => '0');  -- clear on uC write
 end if;
 
 -- 1us time base
@@ -1449,6 +1538,11 @@ end if;
 
 end loop;
 
+
+--  variable rs_next : std_logic_vector(7 downto 0);
+
+
+
 -- Every sysclk reverses the clock and frame pattern
 if LockOut = '1' then
 	ClockReg <= not ClockReg; 
@@ -1478,9 +1572,9 @@ else PhyTxBuff_wreq <= '0';
 end if;
 
 -- Clear ReadyStatus bits by writing 1s in the lower byte of uCD
-if WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = ReadyClearAddr then
-  ReadyStatus <= ReadyStatus and (not uCD(7 downto 0));
-end if;
+--if WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = ReadyClearAddr then
+--  ReadyStatus <= ReadyStatus and (not uCD(7 downto 0));
+--end if;
 
 
 -- Default: no kick pulse
@@ -1488,9 +1582,12 @@ AutoTxKickPulse <= '0';
 
 -- Correct: decode kick on WRDL=1 using uCA and uCD directly
 -- Override: assert kick pulse for one cycle on address match
+-- With a latched version that holds for two cycles:
 if WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = AutoTxKickAddr then
-  AutoTxKickMask  <= uCD(7 downto 0);
-  AutoTxKickPulse <= '1';
+  AutoTxKickMask        <= uCD(7 downto 0);
+  AutoTxKickPulse       <= '1';
+elsif AutoTxKickPulse = '1' then
+  AutoTxKickPulse       <= '0';  -- hold for exactly one extra SysClk cycle
 end if;
 
 -- stretch pulse
