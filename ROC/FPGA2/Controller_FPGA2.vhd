@@ -1670,7 +1670,7 @@ variable rs_next : std_logic_vector(7 downto 0);
 	phy_empty_d <= (others => "00"); --Debug(10 downto 8) <= (others => '0'); 
 	AutoTxKickMask  <= (others => '0');
 	AutoTxKickPulse <= '0';
-
+   LastTxTarget_clr_req <= '0';
 	
 
 elsif rising_edge (SysClk) then 
@@ -1749,13 +1749,26 @@ if RDDL = 1 or WRDL = 1 then AddrReg <= uCA;
 else AddrReg <= AddrReg;
 end if;
 
-
+-- AutoTx kick: µC writes a one-hot lane mask; AutoTx_Proc sees the pulse
+-- and immediately queues a UBT for that port, bypassing the ReadyStatus scan.
+-- AutoTxKickMask and AutoTxKickPulse must be declared (uncommented) in the
+-- signal section ? see Change B below.
 if WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = AutoTxKickAddr then
   AutoTxKickMask  <= uCD(7 downto 0);
   AutoTxKickPulse <= '1';
 elsif AutoTxKickPulse = '1' then
   AutoTxKickPulse <= '0';
 end if;
+
+-- Sticky latch clear: µC writes any value to LastTxTargetAddr to clear it.
+-- This sets a pulse in SysClk domain; phy_out_gating synchronises it.
+if WRDL = 1 and uCA(11 downto 10) = GA
+      and uCA(9 downto 0) = LastTxTargetAddr then
+  LastTxTarget_clr_req <= '1';
+else
+  LastTxTarget_clr_req <= '0';
+end if;
+
 
 -- Sticky latch: capture which port AutoTx just finished targeting
 --if AutoTx_TxEnReqPulse = '1' then
@@ -1857,16 +1870,7 @@ end if;
 --  ReadyStatus <= ReadyStatus and (not uCD(7 downto 0));
 --end if;
 
--- AutoTx kick: µC writes a one-hot lane mask; AutoTx_Proc sees the pulse
--- and immediately queues a UBT for that port, bypassing the ReadyStatus scan.
--- AutoTxKickMask and AutoTxKickPulse must be declared (uncommented) in the
--- signal section ? see Change B below.
-if WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = AutoTxKickAddr then
-  AutoTxKickMask  <= uCD(7 downto 0);
-  AutoTxKickPulse <= '1';
-elsif AutoTxKickPulse = '1' then
-  AutoTxKickPulse <= '0';
-end if;
+
 
 -- stretch pulse
 if WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = TxFifoResetAddr then
