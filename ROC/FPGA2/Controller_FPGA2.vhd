@@ -352,6 +352,7 @@ signal LastTxTarget : std_logic_vector(7 downto 0) := (others => '0');
 -- (SysClk ? i50MHz):
 signal LastTxTarget_clr_req  : std_logic := '0';  -- set by main (SysClk)
 signal LastTxTarget_clr_sync : std_logic_vector(2 downto 0) := "000"; -- sync in i50MHz
+signal LastTxTarget_clr_stretch : std_logic_vector(2 downto 0) := "000";
 signal port_full : std_logic_vector(7 downto 0); -- hook this to your per-port FIFO-full flagssignal debug_ReadyStatus     : std_logic_vector(7 downto 0);
 
   -- CurrentTarget is derived at transmit time to guarantee only one port
@@ -1720,7 +1721,7 @@ variable rs_next : std_logic_vector(7 downto 0);
    LastTxTarget_clr_req <= '0';
 	TransitionCount    <= (others => X"0");
 	DeadWindowCount    <= (others => X"0");
-	
+	LastTxTarget_clr_stretch <= "000";
 
 elsif rising_edge (SysClk) then 
 if PllLock = '1' then
@@ -1815,15 +1816,23 @@ elsif AutoTxKickPulse = '1' then
   AutoTxKickPulse <= '0';
 end if;
 
--- Sticky latch clear: µC writes any value to LastTxTargetAddr to clear it.
--- This sets a pulse in SysClk domain; phy_out_gating synchronises it.
+---- Sticky latch clear: µC writes any value to LastTxTargetAddr to clear it.
+---- This sets a pulse in SysClk domain; phy_out_gating synchronises it.
+--if WRDL = 1 and uCA(11 downto 10) = GA
+--      and uCA(9 downto 0) = LastTxTargetAddr then
+--  LastTxTarget_clr_req <= '1';
+--else
+--  LastTxTarget_clr_req <= '0';
+--end if;
+-- Stretch the clear pulse to 3 SysClk cycles so the 3-stage
+-- i50MHz synchroniser in phy_out_gating cannot miss it.
 if WRDL = 1 and uCA(11 downto 10) = GA
       and uCA(9 downto 0) = LastTxTargetAddr then
-  LastTxTarget_clr_req <= '1';
-else
-  LastTxTarget_clr_req <= '0';
+  LastTxTarget_clr_stretch <= "111";   -- load stretch counter
+elsif LastTxTarget_clr_stretch /= "000" then
+  LastTxTarget_clr_stretch <= '0' & LastTxTarget_clr_stretch(2 downto 1);
 end if;
-
+LastTxTarget_clr_req <= LastTxTarget_clr_stretch(0);
 
 -- Sticky latch: capture which port AutoTx just finished targeting
 --if AutoTx_TxEnReqPulse = '1' then
