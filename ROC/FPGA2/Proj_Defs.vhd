@@ -156,7 +156,7 @@ constant AutoTxKickAddr     : std_logic_vector(9 downto 0) := "00" & X"4D";  -- 
 
 -- Sticky last-TX target register: latches CurrentTarget at each PhyTxBuff_rdreq pulse.
 -- Read to see which lane was last targeted; write any value to clear.
-constant LastTxTargetAddr : std_logic_vector(9 downto 0) := "00" & X"4B";  -- 0x04B
+constant LastTxTargetAddr : std_logic_vector(9 downto 0) := "00" & X"49";  -- 0x04B
 
 
 ---------------------- Broadcast addresses ------------------------------
@@ -401,6 +401,8 @@ COMPONENT PhyRxBuff
     empty : OUT STD_LOGIC;
     rd_data_count : OUT STD_LOGIC_VECTOR(11 DOWNTO 0));
 END COMPONENT;
+
+
 
 COMPONENT FEBRx_test_Buff
   PORT (

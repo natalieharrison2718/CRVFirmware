@@ -63,10 +63,17 @@ entity Controller_FPGA2 is port(
 	SPICS,SPISClk,SPIMOSI : buffer std_logic;
 	SPIMISO : in std_logic;
 -- Debug port
-	Debug : buffer std_logic_vector(10 downto 1);
+	Debug : buffer std_logic_vector(10 downto 1)
 	--Debug : buffer std_logic_vector(10 downto 1);
     -- debug outputs for testbench visibility
-    debug_ReadyStatus : out std_logic_vector(7 downto 0)
+	-- synthesis translate_off
+	;
+	probe_MaskReg         : out std_logic_vector(7 downto 0);
+	probe_PhyRxEmpty      : out std_logic_vector(7 downto 0);
+	probe_Rx_active       : out std_logic_vector(7 downto 0);
+	probe_PhyTxBuff_Count : out std_logic_vector(10 downto 0);
+	probe_ReadyStatus     : out std_logic_vector(7 downto 0)
+	-- synthesis translate_on	 
 );
 
 end Controller_FPGA2;
@@ -89,10 +96,18 @@ Type Array_8x32 is Array(0 to 7) of std_logic_vector(31 downto 0);
 Type Array_3x8x16 is Array(0 to 2) of Array_8x16;
 
 
+
 -- Reset synchroniser signals
 signal CpldRst_ibuf : std_logic;
 signal CpldRst_r    : std_logic_vector(1 downto 0) := "00";
 signal CpldRst_sync : std_logic;
+
+-- FIX 1b: PhyPDn_sync(1) is the i50MHz-safe version of PhyPDn.
+-- Use PhyPDn_sync(1) in any i50MHz-domain process that needs to READ PhyPDn.
+-- Currently PhyPDn is only driven (not read) in i50MHz processes,
+-- so no substitution is required today, but the synchroniser is in place
+-- for any future i50MHz-domain gating on PhyPDn.
+signal PhyPDn_sync  : std_logic_vector(1 downto 0) := "11";
 
 
 -- Clock and reset signals
@@ -269,6 +284,8 @@ signal FEBRxIn : Array_InRec_x8;
 signal RxDl : Array_8x2;
 signal TransitionCount : Array_8x4;
 signal Rx_active : std_logic_vector(7 downto 0);
+signal Rx_active_rxclk    : std_logic_vector(7 downto 0);  -- ADD: RxFMClk-domain copy
+signal Rx_active_sync     : Array_8x2;                      -- ADD: 2-FF synchroniser
 signal LinkStatEn : std_logic;
 signal LinkTxFullCnt : std_logic_vector(7 downto 0);
 
@@ -281,9 +298,10 @@ signal LinkTxFull,LinkTxEmpty,LinkTxWrReq,LinkTxRDReq,TxValid,LinkTxTraceWrReq :
 
 -- Added 11/24: PHY to FEB signal for prefetch filling
 -- Ready notification / edge-detect signals (per PHY port)
-signal phy_empty_d    : Array_8x2 := (others => (others => '0'));  -- delayed copy for edge detect
+signal phy_empty_d    : Array_8x2 := (others => (others => '1'));  -- delayed copy for edge detect
 signal ReadyStatus    : std_logic_vector(7 downto 0) := (others => '0');  -- sticky ready bits
 
+signal DeadWindowCount : Array_8x4;   -- counts consecutive zero-transition windows
 
 -- debug trace buffer
 signal LinkTxTraceRDReq : std_logic;
@@ -334,10 +352,9 @@ signal LastTxTarget : std_logic_vector(7 downto 0) := (others => '0');
 -- (SysClk ? i50MHz):
 signal LastTxTarget_clr_req  : std_logic := '0';  -- set by main (SysClk)
 signal LastTxTarget_clr_sync : std_logic_vector(2 downto 0) := "000"; -- sync in i50MHz
-signal port_full : std_logic_vector(7 downto 0); -- hook this to your per-port FIFO-full flags
+signal port_full : std_logic_vector(7 downto 0); -- hook this to your per-port FIFO-full flagssignal debug_ReadyStatus     : std_logic_vector(7 downto 0);
 
-
--- CurrentTarget is derived at transmit time to guarantee only one port
+  -- CurrentTarget is derived at transmit time to guarantee only one port
 -- actually receives the 4 nibbles for a single FIFO read.  It picks
 -- AutoTx_Target (one-hot) if set, otherwise selects the lowest-indexed
 -- bit from TxEn so we never drive more than one PHY at once.
@@ -388,6 +405,18 @@ begin
     CpldRst_r(1) <= CpldRst_r(0);
   end if;
 end process rst_sync_proc;
+
+PhyPDn_sync_proc : process(i50MHz)
+begin
+  if rising_edge(i50MHz) then
+    if CpldRst_sync = '0' then
+      PhyPDn_sync <= "11";        -- safe default: PHY powered down
+    else
+      PhyPDn_sync(0) <= PhyPDn;
+      PhyPDn_sync(1) <= PhyPDn_sync(0);
+    end if;
+  end if;
+end process PhyPDn_sync_proc;
 
 CpldRst_sync <= CpldRst_r(1);
 ResetHi <= not CpldRst_sync;
@@ -707,7 +736,7 @@ PhyRx_Proc : process(CpldRst_sync, RxFMClk)
 begin
 
  --if CpldRst = '0' then
- if CpldRst_sync = '0' then
+ if CpldRst_sync = '0' or PllLock = '0' then
 
 
     PhyRxBuff_wreq(i) <= '0'; RxClkDL(i) <= "00";
@@ -802,7 +831,7 @@ end if;
 
 -- When the word has been assembled and pipeline delayed, write to the FIFO
  if StartCount(i) = 6 and iRxDV(i)(0) = '1' and iCRS(i) = '1' and RxClkDL(i) = 2
-  and RxNibbleCount(i) = 3 and Rx_Active(i) = '1' and MaskReg(i) = '1'
+  and RxNibbleCount(i) = 3 and Rx_Active_rxclk(i) = '1' and MaskReg(i) = '1'
  then PhyRxBuff_wreq(i) <= '1'; 
  else PhyRxBuff_wreq(i) <= '0'; 
   end if;
@@ -1154,6 +1183,24 @@ end process;
 -- UBTTarget_wr_en_sync_50(2)='0' and UBTTarget_wr_en_sync_50(1)='1' = rising edge
 
 -- Deterministic transmit gating: hold selected target for exactly 4 nibbles
+
+Rx_active_cdc : process(RxFMClk)
+begin
+  if rising_edge(RxFMClk) then
+    if CpldRst_sync = '0' or PllLock = '0' then
+      Rx_active_sync   <= (others => "00");
+      Rx_active_rxclk  <= (others => '0');
+    else
+      for i in 0 to 7 loop
+        Rx_active_sync(i)(0) <= Rx_active(i);
+        Rx_active_sync(i)(1) <= Rx_active_sync(i)(0);
+      end loop;
+      for i in 0 to 7 loop
+        Rx_active_rxclk(i) <= Rx_active_sync(i)(1);
+      end loop;
+    end if;
+  end if;
+end process Rx_active_cdc;
 
 
 phy_out_gating : process(i50MHz)
@@ -1667,73 +1714,75 @@ variable rs_next : std_logic_vector(7 downto 0);
 	word_number <= (others => '0');
 	EvWdCountTot <= (others => '0');
 	ReadyStatus <= (others => '0');
-	phy_empty_d <= (others => "00"); --Debug(10 downto 8) <= (others => '0'); 
+	phy_empty_d <= (others => "11"); --Debug(10 downto 8) <= (others => '0'); 
 	AutoTxKickMask  <= (others => '0');
 	AutoTxKickPulse <= '0';
    LastTxTarget_clr_req <= '0';
+	TransitionCount    <= (others => X"0");
+	DeadWindowCount    <= (others => X"0");
 	
 
 elsif rising_edge (SysClk) then 
+if PllLock = '1' then
+
 
 -- In main SysClk process, inside rising_edge(SysClk)
+--for p in 0 to 7 loop
+--  -- sample empty (2-stage)
+--  phy_empty_d(p)(1) <= phy_empty_d(p)(0);
+--  phy_empty_d(p)(0) <= PhyRxBuff_Empty(p);
+--
+--  -- arm once we observe any non-empty condition
+--  --if PhyRxBuff_Empty(p) = '0' then
+--    --SeenData(p) <= '1';
+--  --end if;
+--end loop;rs_next := ReadyStatus;-- CORRECT ORDER: initialize rs_next first, THEN use it
+rs_next := ReadyStatus;
+
+-- Update phy_empty_d pipeline (was incorrectly commented out)
 for p in 0 to 7 loop
-  -- sample empty (2-stage)
   phy_empty_d(p)(1) <= phy_empty_d(p)(0);
   phy_empty_d(p)(0) <= PhyRxBuff_Empty(p);
-
-  -- arm once we observe any non-empty condition
-  --if PhyRxBuff_Empty(p) = '0' then
-    --SeenData(p) <= '1';
-  --end if;
 end loop;
 
-
-
-
-
-  rs_next := ReadyStatus;
-
-  -- P4 (lowest): startup broadcast on rising edge of DDRRd_en.
-  -- Sets all MaskReg-enabled ports so UBT-1 packets go out automatically
-  -- when the microcontroller first enables readout, without any kick.
-  if DDRRd_en = '1' and DDRRd_EnD = '0' then
-    for p in 0 to 7 loop
-      if MaskReg(p) = '1' then
-        rs_next(p) := '1';
-      end if;
-    end loop;
-  end if;
-
-  -- P3: set bit when this port's RX FIFO transitions non-empty -> empty.
-  -- The edge detect guarantees data arrived first; no SeenData guard needed.
+-- P4: startup broadcast on rising edge of DDRRd_en
+if DDRRd_en = '1' and DDRRd_EnD = '0' then
   for p in 0 to 7 loop
-    if phy_empty_d(p)(0) = '1' and phy_empty_d(p)(1) = '0'
-       and AutoTx_Claim(p) = '0' then
+    if MaskReg(p) = '1' then
       rs_next(p) := '1';
     end if;
   end loop;
-  
-  if WRDL = 1 and uCA(11 downto 10) = GA
-     and uCA(9 downto 0) = ReadyForceAddr then
-    rs_next := rs_next or uCD(7 downto 0);
+end if;
+
+-- P3: set bit when RX FIFO transitions non-empty->empty
+-- Guard with CpldRst_sync to prevent spurious sets during reset
+for p in 0 to 7 loop
+  if CpldRst_sync = '1'
+     and phy_empty_d(p)(0) = '1'
+     and phy_empty_d(p)(1) = '0'
+     and AutoTx_Claim(p) = '0' then
+    rs_next(p) := '1';
   end if;
+end loop;
 
-  -- P2: AutoTx claim clears (overrides P3/P4 sets from this cycle)
-  if AutoTx_Claim /= X"00" then
-    rs_next := rs_next and (not AutoTx_Claim);
-  end if;
+-- ReadyForce write
+if WRDL = 1 and uCA(11 downto 10) = GA
+   and uCA(9 downto 0) = ReadyForceAddr then
+  rs_next := rs_next or uCD(7 downto 0);
+end if;
 
-  -- P1 (highest): microcontroller explicit clear
-  if WRDL = 1 and uCA(11 downto 10) = GA
-     and uCA(9 downto 0) = ReadyClearAddr then
-    rs_next := rs_next and (not uCD(7 downto 0));
-  end if;
+-- P2: AutoTx claim clears
+if AutoTx_Claim /= X"00" then
+  rs_next := rs_next and (not AutoTx_Claim);
+end if;
 
-  ReadyStatus <= rs_next;
+-- P1: microcontroller explicit clear
+if WRDL = 1 and uCA(11 downto 10) = GA
+   and uCA(9 downto 0) = ReadyClearAddr then
+  rs_next := rs_next and (not uCD(7 downto 0));
+end if;
 
-
-
-   
+ReadyStatus <= rs_next;   
 -- Synchronous edge detectors for read and write strobes
 RDDL(0) <= not uCRD and not CpldCS;
 RDDL(1) <= RDDL(0); 
@@ -1741,8 +1790,14 @@ RDDL(1) <= RDDL(0);
 WRDL(0) <= not uCWR and not CpldCS;
 WRDL(1) <= WRDL(0);
 
-debug_ReadyStatus <= ReadyStatus;
-UBTTarget_rd_en_sync <= UBTTarget_rd_en_sync(0) & UBTTarget_rd_en;
+-- synthesis translate_off
+probe_ReadyStatus     <= ReadyStatus;
+probe_MaskReg         <= MaskReg;
+probe_PhyRxEmpty      <= PhyRxBuff_Empty;
+probe_Rx_active       <= Rx_active;
+probe_PhyTxBuff_Count <= PhyTxBuff_Count;
+-- synthesis translate_on
+
 
 -- Latch the address for post increment during reads
 if RDDL = 1 or WRDL = 1 then AddrReg <= uCA;
@@ -1816,19 +1871,42 @@ RxDl(i)(0) <= FMRx(i);
 RxDl(i)(1) <= RxDl(i)(0);
 
 -- Increment this count with FEB LVDS Rx transistions, clear it periodically
-if Counter10us(5 downto 0) = "00" & X"0" then TransitionCount(i) <= X"0";
-elsif (RxDl(i)(0) = '1' xor RxDl(i)(1) = '1') and TransitionCount(i) /= 15
-then TransitionCount(i) <= TransitionCount(i) + 1;
-else TransitionCount(i) <= TransitionCount(i);
+--if Counter10us(5 downto 0) = "00" & X"0" then TransitionCount(i) <= X"0";
+--elsif (RxDl(i)(0) = '1' xor RxDl(i)(1) = '1') and TransitionCount(i) /= 15
+--then TransitionCount(i) <= TransitionCount(i) + 1;
+--else TransitionCount(i) <= TransitionCount(i);
+--end if;
+--
+---- At the end of the timing interval check to see if there were FM transitions
+--if    Counter10us(5 downto 0) = "00" & X"0" and TransitionCount(i) = 15 and MaskReg(i) = '1' 
+--	then Rx_active(i) <= '1';
+--elsif (Counter10us(5 downto 0) = "00" & X"0" and TransitionCount(i) = 0) or  MaskReg(i) = '0' 
+--	then Rx_active(i) <= '0';
+--else Rx_active(i) <= Rx_active(i);
+--end if;
+if Counter10us(5 downto 0) = "00" & X"0" then
+    TransitionCount(i) <= X"0";  -- always reset the counter at evaluation
+
+    if TransitionCount(i) = 15 and MaskReg(i) = '1' then
+        -- Link is active this window
+        Rx_active(i)        <= '1';
+        DeadWindowCount(i)  <= X"0";   -- reset dead-window counter
+    elsif TransitionCount(i) = 0 then
+        -- No transitions this window: increment dead counter
+        if DeadWindowCount(i) /= 15 then
+            DeadWindowCount(i) <= DeadWindowCount(i) + 1;
+        end if;
+        -- Only clear Rx_active after 4 consecutive dead windows (~2.5 us quiet)
+        if DeadWindowCount(i) >= 4 or MaskReg(i) = '0' then
+            Rx_active(i) <= '0';
+        end if;
+    end if;
+else
+    if MaskReg(i) = '0' then
+        Rx_active(i) <= '0';  -- immediate clear if masked
+    end if;
 end if;
 
--- At the end of the timing interval check to see if there were FM transitions
-if    Counter10us(5 downto 0) = "00" & X"0" and TransitionCount(i) = 15 and MaskReg(i) = '1' 
-	then Rx_active(i) <= '1';
-elsif (Counter10us(5 downto 0) = "00" & X"0" and TransitionCount(i) = 0) or  MaskReg(i) = '0' 
-	then Rx_active(i) <= '0';
-else Rx_active(i) <= Rx_active(i);
-end if;
 
 end loop;
 
@@ -1911,27 +1989,47 @@ end if;
 --else TrigReqCount <= TrigReqCount;
 --end if;
 
+
 if WRDL = 1 and ((uCA(11 downto 10) = GA and uCA(9 downto 0) = CSRRegAddr)
-					or (uCA(9 downto 0) = CSRBroadCastAd))
-then RxBuffRst <= uCD(0);
-	  LinkRst <= uCD(1);
-	  PhyPDn <= not uCD(2);
-	  FMRxEn <= uCD(3);
-	  DDRWrt_En <= uCD(5);
-	  PhyDatSel <= uCD(6);
-	  DDRRd_en <= uCD(7);
-	  InitReq <= uCD(8);
-	  TrigWdCntRst <= uCD(9);
-else PhyPDn <= PhyPDn;
-	  LinkRst <= '0';
-	  FMRxEn <= FMRxEn;
-     RxBuffRst <= '0';
-	  DDRWrt_En <= DDRWrt_En;
-	  PhyDatSel <= PhyDatSel;
-	  DDRRd_en <= DDRRd_en;
-	  InitReq <= '0';
-	  TrigWdCntRst <= '0';
+                or (uCA(9 downto 0) = CSRBroadCastAd))
+then
+  LinkRst      <= uCD(1);
+  PhyPDn       <= not uCD(2);
+  FMRxEn       <= uCD(3);
+  DDRWrt_En    <= uCD(5);
+  PhyDatSel    <= uCD(6);
+  DDRRd_en     <= uCD(7);
+  InitReq      <= uCD(8);
+  TrigWdCntRst <= uCD(9);
+else
+  PhyPDn       <= PhyPDn;
+  LinkRst      <= '0';
+  FMRxEn       <= FMRxEn;
+  DDRWrt_En    <= DDRWrt_En;
+  PhyDatSel    <= PhyDatSel;
+  DDRRd_en     <= DDRRd_en;
+  InitReq      <= '0';
+  TrigWdCntRst <= '0';
 end if;
+
+-- FIX 1c BLOCK B: RxBuffRst is a single-cycle pulse ? decoded separately
+-- so that unrelated CSR writes (e.g. PhyPDn=0) do NOT accidentally pulse it
+if WRDL = 1 and ((uCA(11 downto 10) = GA and uCA(9 downto 0) = CSRRegAddr)
+                or (uCA(9 downto 0) = CSRBroadCastAd))
+  and uCD(0) = '1'
+then RxBuffRst <= '1';
+else RxBuffRst <= '0';
+end if;
+
+
+
+
+
+
+
+
+
+
 
 -- This is a copy of the data bit set in FPGA 1. 0 : the DReqFM bit becomes the "and" of the 
 -- three link FIFO empty flags. 1 : The bit is FM data containig data request packets.
@@ -2674,6 +2772,7 @@ Case DDR_Write_Seq is
 --Debug(4) <= PhyRxBuff_Empty(0);
 --if PhyRxBuff_rdreq = 0 then Debug(3) <= '0'; else Debug(3) <= '1'; end if;
 
+end if; --PllLock
 end if; -- CpldRst
 
 end process main;
