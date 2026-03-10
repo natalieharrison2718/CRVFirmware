@@ -364,6 +364,9 @@ signal LastTxTarget_clr_sync : std_logic_vector(2 downto 0) := "000"; -- sync in
 signal LastTxTarget_clr_stretch : std_logic_vector(2 downto 0) := "000";
 signal port_full : std_logic_vector(7 downto 0); -- hook this to your per-port FIFO-full flagssignal debug_ReadyStatus     : std_logic_vector(7 downto 0);
 
+signal RoundRobin_Last : integer range 0 to 7 := 0;
+
+
   -- CurrentTarget is derived at transmit time to guarantee only one port
 -- actually receives the 4 nibbles for a single FIFO read.  It picks
 -- AutoTx_Target (one-hot) if set, otherwise selects the lowest-indexed
@@ -1369,6 +1372,7 @@ begin
           if onehot /= X"00" then
             AutoTx_Target      <= onehot;
             AutoTx_Port        <= 0;
+			   RoundRobin_Last    <= 0;
             AutoTx_WordIdx     <= 0;
             AutoTx_Claim       <= onehot;
             AutoTx_Active      <= '1';
@@ -1378,15 +1382,19 @@ begin
         else
           -- Normal scan of ReadyStatus
           found_port := 0; have_port := false;
-          for p in 0 to 7 loop
-            if ReadyStatus(p) = '1' then
-              found_port := p; have_port := true; exit;
-            end if;
-          end loop;
+			-- scan from last+1 wrapping around
+			for i in 0 to 7 loop
+				if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' then
+					found_port := (RoundRobin_Last + 1 + i) mod 8;
+					have_port  := true;
+					exit;
+				end if;
+			end loop;
 
           if have_port and PhyTxBuff_Full = '0'
              and PhyTxBuff_wreq = '0' and UBTTarget_full = '0' then
             AutoTx_Port               <= found_port;
+				RoundRobin_Last           <= found_port;
             AutoTx_WordIdx            <= 0;
             AutoTx_Claim(found_port)  <= '1';
             AutoTx_Active             <= '1';
@@ -1453,18 +1461,21 @@ begin
       -- State "011": check for next ready port immediately
       -- -------------------------------------------------------
       when "011" =>
-        AutoTx_Target <= (others => '0');
+			AutoTx_Target <= (others => '0');
 
-        found_port := 0; have_port := false;
-        for p in 0 to 7 loop
-          if ReadyStatus(p) = '1' then
-            found_port := p; have_port := true; exit;
-          end if;
-        end loop;
+			found_port := 0; have_port := false;
+			for i in 0 to 7 loop                    -- round robin scan
+				if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' then
+					found_port := (RoundRobin_Last + 1 + i) mod 8;
+					have_port  := true;
+					exit;
+				end if;
+			end loop;
 
         if have_port and PhyTxBuff_Full = '0'
            and PhyTxBuff_wreq = '0' and UBTTarget_full = '0' then
           AutoTx_Port               <= found_port;
+			 RoundRobin_Last           <= found_port;
           AutoTx_WordIdx            <= 0;
           AutoTx_Claim(found_port)  <= '1';
           AutoTx_Active             <= '1';
