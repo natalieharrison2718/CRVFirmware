@@ -332,7 +332,7 @@ signal PhyTxDin_FPGA      : std_logic_vector(15 downto 0) := (others => '0'); --
 signal PhyTxDin_mux       : std_logic_vector(15 downto 0) := (others => '0'); -- selected DIN to PhyTx_Buff (uC or FPGA)
 signal PhyTxBuff_wr_en_mux: std_logic := '0';                                  -- combined wr_en into PhyTx_Buff
 signal PhyTxWrReq_FPGA    : std_logic := '0';                                  -- one-cycle FPGA write request
-signal AutoTx_State       : std_logic_vector(2 downto 0) := "000";              -- small FSM state
+signal AutoTx_State       : std_logic_vector(2 downto 0) := "000";              -- "000"=Idle, "001"=Send UBT, "010"=Wait reply, "011"=Immediate scan, "100"=Wait for FIFO empty
 signal AutoTx_Port        : integer range 0 to 7 := 0;
 signal AutoTx_WordIdx     : integer range 0 to 15 := 0; -- supports up to 16-word packets if needed
 signal AutoTx_WordPending : std_logic := '0';  -- internal one-cycle writer strobe tracker
@@ -1302,147 +1302,261 @@ begin
       AutoTx_WordPending <= '0';
     end if;
 
-    case AutoTx_State is
+		case AutoTx_State is
+  -- "000": Idle ? scan for a ready lane and only send UBT if buffer is empty
+  when "000" =>
+    AutoTx_Active <= '0';
+    AutoTx_Target <= (others => '0');
+    found_port := 0; have_port := false;
 
-      -- -------------------------------------------------------
-      -- State "000": idle ? find next port to send UBT to
-      -- -------------------------------------------------------
-      when "000" =>
-        AutoTx_Active <= '0';
-        AutoTx_Target <= (others => '0');
+    for i in 0 to 7 loop
+      if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' then
+        found_port := (RoundRobin_Last + 1 + i) mod 8;
+        have_port  := true;
+        exit;
+      end if;
+    end loop;
+    -- Only send UBT if buffer is empty
+    if have_port and PhyTxBuff_Empty = '1'
+       and PhyTxBuff_Full = '0'
+       and PhyTxBuff_wreq = '0'
+       and UBTTarget_full = '0' then
+      AutoTx_Port               <= found_port;
+      RoundRobin_Last           <= found_port;
+      AutoTx_WordIdx            <= 0;
+      AutoTx_Claim(found_port)  <= '1';
+      AutoTx_Active             <= '1';
+      onehot                    := (others => '0');
+      onehot(found_port)        := '1';
+      AutoTx_Target             <= onehot;
+      AutoTx_State              <= "001";
+    end if;
 
-        if AutoTxKickPulse = '1' and PhyTxBuff_Full = '0'
-           and PhyTxBuff_wreq = '0' and UBTTarget_full = '0' then
-          -- Forced kick: lowest set bit of AutoTxKickMask
-          onehot := (others => '0');
-          for p in 0 to 7 loop
-            if AutoTxKickMask(p) = '1' then
-              onehot(p) := '1';
-              exit;
-            end if;
-          end loop;
-          if onehot /= X"00" then
-            AutoTx_Target      <= onehot;
-            AutoTx_Port        <= 0;
-			   RoundRobin_Last    <= 0;
-            AutoTx_WordIdx     <= 0;
-            AutoTx_Claim       <= onehot;
-            AutoTx_Active      <= '1';
-            AutoTx_State       <= "001";
-          end if;
+  -- "001": Write UBT packet words
+  when "001" =>
+    if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0'
+       and PhyTxBuff_wreq = '0' then
 
-        else
-          -- Normal scan of ReadyStatus
-          found_port := 0; have_port := false;
-			-- scan from last+1 wrapping around
-			for i in 0 to 7 loop
-				if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' then
-					found_port := (RoundRobin_Last + 1 + i) mod 8;
-					have_port  := true;
-					exit;
-				end if;
-			end loop;
+      PhyTxDin_FPGA      <= ubt_ascii_word(AutoTx_WordIdx, '1');
+      PhyTxWrReq_FPGA    <= '1';
+      AutoTx_WordPending <= '1';
 
-          if have_port and PhyTxBuff_Full = '0'
-             and PhyTxBuff_wreq = '0' and UBTTarget_full = '0' then
-            AutoTx_Port               <= found_port;
-				RoundRobin_Last           <= found_port;
-            AutoTx_WordIdx            <= 0;
-            AutoTx_Claim(found_port)  <= '1';
-            AutoTx_Active             <= '1';
-            onehot                    := (others => '0');
-            onehot(found_port)        := '1';
-            AutoTx_Target             <= onehot;
-            AutoTx_State              <= "001";
-          end if;
-        end if;
+      if AutoTx_WordIdx = 0 then
+        UBTTarget_din            <= AutoTx_Target;
+        UBTTarget_wr_en_stretch  <= "111";
+      end if;
 
-      -- -------------------------------------------------------
-      -- State "001": write UBT packet words
-      -- -------------------------------------------------------
-      when "001" =>
-        if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0'
-           and PhyTxBuff_wreq = '0' then
+      if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
+        -- Packet complete. Request PHY TX enable.
+        AutoTx_TxEnReqPulse <= '1';
+        AutoTx_WordIdx      <= 0;
+        AutoTx_Active       <= '0';
+        AutoTx_WaitMask     <= AutoTx_Target;
+        AutoTx_WaitTimeout  <= 10000000;
+        AutoTx_State        <= "100";   -- Now wait for buffer to drain
+      else
+        AutoTx_WordIdx <= AutoTx_WordIdx + 1;
+      end if;
+    end if;
 
-          PhyTxDin_FPGA      <= ubt_ascii_word(AutoTx_WordIdx, '1');
-          PhyTxWrReq_FPGA    <= '1';
-          AutoTx_WordPending <= '1';
+  -- "100": Wait for PhyTxBuff_Empty after UBT send
+  when "100" =>
+    if PhyTxBuff_Empty = '1' then
+      -- After buffer drains, wait for FEB reply (RX FIFO fill for the lane)
+      AutoTx_State <= "010";
+    end if;
 
-          if AutoTx_WordIdx = 0 then
-            -- load the stretch shift register instead of a bare one-cycle pulse
-				UBTTarget_din            <= AutoTx_Target;
-				UBTTarget_wr_en_stretch  <= "111";   -- will stay high for 3 SysClk cycles
-          end if;
+  -- "010": Wait for reply from FEB (RX FIFO for the lane fills)
+  when "010" =>
+    -- PhyRxFilled is a one-cycle pulse per port, AND with AutoTx_WaitMask gives the port(s) we?re tracking
+    if (PhyRxFilled and AutoTx_WaitMask) /= X"00" then
+      -- Reply arrived; move to immediate scan for next lane
+      AutoTx_WaitMask    <= (others => '0');
+      AutoTx_WaitTimeout <= 0;
+      AutoTx_State       <= "011";
+    elsif AutoTx_WaitTimeout > 0 then
+      AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+    else
+      -- Timeout (no reply)?move on anyway, clear mask
+      AutoTx_WaitMask    <= (others => '0');
+      AutoTx_State       <= "011";
+    end if;
 
-          if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
-            -- Packet complete: request PHY TX enable, then wait for FEB reply
-            AutoTx_TxEnReqPulse <= '1';
-            AutoTx_WordIdx      <= 0;
-            AutoTx_Active       <= '0';
-            -- Record which port we are waiting on
-            AutoTx_WaitMask     <= AutoTx_Target;
-            AutoTx_WaitTimeout  <= 10000000;  -- ~100 ms at 100 MHz
-            AutoTx_State        <= "010";
-          else
-            AutoTx_WordIdx <= AutoTx_WordIdx + 1;
-          end if;
-        end if;
+  -- "011": Immediate scan for more ready lanes (optional; could just return to "000")
+  when "011" =>
+    AutoTx_Target <= (others => '0');
+    found_port := 0; have_port := false;
+    for i in 0 to 7 loop
+      if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' then
+        found_port := (RoundRobin_Last + 1 + i) mod 8;
+        have_port  := true;
+        exit;
+      end if;
+    end loop;
+    if have_port and PhyTxBuff_Empty = '1'
+       and PhyTxBuff_Full = '0'
+       and PhyTxBuff_wreq = '0'
+       and UBTTarget_full = '0' then
+      AutoTx_Port               <= found_port;
+      RoundRobin_Last           <= found_port;
+      AutoTx_WordIdx            <= 0;
+      AutoTx_Claim(found_port)  <= '1';
+      AutoTx_Active             <= '1';
+      onehot                    := (others => '0');
+      onehot(found_port)        := '1';
+      AutoTx_Target             <= onehot;
+      AutoTx_State              <= "001";
+    else
+      AutoTx_State <= "000";
+    end if;
 
-      -- -------------------------------------------------------
-      -- State "010": wait for FEB RX FIFO to go non-empty
-      --              (PhyRxFilled is a one-cycle pulse in SysClk domain)
-      -- -------------------------------------------------------
-      when "010" =>
-        -- Check whether the waited-on port's FIFO just filled
-        if (PhyRxFilled and AutoTx_WaitMask) /= X"00" then
-          -- FEB responded: move on to check for more ports
-          AutoTx_WaitMask    <= (others => '0');
-          AutoTx_WaitTimeout <= 0;
-          AutoTx_State       <= "011";
+  -- catch-all
+  when others =>
+    AutoTx_State <= "000";
+end case;
 
-        elsif AutoTx_WaitTimeout > 0 then
-          -- Still waiting
-          AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
 
-        else
-          -- Timeout: give up waiting, move on anyway
-          AutoTx_WaitMask    <= (others => '0');
-          AutoTx_State       <= "011";
-        end if;
-
-      -- -------------------------------------------------------
-      -- State "011": check for next ready port immediately
-      -- -------------------------------------------------------
-      when "011" =>
-			AutoTx_Target <= (others => '0');
-
-			found_port := 0; have_port := false;
-			for i in 0 to 7 loop                    -- round robin scan
-				if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' then
-					found_port := (RoundRobin_Last + 1 + i) mod 8;
-					have_port  := true;
-					exit;
-				end if;
-			end loop;
-
-        if have_port and PhyTxBuff_Full = '0'
-           and PhyTxBuff_wreq = '0' and UBTTarget_full = '0' then
-          AutoTx_Port               <= found_port;
-			 RoundRobin_Last           <= found_port;
-          AutoTx_WordIdx            <= 0;
-          AutoTx_Claim(found_port)  <= '1';
-          AutoTx_Active             <= '1';
-          onehot                    := (others => '0');
-          onehot(found_port)        := '1';
-          AutoTx_Target             <= onehot;
-          AutoTx_State              <= "001";
-        else
-          AutoTx_State <= "000";
-        end if;
-
-      when others =>
-        AutoTx_State <= "000";
-    end case;
+--    case AutoTx_State is
+--
+--      -- -------------------------------------------------------
+--      -- State "000": idle ? find next port to send UBT to
+--      -- -------------------------------------------------------
+--      when "000" =>
+--        AutoTx_Active <= '0';
+--        AutoTx_Target <= (others => '0');
+--
+--        if AutoTxKickPulse = '1' and PhyTxBuff_Full = '0'
+--           and PhyTxBuff_wreq = '0' and UBTTarget_full = '0' then
+--          -- Forced kick: lowest set bit of AutoTxKickMask
+--          onehot := (others => '0');
+--          for p in 0 to 7 loop
+--            if AutoTxKickMask(p) = '1' then
+--              onehot(p) := '1';
+--              exit;
+--            end if;
+--          end loop;
+--          if onehot /= X"00" then
+--            AutoTx_Target      <= onehot;
+--            AutoTx_Port        <= 0;
+--			   RoundRobin_Last    <= 0;
+--            AutoTx_WordIdx     <= 0;
+--            AutoTx_Claim       <= onehot;
+--            AutoTx_Active      <= '1';
+--            AutoTx_State       <= "001";
+--          end if;
+--
+--        else
+--          -- Normal scan of ReadyStatus
+--          found_port := 0; have_port := false;
+--			-- scan from last+1 wrapping around
+--			for i in 0 to 7 loop
+--				if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' then
+--					found_port := (RoundRobin_Last + 1 + i) mod 8;
+--					have_port  := true;
+--					exit;
+--				end if;
+--			end loop;
+--
+--          if have_port and PhyTxBuff_Full = '0'
+--             and PhyTxBuff_wreq = '0' and UBTTarget_full = '0' then
+--            AutoTx_Port               <= found_port;
+--				RoundRobin_Last           <= found_port;
+--            AutoTx_WordIdx            <= 0;
+--            AutoTx_Claim(found_port)  <= '1';
+--            AutoTx_Active             <= '1';
+--            onehot                    := (others => '0');
+--            onehot(found_port)        := '1';
+--            AutoTx_Target             <= onehot;
+--            AutoTx_State              <= "001";
+--          end if;
+--        end if;
+--
+--      -- -------------------------------------------------------
+--      -- State "001": write UBT packet words
+--      -- -------------------------------------------------------
+--      when "001" =>
+--        if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0'
+--           and PhyTxBuff_wreq = '0' then
+--
+--          PhyTxDin_FPGA      <= ubt_ascii_word(AutoTx_WordIdx, '1');
+--          PhyTxWrReq_FPGA    <= '1';
+--          AutoTx_WordPending <= '1';
+--
+--          if AutoTx_WordIdx = 0 then
+--            -- load the stretch shift register instead of a bare one-cycle pulse
+--				UBTTarget_din            <= AutoTx_Target;
+--				UBTTarget_wr_en_stretch  <= "111";   -- will stay high for 3 SysClk cycles
+--          end if;
+--
+--          if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
+--            -- Packet complete: request PHY TX enable, then wait for FEB reply
+--            AutoTx_TxEnReqPulse <= '1';
+--            AutoTx_WordIdx      <= 0;
+--            AutoTx_Active       <= '0';
+--            -- Record which port we are waiting on
+--            AutoTx_WaitMask     <= AutoTx_Target;
+--            AutoTx_WaitTimeout  <= 10000000;  -- ~100 ms at 100 MHz
+--            AutoTx_State        <= "010";
+--          else
+--            AutoTx_WordIdx <= AutoTx_WordIdx + 1;
+--          end if;
+--        end if;
+--
+--      -- -------------------------------------------------------
+--      -- State "010": wait for FEB RX FIFO to go non-empty
+--      --              (PhyRxFilled is a one-cycle pulse in SysClk domain)
+--      -- -------------------------------------------------------
+--      when "010" =>
+--        -- Check whether the waited-on port's FIFO just filled
+--        if (PhyRxFilled and AutoTx_WaitMask) /= X"00" then
+--          -- FEB responded: move on to check for more ports
+--          AutoTx_WaitMask    <= (others => '0');
+--          AutoTx_WaitTimeout <= 0;
+--          AutoTx_State       <= "011";
+--
+--        elsif AutoTx_WaitTimeout > 0 then
+--          -- Still waiting
+--          AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+--
+--        else
+--          -- Timeout: give up waiting, move on anyway
+--          AutoTx_WaitMask    <= (others => '0');
+--          AutoTx_State       <= "011";
+--        end if;
+--
+--      -- -------------------------------------------------------
+--      -- State "011": check for next ready port immediately
+--      -- -------------------------------------------------------
+--      when "011" =>
+--			AutoTx_Target <= (others => '0');
+--
+--			found_port := 0; have_port := false;
+--			for i in 0 to 7 loop                    -- round robin scan
+--				if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' then
+--					found_port := (RoundRobin_Last + 1 + i) mod 8;
+--					have_port  := true;
+--					exit;
+--				end if;
+--			end loop;
+--
+--        if have_port and PhyTxBuff_Full = '0'
+--           and PhyTxBuff_wreq = '0' and UBTTarget_full = '0' then
+--          AutoTx_Port               <= found_port;
+--			 RoundRobin_Last           <= found_port;
+--          AutoTx_WordIdx            <= 0;
+--          AutoTx_Claim(found_port)  <= '1';
+--          AutoTx_Active             <= '1';
+--          onehot                    := (others => '0');
+--          onehot(found_port)        := '1';
+--          AutoTx_Target             <= onehot;
+--          AutoTx_State              <= "001";
+--        else
+--          AutoTx_State <= "000";
+--        end if;
+--
+--      when others =>
+--        AutoTx_State <= "000";
+--    end case;
   end if;
 end process AutoTx_Proc;
 
