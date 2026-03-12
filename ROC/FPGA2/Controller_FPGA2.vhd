@@ -1319,31 +1319,31 @@ begin
 --    end loop;
 	 
 	 for i in 0 to 7 loop
-		if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' and UBT_in_progress((RoundRobin_Last + 1 + i) mod 8) = '0' then
-			found_port := (RoundRobin_Last + 1 + i) mod 8;
-			have_port := true;
-		exit;
-		end if;
-	 end loop;
-	 
-	 
-    -- Only send UBT if buffer is empty
-    if have_port and PhyTxBuff_Empty = '1'
-       and PhyTxBuff_Full = '0'
-       and PhyTxBuff_wreq = '0'
-       and UBTTarget_full = '0' then
-		UBT_in_progress(found_port) <= '1'; 
-      AutoTx_Port               <= found_port;
-      RoundRobin_Last           <= found_port;
-      AutoTx_WordIdx            <= 0;
-      AutoTx_Claim(found_port)  <= '1';
-      AutoTx_Active             <= '1';
-      onehot                    := (others => '0');
-      onehot(found_port)        := '1';
-      AutoTx_Target             <= onehot;
-      AutoTx_State              <= "001";
-    end if;
+  if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' and UBT_in_progress((RoundRobin_Last + 1 + i) mod 8) = '0' then
+    found_port := (RoundRobin_Last + 1 + i) mod 8;
+    have_port := true;
+    exit;
+  end if;
+end loop;
 
+if have_port and PhyTxBuff_Empty = '1'
+   and PhyTxBuff_Full = '0'
+   and PhyTxBuff_wreq = '0'
+   and UBTTarget_full = '0' then
+  -- Set handshake in-progress BEFORE UBT is queued, so port is not picked again
+  UBT_in_progress(found_port) <= '1'; 
+  -- CLEAR ReadyStatus immediately via claim
+  AutoTx_Claim(found_port) <= '1';
+  -- Queue UBT for this port
+  AutoTx_Port               <= found_port;
+  RoundRobin_Last           <= found_port;
+  AutoTx_WordIdx            <= 0;
+  AutoTx_Active             <= '1';
+  onehot                    := (others => '0');
+  onehot(found_port)        := '1';
+  AutoTx_Target             <= onehot;
+  AutoTx_State              <= "001";
+end if;
   -- "001": Write UBT packet words
   when "001" =>
     if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0'
@@ -1582,6 +1582,8 @@ end process AutoTx_Proc;
 ----------------------- 100 Mhz clocked logic -----------------------------
 
 main : process(SysClk, CpldRst_sync)
+variable next_ready : std_logic_vector(7 downto 0);
+  variable handshake_busy : boolean;
 variable rs_next : std_logic_vector(7 downto 0);
  begin 
 
@@ -1653,6 +1655,30 @@ for p in 0 to 7 loop
   phy_empty_d(p)(0) <= PhyRxBuff_Empty(p);
 end loop;
 
+
+-- Determine if any handshake is in progress
+  handshake_busy := false;
+  for p in 0 to 7 loop
+    if UBT_in_progress(p) = '1' then
+      handshake_busy := true;
+    end if;
+  end loop;
+
+  -- Only allow new ready bit if no handshake is active
+  if not handshake_busy then
+    -- Scan for masked and eligible ports (not in progress, RX FIFO empty, etc.)
+    for p in 0 to 7 loop
+      if MaskReg(p) = '1' and PhyRxBuff_Empty(p) = '1' and ReadyStatus(p) = '0' then
+        next_ready(p) := '1';
+        -- Only set the lowest-index port, break after first
+        exit;
+      end if;
+    end loop;
+    ReadyStatus <= next_ready;
+  end if;
+
+  -- When handshake finishes, clear UBT_in_progress(port)
+  -- (your AutoTx FSM logic already does this after reply or timeout)
 -- Startup holdoff + PowerOnReady_done
 -- Increment the holdoff counter until it saturates at 0xFF.
 -- Only fire the one-shot ReadyStatus initialisation after the counter
@@ -1664,19 +1690,35 @@ end if;
 -- P5: power-on init ? set ReadyStatus for all masked ports once, on first PllLock
 -- This fires exactly once after reset+PLL-lock, with or without DDRRd_en.
 -- PowerOnReady_done is cleared on reset (in the CpldRst_sync='0' branch).
-if PowerOnReady_done = '0' and StartupHoldoff = X"FF" and CpldRst_sync = '1' then
+--if PowerOnReady_done = '0' and StartupHoldoff = X"FF" and CpldRst_sync = '1' then
+--  for p in 0 to 7 loop
+--    if MaskReg(p) = '1' then
+--      rs_next(p) := '1';
+--    end if;
+--  end loop;
+--  PowerOnReady_done <= '1';
+--end if;
+
+
+handshake_busy := false;
+for p in 0 to 7 loop
+  if UBT_in_progress(p) = '1' then
+    handshake_busy := true;
+  end if;
+end loop;
+
+if not handshake_busy then
+  -- Set only one eligible port (lowest index)
   for p in 0 to 7 loop
-    if MaskReg(p) = '1' then
+    if MaskReg(p) = '1' and PhyRxBuff_Empty(p) = '1' and ReadyStatus(p) = '0' then
       rs_next(p) := '1';
+      exit; -- Only set one
     end if;
   end loop;
-  PowerOnReady_done <= '1';
-end if;
-
--- P4: startup broadcast on rising edge of DDRRd_en
+end if;-- P4: startup broadcast on rising edge of DDRRd_en
 if DDRRd_en = '1' and DDRRd_EnD = '0' then
   for p in 0 to 7 loop
-    if MaskReg(p) = '1' then
+    if MaskReg(p) = '1' and UBT_in_progress(p) = '0' then
       rs_next(p) := '1';
     end if;
   end loop;
@@ -1704,36 +1746,62 @@ end if;
 
 -- P3: set bit when RX FIFO transitions non-empty->empty
 -- Guard with CpldRst_sync to prevent spurious sets during reset
+--for p in 0 to 7 loop
+--  if CpldRst_sync = '1'
+--     and phy_empty_d(p)(0) = '1'
+--     and phy_empty_d(p)(1) = '0'
+--     and AutoTx_Claim(p) = '0' then
+--    rs_next(p) := '1';
+--  end if;
+--end loop;
 for p in 0 to 7 loop
   if CpldRst_sync = '1'
      and phy_empty_d(p)(0) = '1'
      and phy_empty_d(p)(1) = '0'
-     and AutoTx_Claim(p) = '0' then
+     and AutoTx_Claim(p) = '0'
+     and UBT_in_progress(p) = '0' then
     rs_next(p) := '1';
   end if;
 end loop;
 
 -- ReadyForce write
+--if WRDL = 1 and uCA(11 downto 10) = GA
+--   and uCA(9 downto 0) = ReadyForceAddr then
+--  rs_next := rs_next or uCD(7 downto 0);
+--end if;
 if WRDL = 1 and uCA(11 downto 10) = GA
    and uCA(9 downto 0) = ReadyForceAddr then
-  rs_next := rs_next or uCD(7 downto 0);
+  for p in 0 to 7 loop
+    if uCD(p) = '1' and UBT_in_progress(p) = '0' then
+      rs_next(p) := '1';
+    end if;
+  end loop;
 end if;
 
 -- P2: AutoTx claim clears
---if AutoTx_Claim /= X"00" then
---  rs_next := rs_next and (not AutoTx_Claim);
---end if;
+if AutoTx_Claim /= X"00" then
+  rs_next := rs_next and (not AutoTx_Claim);
+end if;
 
 -- P2: use the delayed claim so ReadyStatus is stable for one full cycle
 -- before being cleared, giving AutoTx_Proc time to latch it.
-if AutoTx_Claim_d /= X"00" then
-  rs_next := rs_next and (not AutoTx_Claim_d);
-end if;
+--if AutoTx_Claim_d /= X"00" then
+--  rs_next := rs_next and (not AutoTx_Claim_d);
+--end if;
 
 -- P1: microcontroller explicit clear
+--if WRDL = 1 and uCA(11 downto 10) = GA
+--   and uCA(9 downto 0) = ReadyClearAddr then
+--  rs_next := rs_next and (not uCD(7 downto 0));
+--end if;
 if WRDL = 1 and uCA(11 downto 10) = GA
    and uCA(9 downto 0) = ReadyClearAddr then
-  rs_next := rs_next and (not uCD(7 downto 0));
+  for p in 0 to 7 loop
+    if uCD(p) = '1' and UBT_in_progress(p) = '0' then
+      rs_next(p) := '0';
+    end if;
+    -- If UBT_in_progress(p) = '1', leave rs_next(p) unchanged so handshake is protected
+  end loop;
 end if;
 
 ReadyStatus <= rs_next;   
