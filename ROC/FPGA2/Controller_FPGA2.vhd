@@ -182,6 +182,8 @@ signal PowerOnReady_done : std_logic := '0';
 -- Signals used by DDR write sequencer
 signal PortNo : Integer range 0 to 7; 
 signal MaskReg : std_logic_vector(7 downto 0);
+signal MaskReg_rxclk   : std_logic_vector(7 downto 0) := X"FF";
+signal MaskReg_sync_rx : std_logic_vector(7 downto 0) := X"FF";
 signal EventWdCnt,EventStat : std_logic_vector (15 downto 0);
 signal uBunch : std_logic_vector(31 downto 0);
 signal PortWdCounter : Array_8x16;
@@ -230,10 +232,23 @@ signal PreambleTx_d : std_logic := '0';
 signal PhyRstCnt : std_logic_vector (1 downto 0);
 signal PhyTxBuff_Full,PhyTxBuff_Empty,PhyTxBuff_rdreq,PreambleTx,DDRRd_en,
 		 PhyTxBuff_wreq,TxEnReq,TxEnAck,DDRWrt_En,DDRWrt_EnD,InitReq,PhyDatSel : std_logic;
+signal PhyTxBuff_Empty_sync : std_logic_vector(1 downto 0) := "11";
 signal PhyTxBuff_Count : std_logic_vector (10 downto 0);
 signal PreambleCnt : std_logic_vector (2 downto 0);
 signal TxReg : std_logic_vector (3 downto 0);
 signal Preamble,CRCErr_Reg,TxEnMask : std_logic_vector (7 downto 0);
+
+--synchronised CRC-clear pulse for RxFMClk domain.
+-- CRCErr_Clr_SysClk is a one-cycle SysClk pulse generated in main.
+-- CRCErr_Clr_rxclk is the version safe to use inside PhyRx_Proc (RxFMClk).
+signal CRCErr_Clr_SysClk : std_logic_vector(7 downto 0) := (others => '0');
+-- Two-stage synchroniser per channel: (0)=FF1 metastability, (1)=FF2 stable output
+signal CRCErr_Clr_sync    : Array_8x2 := (others => "00");
+signal CRCErr_Clr_rxclk   : std_logic_vector(7 downto 0) := (others => '0');
+signal CRCErr_Clr_stretch : Array_8x2 := (others => "00"); -- 2-bit stretch per channel
+
+signal TxEnMask_sync : std_logic_vector(7 downto 0) := (others => '0');
+signal TxEnMask_r    : std_logic_vector(7 downto 0) := (others => '0');
 signal PhyTxBuff_Out,PhyTxBuff_Dat : std_logic_vector (15 downto 0);
 -- Add this signal declaration:
 signal PhyTxBuff_Out_r : std_logic_vector(15 downto 0);
@@ -369,7 +384,7 @@ signal LastTxTarget : std_logic_vector(7 downto 0) := (others => '0');
 -- (SysClk ? i50MHz):
 signal LastTxTarget_clr_req  : std_logic := '0';  -- set by main (SysClk)
 signal LastTxTarget_clr_sync : std_logic_vector(2 downto 0) := "000"; -- sync in i50MHz
-signal LastTxTarget_clr_stretch : std_logic_vector(2 downto 0) := "000";
+signal LastTxTarget_clr_stretch : std_logic_vector(5 downto 0) := (others => '0');
 -- signal port_full : std_logic_vector(7 downto 0); -- hook this to your per-port FIFO-full flagssignal debug_ReadyStatus     : std_logic_vector(7 downto 0);
 
 signal RoundRobin_Last : integer range 0 to 7 := 0;
@@ -742,13 +757,16 @@ begin
 	iRxDV(i)(0) <= RxDV(i); iCRS(i) <= CRS(i);
 	iRxDV(i)(1) <= iRxDV(i)(0);
 
+
 -- CRC Error register
 	if iRxDV(i) = 2 and Rx_CRC_Out(i) /= X"C704DD7B" then
-	CRCErr_Reg(i) <= '1';
--- Writing a '1' to the appropriate location will clear the error bit
-	elsif uCWR = '0' and CpldCS = '0' and uCA(11 downto 10) = GA and uCA(9 downto 0) = CRCErrAddr
-		and uCD(i) = '1' then CRCErr_Reg(i) <= '0';
-	else CRCErr_Reg(i) <= CRCErr_Reg(i);
+	  CRCErr_Reg(i) <= '1';
+-- Use the RxFMClk-domain synchronised clear pulse (generated in main, synced
+-- by CRCErr_Clr_cdc).  Never sample raw uC bus signals (uCWR/uCA/uCD) here.
+	elsif CRCErr_Clr_rxclk(i) = '1' then
+	  CRCErr_Reg(i) <= '0';
+	else
+	  CRCErr_Reg(i) <= CRCErr_Reg(i);
 	end if;
 
 -- Modulo four counter used to assemble nibbles into words
@@ -804,7 +822,7 @@ end if;
 
 -- When the word has been assembled and pipeline delayed, write to the FIFO
  if StartCount(i) = 6 and iRxDV(i)(0) = '1' and iCRS(i) = '1' and RxClkDL(i) = 2
-  and RxNibbleCount(i) = 3 and Rx_Active_rxclk(i) = '1' and MaskReg(i) = '1'
+  and RxNibbleCount(i) = 3 and Rx_Active_rxclk(i) = '1' and MaskReg_rxclk(i) = '1'
  then PhyRxBuff_wreq(i) <= '1'; 
  else PhyRxBuff_wreq(i) <= '0'; 
   end if;
@@ -817,6 +835,27 @@ end process PhyRx_Proc;
 
 end generate;
 --Debug(2) <= PhyRxBuff_wreq(1);
+
+-- CDC bridge: transfer the SysClk CRCErr clear pulse into RxFMClk domain.
+-- Two flip-flop synchroniser per channel.  The source pulse is one SysClk
+-- cycle (10 ns); at 200 MHz the destination samples every 5 ns, so a 2-FF
+-- sync is sufficient with standard Xilinx timing constraints.
+CRCErr_Clr_cdc : process(RxFMClk)
+begin
+  if rising_edge(RxFMClk) then
+    if CpldRst_sync = '0' or PllLock = '0' then
+      CRCErr_Clr_sync  <= (others => "00");
+      CRCErr_Clr_rxclk <= (others => '0');
+    else
+      for i in 0 to 7 loop
+        CRCErr_Clr_sync(i)(0) <= CRCErr_Clr_SysClk(i);  -- FF1: metastability
+        CRCErr_Clr_sync(i)(1) <= CRCErr_Clr_sync(i)(0); -- FF2: stable
+        -- Rising-edge detect: pulse was '0', now '1'
+        CRCErr_Clr_rxclk(i)   <= CRCErr_Clr_sync(i)(0) and not CRCErr_Clr_sync(i)(1);
+      end loop;
+    end if;
+  end if;
+end process CRCErr_Clr_cdc;
 
 -- Serializer for MDC links on the Phy chips, SPI ports on the LVDS Tx Chips --
 -- Clock runs at 50 MHz, MDI bit period is 40ns, SPI bit perios is 80ns
@@ -836,12 +875,16 @@ PhyTxBuff_rdreq <= '0'; TxEnAck <= '0'; PreambleTx <= '0';
 PreambleCnt <= "000"; Preamble <= X"00";
 PhyTxBuff_Out_r <= (others => '0');
 TxEnMask <= X"FF";
+TxEnMask_r    <= TxEnMask;       -- FF1 (metastability)
+TxEnMask_sync <= TxEnMask_r;     -- FF2 (stable)
 
 -- Clock fanout SPI signals
 SPI_Adddr <= X"0800"; SPI_Shift <= (others => '0');
 SPIDiv <= "000"; SPIBitCnt <= (others => '0');
 SPI_State <= Idle; SPICS <= '1'; SPISClk <= '0'; 
 SPI_rdreq <= '0';
+PhyTxBuff_Empty_sync(0) <= PhyTxBuff_Empty;
+PhyTxBuff_Empty_sync(1) <= PhyTxBuff_Empty_sync(0);
 
 elsif rising_edge (i50MHz) then 
 
@@ -1112,8 +1155,9 @@ begin
     else
       -- Write port: use rising-edge detect of synchronized wr_en
       -- (UBTTarget_din is stable for many SysClk cycles so no sync needed for data)
-      if UBTTarget_wr_en_sync_50(3) = '0' and UBTTarget_wr_en_sync_50(2) = '1'
-         and count < 8 then
+      -- Rising edge: bit(1) just became '1' and bit(2) was '0' (one stage delayed)
+		if UBTTarget_wr_en_sync_50(2) = '0' and UBTTarget_wr_en_sync_50(1) = '1'
+			and count < 8 then
         mem(wptr) := UBTTarget_din;  -- din stable long enough to sample here
         wptr      := (wptr + 1) mod 8;
         count     := count + 1;
@@ -1153,6 +1197,9 @@ end process;
 Rx_active_cdc : process(RxFMClk)
 begin
   if rising_edge(RxFMClk) then
+  
+	 MaskReg_sync_rx <= MaskReg;         -- FF1
+	 MaskReg_rxclk   <= MaskReg_sync_rx; -- FF2
     if CpldRst_sync = '0' or PllLock = '0' then
       Rx_active_sync   <= (others => "00");
       Rx_active_rxclk  <= (others => '0');
@@ -1407,10 +1454,13 @@ end if;
     elsif AutoTx_WaitTimeout > 0 then
       AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
     else
-      -- Timeout (no reply)?move on anyway, clear mask
-      AutoTx_WaitMask    <= (others => '0');
-      AutoTx_State       <= "011";
-    end if;
+		for p in 0 to 7 loop
+			if AutoTx_WaitMask(p) = '1' then
+				UBT_in_progress(p) <= '0';
+			end if;
+		end loop;
+		AutoTx_WaitMask    <= (others => '0');
+		AutoTx_State       <= "011";    end if;
 
   -- "011": Immediate scan for more ready lanes (optional; could just return to "000")
   when "011" =>
@@ -1645,7 +1695,7 @@ variable p : integer;
    LastTxTarget_clr_req <= '0';
 	TransitionCount    <= (others => X"0");
 	DeadWindowCount    <= (others => X"0");
-	LastTxTarget_clr_stretch <= "000";
+	LastTxTarget_clr_stretch <= "000000";
 	PowerOnReady_done <= '0';
    StartupHoldoff    <= (others => '0');
 	-- UBTTarget_wr_en         <= '0';
@@ -1752,9 +1802,9 @@ end if;
 
 -- P2: use the delayed claim so ReadyStatus is stable for one full cycle
 -- before being cleared, giving AutoTx_Proc time to latch it.
---if AutoTx_Claim_d /= X"00" then
---  rs_next := rs_next and (not AutoTx_Claim_d);
---end if;
+if AutoTx_Claim_d /= X"00" then
+  rs_next := rs_next and (not AutoTx_Claim_d);
+end if;
 
 -- P1: microcontroller explicit clear
 if WRDL = 1 and uCA(11 downto 10) = GA
@@ -1797,16 +1847,16 @@ elsif AutoTxKickPulse = '1' then
   AutoTxKickPulse <= '0';
 end if;
 
-
--- Stretch the clear pulse to 3 SysClk cycles so the 3-stage
--- i50MHz synchroniser in phy_out_gating cannot miss it.
+-- Stretch the clear pulse to 6 SysClk cycles (60 ns) so the 3-stage
+-- i50MHz synchroniser in phy_out_gating (50 MHz = 20 ns/cycle) cannot miss it.
 if WRDL = 1 and uCA(11 downto 10) = GA
       and uCA(9 downto 0) = LastTxTargetAddr then
-  LastTxTarget_clr_stretch <= "111";   -- load stretch counter
-elsif LastTxTarget_clr_stretch /= "000" then
-  LastTxTarget_clr_stretch <= '0' & LastTxTarget_clr_stretch(2 downto 1);
+  LastTxTarget_clr_stretch <= "111111";          -- load all-ones: 6-bit literal
+elsif LastTxTarget_clr_stretch /= "000000" then  -- compare against 6-bit literal
+  LastTxTarget_clr_stretch <= '0' & LastTxTarget_clr_stretch(5 downto 1);
 end if;
 LastTxTarget_clr_req <= LastTxTarget_clr_stretch(0);
+
 
 -- 1us time base
 if Counter1us /= Count1us then Counter1us <= Counter1us + 1;
@@ -2045,8 +2095,27 @@ then FEBRxIn(i).Clr_Err <= '1';
 else FEBRxIn(i).Clr_Err <= '0';
 end if;
 
-end loop;
 
+
+-- Generate a one-cycle SysClk clear pulse for CRCErr_Reg(i).
+-- This replaces the direct uC-bus sampling inside RxFMClk (PhyRx_Proc).
+if WRDL = 1 and uCA(11 downto 10) = GA
+   and uCA(9 downto 0) = CRCErrAddr and uCD(i) = '1'
+then CRCErr_Clr_SysClk(i) <= '1';
+else CRCErr_Clr_SysClk(i) <= '0';
+end if;
+
+
+
+-- In main, inside for i in 0 to 7 loop:
+if WRDL = 1 and uCA(11 downto 10) = GA
+   and uCA(9 downto 0) = CRCErrAddr and uCD(i) = '1'
+then CRCErr_Clr_stretch(i) <= "11";
+elsif CRCErr_Clr_stretch(i) /= "00" then
+  CRCErr_Clr_stretch(i) <= '0' & CRCErr_Clr_stretch(i)(1);
+end if;
+CRCErr_Clr_SysClk(i) <= CRCErr_Clr_stretch(i)(0);
+end loop;
 
 if WRDL = 1 and AddrReg(11 downto 10) = GA and AddrReg(9 downto 0) = FMRxErrAddr
 then RxIn(0).Clr_Err <= uCD(9);
@@ -2802,7 +2871,8 @@ iCD <= "00000" & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En & "0
 		 tx_overflow_cnt when OverflowCntAd,
 		 (15 downto 1 => '0') & PhyTxBuff_Empty when TxFifoRawEmptyAddr,
 		 X"00" & LastTxTarget  when LastTxTargetAddr,
-       X"0011" when DebugVersion,							  
+		 --X"00" & TxEnMask_sync when TxEnMaskAd,       
+		 X"0011" when DebugVersion,							  
 		 X"00" & ReadyStatus when ReadyStatusAddr,
 		 X"0000"              when ReadyClearAddr,   -- write-only, read returns 0
 		 X"0000"              when ReadyForceAddr,   -- write-only, read returns 0
