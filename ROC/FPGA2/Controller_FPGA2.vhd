@@ -1332,7 +1332,7 @@ if have_port and PhyTxBuff_Empty = '1'
    and PhyTxBuff_wreq = '0'
    and UBTTarget_full = '0' then
   -- Set handshake in-progress BEFORE UBT is queued, so port is not picked again
-  --UBT_in_progress(found_port) <= '1'; 
+  UBT_in_progress(found_port) <= '1'; 
   -- CLEAR ReadyStatus immediately via claim
   AutoTx_Claim(found_port) <= '1';
   -- Queue UBT for this port
@@ -1347,9 +1347,6 @@ if have_port and PhyTxBuff_Empty = '1'
 end if;
   -- "001": Write UBT packet words
   when "001" =>
-	 if UBT_in_progress(AutoTx_Port) = '0' then
-		UBT_in_progress(AutoTx_Port) <= '1'; -- Set only when entering "001"
-	 end if;
     if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0'
        and PhyTxBuff_wreq = '0' then
 
@@ -1679,18 +1676,15 @@ end if;
 --end if;
 
 
-  if PowerOnReady_done = '0' and StartupHoldoff = X"FF" and CpldRst_sync = '1' then
-    for i in 0 to 7 loop
-      p := (RoundRobin_Last + 1 + i) mod 8;
-      if MaskReg(p) = '1' and PhyRxBuff_Empty(p) = '1' and UBT_in_progress(p) = '0' then
-        rs_next := (others => '0');
-        rs_next(p) := '1';
-        --RoundRobin_Last <= p;
-        exit;
-      end if;
-    end loop;
-    PowerOnReady_done <= '1';
-  end if;
+
+if PowerOnReady_done = '0' and StartupHoldoff = X"FF" and CpldRst_sync = '1' then
+  for p in 0 to 7 loop
+    if MaskReg(p) = '1' and PhyRxBuff_Empty(p) = '1' and UBT_in_progress(p) = '0' then
+      rs_next(p) := '1';
+    end if;
+  end loop;
+  PowerOnReady_done <= '1';
+end if;
 
 
 -- P4: startup broadcast on rising edge of DDRRd_en
