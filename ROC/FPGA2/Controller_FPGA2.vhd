@@ -396,6 +396,7 @@ signal UBTTarget_wr_en_sync_50 : std_logic_vector(3 downto 0) := "0000";
 -- (3 stages: 2 for metastability, 1 for edge detect)
 signal UBT_in_progress : std_logic_vector(7 downto 0) := (others => '0');
 
+
 constant READY_WORD_COUNT : integer := 2; -- number of words in the READY packet (update if you change helper)
 
 -- added 11/24
@@ -1583,6 +1584,7 @@ end process AutoTx_Proc;
 
 main : process(SysClk, CpldRst_sync)
 variable rs_next : std_logic_vector(7 downto 0);
+variable p : integer;
  begin 
 
 -- reset/preset
@@ -1664,14 +1666,29 @@ end if;
 -- P5: power-on init ? set ReadyStatus for all masked ports once, on first PllLock
 -- This fires exactly once after reset+PLL-lock, with or without DDRRd_en.
 -- PowerOnReady_done is cleared on reset (in the CpldRst_sync='0' branch).
-if PowerOnReady_done = '0' and StartupHoldoff = X"FF" and CpldRst_sync = '1' then
-  for p in 0 to 7 loop
-    if MaskReg(p) = '1' then
-      rs_next(p) := '1';
-    end if;
-  end loop;
-  PowerOnReady_done <= '1';
-end if;
+--if PowerOnReady_done = '0' and StartupHoldoff = X"FF" and CpldRst_sync = '1' then
+--  for p in 0 to 7 loop
+--    if MaskReg(p) = '1' then
+--      rs_next(p) := '1';
+--    end if;
+--  end loop;
+--  PowerOnReady_done <= '1';
+--end if;
+
+
+  if PowerOnReady_done = '0' and StartupHoldoff = X"FF" and CpldRst_sync = '1' then
+    for i in 0 to 7 loop
+      p := (RoundRobin_Last + 1 + i) mod 8;
+      if MaskReg(p) = '1' and PhyRxBuff_Empty(p) = '1' and UBT_in_progress(p) = '0' then
+        rs_next := (others => '0');
+        rs_next(p) := '1';
+        --RoundRobin_Last <= p;
+        exit;
+      end if;
+    end loop;
+    PowerOnReady_done <= '1';
+  end if;
+
 
 -- P4: startup broadcast on rising edge of DDRRd_en
 if DDRRd_en = '1' and DDRRd_EnD = '0' then
