@@ -1582,8 +1582,6 @@ end process AutoTx_Proc;
 ----------------------- 100 Mhz clocked logic -----------------------------
 
 main : process(SysClk, CpldRst_sync)
-variable next_ready : std_logic_vector(7 downto 0);
-  variable handshake_busy : boolean;
 variable rs_next : std_logic_vector(7 downto 0);
  begin 
 
@@ -1655,30 +1653,6 @@ for p in 0 to 7 loop
   phy_empty_d(p)(0) <= PhyRxBuff_Empty(p);
 end loop;
 
-
--- Determine if any handshake is in progress
-  handshake_busy := false;
-  for p in 0 to 7 loop
-    if UBT_in_progress(p) = '1' then
-      handshake_busy := true;
-    end if;
-  end loop;
-
-  -- Only allow new ready bit if no handshake is active
-  if not handshake_busy then
-    -- Scan for masked and eligible ports (not in progress, RX FIFO empty, etc.)
-    for p in 0 to 7 loop
-      if MaskReg(p) = '1' and PhyRxBuff_Empty(p) = '1' and ReadyStatus(p) = '0' then
-        next_ready(p) := '1';
-        -- Only set the lowest-index port, break after first
-        exit;
-      end if;
-    end loop;
-    ReadyStatus <= next_ready;
-  end if;
-
-  -- When handshake finishes, clear UBT_in_progress(port)
-  -- (your AutoTx FSM logic already does this after reply or timeout)
 -- Startup holdoff + PowerOnReady_done
 -- Increment the holdoff counter until it saturates at 0xFF.
 -- Only fire the one-shot ReadyStatus initialisation after the counter
@@ -1690,35 +1664,19 @@ end if;
 -- P5: power-on init ? set ReadyStatus for all masked ports once, on first PllLock
 -- This fires exactly once after reset+PLL-lock, with or without DDRRd_en.
 -- PowerOnReady_done is cleared on reset (in the CpldRst_sync='0' branch).
---if PowerOnReady_done = '0' and StartupHoldoff = X"FF" and CpldRst_sync = '1' then
---  for p in 0 to 7 loop
---    if MaskReg(p) = '1' then
---      rs_next(p) := '1';
---    end if;
---  end loop;
---  PowerOnReady_done <= '1';
---end if;
-
-
-handshake_busy := false;
-for p in 0 to 7 loop
-  if UBT_in_progress(p) = '1' then
-    handshake_busy := true;
-  end if;
-end loop;
-
-if not handshake_busy then
-  -- Set only one eligible port (lowest index)
+if PowerOnReady_done = '0' and StartupHoldoff = X"FF" and CpldRst_sync = '1' then
   for p in 0 to 7 loop
-    if MaskReg(p) = '1' and PhyRxBuff_Empty(p) = '1' and ReadyStatus(p) = '0' then
+    if MaskReg(p) = '1' then
       rs_next(p) := '1';
-      exit; -- Only set one
     end if;
   end loop;
-end if;-- P4: startup broadcast on rising edge of DDRRd_en
+  PowerOnReady_done <= '1';
+end if;
+
+-- P4: startup broadcast on rising edge of DDRRd_en
 if DDRRd_en = '1' and DDRRd_EnD = '0' then
   for p in 0 to 7 loop
-    if MaskReg(p) = '1' and UBT_in_progress(p) = '0' then
+    if MaskReg(p) = '1' then
       rs_next(p) := '1';
     end if;
   end loop;
@@ -1746,36 +1704,19 @@ end if;
 
 -- P3: set bit when RX FIFO transitions non-empty->empty
 -- Guard with CpldRst_sync to prevent spurious sets during reset
---for p in 0 to 7 loop
---  if CpldRst_sync = '1'
---     and phy_empty_d(p)(0) = '1'
---     and phy_empty_d(p)(1) = '0'
---     and AutoTx_Claim(p) = '0' then
---    rs_next(p) := '1';
---  end if;
---end loop;
 for p in 0 to 7 loop
   if CpldRst_sync = '1'
      and phy_empty_d(p)(0) = '1'
      and phy_empty_d(p)(1) = '0'
-     and AutoTx_Claim(p) = '0'
-     and UBT_in_progress(p) = '0' then
+     and AutoTx_Claim(p) = '0' then
     rs_next(p) := '1';
   end if;
 end loop;
 
 -- ReadyForce write
---if WRDL = 1 and uCA(11 downto 10) = GA
---   and uCA(9 downto 0) = ReadyForceAddr then
---  rs_next := rs_next or uCD(7 downto 0);
---end if;
 if WRDL = 1 and uCA(11 downto 10) = GA
    and uCA(9 downto 0) = ReadyForceAddr then
-  for p in 0 to 7 loop
-    if uCD(p) = '1' and UBT_in_progress(p) = '0' then
-      rs_next(p) := '1';
-    end if;
-  end loop;
+  rs_next := rs_next or uCD(7 downto 0);
 end if;
 
 -- P2: AutoTx claim clears
@@ -1790,18 +1731,9 @@ end if;
 --end if;
 
 -- P1: microcontroller explicit clear
---if WRDL = 1 and uCA(11 downto 10) = GA
---   and uCA(9 downto 0) = ReadyClearAddr then
---  rs_next := rs_next and (not uCD(7 downto 0));
---end if;
 if WRDL = 1 and uCA(11 downto 10) = GA
    and uCA(9 downto 0) = ReadyClearAddr then
-  for p in 0 to 7 loop
-    if uCD(p) = '1' and UBT_in_progress(p) = '0' then
-      rs_next(p) := '0';
-    end if;
-    -- If UBT_in_progress(p) = '1', leave rs_next(p) unchanged so handshake is protected
-  end loop;
+  rs_next := rs_next and (not uCD(7 downto 0));
 end if;
 
 ReadyStatus <= rs_next;   
