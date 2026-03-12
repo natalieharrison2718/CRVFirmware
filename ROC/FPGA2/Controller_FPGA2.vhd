@@ -1330,7 +1330,8 @@ end loop;
 if have_port and PhyTxBuff_Empty = '1'
    and PhyTxBuff_Full = '0'
    and PhyTxBuff_wreq = '0'
-   and UBTTarget_full = '0' then
+   and UBTTarget_full = '0'
+	and UBT_in_progress(found_port) = '0' then
   -- Set handshake in-progress BEFORE UBT is queued, so port is not picked again
   UBT_in_progress(found_port) <= '1'; 
   -- CLEAR ReadyStatus immediately via claim
