@@ -72,7 +72,10 @@ entity Controller_FPGA2 is port(
 	probe_PhyRxEmpty      : out std_logic_vector(7 downto 0);
 	probe_Rx_active       : out std_logic_vector(7 downto 0);
 	probe_PhyTxBuff_Count : out std_logic_vector(10 downto 0);
-	probe_ReadyStatus     : out std_logic_vector(7 downto 0)
+	probe_ReadyStatus     : out std_logic_vector(7 downto 0);
+probe_UBT_in_progress  : out std_logic_vector(7 downto 0); -- Add this
+probe_handshake_queued : out std_logic_vector(7 downto 0); -- Add this (one-hot, pulse)
+probe_AutoTx_Port      : out std_logic_vector(2 downto 0) -- Add this (port number picked)
 	-- synthesis translate_on	 
 );
 
@@ -395,8 +398,9 @@ signal UBTTarget_wr_en_50  : std_logic := '0';
 signal UBTTarget_wr_en_sync_50 : std_logic_vector(3 downto 0) := "0000";
 -- (3 stages: 2 for metastability, 1 for edge detect)
 signal UBT_in_progress : std_logic_vector(7 downto 0) := (others => '0');
-
-
+signal probe_handshake_queued_s : std_logic_vector(7 downto 0); -- The _s means "signal"
+signal probe_ubt_in_progress_s  : std_logic_vector(7 downto 0);
+signal probe_autotx_port_s      : std_logic_vector(2 downto 0);
 constant READY_WORD_COUNT : integer := 2; -- number of words in the READY packet (update if you change helper)
 
 -- added 11/24
@@ -1345,6 +1349,11 @@ if have_port and PhyTxBuff_Empty = '1'
   onehot(found_port)        := '1';
   AutoTx_Target             <= onehot;
   AutoTx_State              <= "001";
+  probe_handshake_queued_s <= (others => '0');
+	probe_handshake_queued_s(found_port) <= '1';
+probe_ubt_in_progress_s <= UBT_in_progress;
+probe_autotx_port_s <= std_logic_vector(to_unsigned(AutoTx_Port, 3));
+
 end if;
   -- "001": Write UBT packet words
   when "001" =>
@@ -1408,7 +1417,7 @@ end if;
     AutoTx_Target <= (others => '0');
     found_port := 0; have_port := false;
     for i in 0 to 7 loop
-      if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' then
+      if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' and UBT_in_progress((RoundRobin_Last + 1 + i) mod 8) = '0' then
         found_port := (RoundRobin_Last + 1 + i) mod 8;
         have_port  := true;
         exit;
@@ -1642,6 +1651,7 @@ variable p : integer;
 	-- UBTTarget_wr_en         <= '0';
 	-- UBTTarget_wr_en_stretch <= "000";
 	AutoTx_Claim_d <= (others => '0');
+	
 	 
 elsif rising_edge (SysClk) then 
 if PllLock = '1' then
@@ -1682,6 +1692,7 @@ if PowerOnReady_done = '0' and StartupHoldoff = X"FF" and CpldRst_sync = '1' the
   for p in 0 to 7 loop
     if MaskReg(p) = '1' and PhyRxBuff_Empty(p) = '1' and UBT_in_progress(p) = '0' then
       rs_next(p) := '1';
+		exit;
     end if;
   end loop;
   PowerOnReady_done <= '1';
@@ -1766,6 +1777,7 @@ probe_MaskReg         <= MaskReg;
 probe_PhyRxEmpty      <= PhyRxBuff_Empty;
 probe_Rx_active       <= Rx_active;
 probe_PhyTxBuff_Count <= PhyTxBuff_Count;
+probe_UBT_in_progress <= UBT_in_progress;
 -- synthesis translate_on
 
 
@@ -2800,5 +2812,7 @@ iCD <= "00000" & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En & "0
 
 uCD <= iCD when uCRd = '0' and CpldCS = '0' and uCA(11 downto 10) = GA 
 		 else (others => 'Z');
+		 
+
 
 end behavioural;
