@@ -394,6 +394,7 @@ signal UBTTarget_rd_en_sync : std_logic_vector(1 downto 0) := "00";
 signal UBTTarget_wr_en_50  : std_logic := '0';
 signal UBTTarget_wr_en_sync_50 : std_logic_vector(3 downto 0) := "0000";
 -- (3 stages: 2 for metastability, 1 for edge detect)
+signal UBT_in_progress : std_logic_vector(7 downto 0) := (others => '0');
 
 constant READY_WORD_COUNT : integer := 2; -- number of words in the READY packet (update if you change helper)
 
@@ -1309,18 +1310,29 @@ begin
     AutoTx_Target <= (others => '0');
     found_port := 0; have_port := false;
 
-    for i in 0 to 7 loop
-      if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' then
-        found_port := (RoundRobin_Last + 1 + i) mod 8;
-        have_port  := true;
-        exit;
-      end if;
-    end loop;
+--    for i in 0 to 7 loop
+--      if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' then
+--        found_port := (RoundRobin_Last + 1 + i) mod 8;
+--        have_port  := true;
+--        exit;
+--      end if;
+--    end loop;
+	 
+	 for i in 0 to 7 loop
+		if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' and UBT_in_progress((RoundRobin_Last + 1 + i) mod 8) = '0' then
+			found_port := (RoundRobin_Last + 1 + i) mod 8;
+			have_port := true;
+		exit;
+		end if;
+	 end loop;
+	 
+	 
     -- Only send UBT if buffer is empty
     if have_port and PhyTxBuff_Empty = '1'
        and PhyTxBuff_Full = '0'
        and PhyTxBuff_wreq = '0'
        and UBTTarget_full = '0' then
+		UBT_in_progress(found_port) <= '1'; 
       AutoTx_Port               <= found_port;
       RoundRobin_Last           <= found_port;
       AutoTx_WordIdx            <= 0;
@@ -1371,7 +1383,14 @@ begin
     -- PhyRxFilled is a one-cycle pulse per port, AND with AutoTx_WaitMask gives the port(s) we?re tracking
     if (PhyRxFilled and AutoTx_WaitMask) /= X"00" then
       -- Reply arrived; move to immediate scan for next lane
-      AutoTx_WaitMask    <= (others => '0');
+      -- reply received
+		for p in 0 to 7 loop
+			if AutoTx_WaitMask(p) = '1' then
+			UBT_in_progress(p) <= '0';
+			end if;
+		end loop;
+		
+		AutoTx_WaitMask    <= (others => '0');
       AutoTx_WaitTimeout <= 0;
       AutoTx_State       <= "011";
     elsif AutoTx_WaitTimeout > 0 then
@@ -1669,11 +1688,18 @@ end if;
 -- Fired at Counter1s = 0 to avoid flooding; gated on PowerOnReady_done
 -- so it only activates after the normal startup path has had its chance.
 if Counter1s = 0 and PowerOnReady_done = '1' then
+--  for p in 0 to 7 loop
+--    if MaskReg(p) = '1' and PhyRxBuff_Empty(p) = '1' and rs_next(p) = '0' then
+--      rs_next(p) := '1';
+--    end if;
+--  end loop;
+  
   for p in 0 to 7 loop
-    if MaskReg(p) = '1' and PhyRxBuff_Empty(p) = '1' and rs_next(p) = '0' then
-      rs_next(p) := '1';
-    end if;
-  end loop;
+  if MaskReg(p) = '1' and PhyRxBuff_Empty(p) = '1' and rs_next(p) = '0' and UBT_in_progress(p) = '0' then
+    rs_next(p) := '1';
+  end if;
+end loop;
+  
 end if;
 
 -- P3: set bit when RX FIFO transitions non-empty->empty
