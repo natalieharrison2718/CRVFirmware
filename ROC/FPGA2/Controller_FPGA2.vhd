@@ -1332,7 +1332,7 @@ if have_port and PhyTxBuff_Empty = '1'
    and PhyTxBuff_wreq = '0'
    and UBTTarget_full = '0' then
   -- Set handshake in-progress BEFORE UBT is queued, so port is not picked again
-  UBT_in_progress(found_port) <= '1'; 
+  --UBT_in_progress(found_port) <= '1'; 
   -- CLEAR ReadyStatus immediately via claim
   AutoTx_Claim(found_port) <= '1';
   -- Queue UBT for this port
@@ -1347,6 +1347,9 @@ if have_port and PhyTxBuff_Empty = '1'
 end if;
   -- "001": Write UBT packet words
   when "001" =>
+	 if UBT_in_progress(AutoTx_Port) = '0' then
+		UBT_in_progress(AutoTx_Port) <= '1'; -- Set only when entering "001"
+	 end if;
     if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0'
        and PhyTxBuff_wreq = '0' then
 
