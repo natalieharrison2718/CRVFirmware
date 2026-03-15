@@ -401,7 +401,7 @@ signal UBT_in_progress : std_logic_vector(7 downto 0) := (others => '0');-- Latc
 -- Prevents 1Hz re-arm from re-triggering once the exchange is complete.
 -- Cleared by µC write to ReadyClearAddr (already resets ReadyStatus too).
 signal UBT_session_done : std_logic_vector(7 downto 0) := (others => '0');
-
+constant UBT_REPLY_TIMEOUT : integer := 200000;  -- ~2 ms @ 100 MHz
 
 signal probe_handshake_queued_s : std_logic_vector(7 downto 0); -- The _s means "signal"
 signal probe_ubt_in_progress_s  : std_logic_vector(7 downto 0);
@@ -809,7 +809,7 @@ end if;
 
 -- When the word has been assembled and pipeline delayed, write to the FIFO
  if StartCount(i) = 6 and iRxDV(i)(0) = '1' and iCRS(i) = '1' and RxClkDL(i) = 2
-  and RxNibbleCount(i) = 3 and Rx_Active_rxclk(i) = '1' and MaskReg(i) = '1'
+  and RxNibbleCount(i) = 3  and MaskReg(i) = '1'
  then PhyRxBuff_wreq(i) <= '1'; 
  else PhyRxBuff_wreq(i) <= '0'; 
   end if;
@@ -1386,7 +1386,7 @@ end if;
         AutoTx_WordIdx      <= 0;
         AutoTx_Active       <= '0';
         AutoTx_WaitMask     <= AutoTx_Target;
-        AutoTx_WaitTimeout  <= 10000000;
+        AutoTx_WaitTimeout  <= UBT_REPLY_TIMEOUT;
         AutoTx_State        <= "100";   -- Now wait for buffer to drain
       else
         AutoTx_WordIdx <= AutoTx_WordIdx + 1;
@@ -1798,6 +1798,8 @@ probe_MaskReg         <= MaskReg;
 probe_PhyRxEmpty      <= PhyRxBuff_Empty;
 probe_Rx_active       <= Rx_active;
 probe_PhyTxBuff_Count <= PhyTxBuff_Count;
+probe_handshake_queued <= probe_handshake_queued_s;
+probe_AutoTx_Port      <= probe_autotx_port_s;
 probe_UBT_in_progress <= UBT_in_progress;
 -- synthesis translate_on
 
