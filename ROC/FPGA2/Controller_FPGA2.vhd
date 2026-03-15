@@ -1705,7 +1705,7 @@ end if;
 
 if PowerOnReady_done = '0' and StartupHoldoff = X"FF" and CpldRst_sync = '1' then
   for p in 0 to 7 loop
-    if MaskReg(p) = '1' and PhyRxBuff_Empty(p) = '1' and UBT_in_progress(p) = '0' then
+    if MaskReg(p) = '1' and PhyRxBuff_Empty(p) = '1' and UBT_in_progress(p) = '0' and UBT_session_done(p) = '0' then 
       rs_next(p) := '1';
 		exit;
     end if;
@@ -1751,7 +1751,8 @@ for p in 0 to 7 loop
      and phy_empty_d(p)(0) = '1'
      and phy_empty_d(p)(1) = '0'
      and AutoTx_Claim(p) = '0'
-     and UBT_in_progress(p) = '0' then  -- <<< ADD THIS LINE
+     and UBT_in_progress(p) = '0' -- <<< ADD THIS LINE
+     and UBT_session_done(p) = '0' then
     rs_next(p) := '1';
   end if;
 end loop;
