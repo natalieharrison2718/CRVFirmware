@@ -402,6 +402,7 @@ signal UBT_in_progress : std_logic_vector(7 downto 0) := (others => '0');-- Latc
 -- Cleared by µC write to ReadyClearAddr (already resets ReadyStatus too).
 signal UBT_session_done : std_logic_vector(7 downto 0) := (others => '0');
 constant UBT_REPLY_TIMEOUT : integer := 200000;  -- ~2 ms @ 100 MHz
+signal UBT_in_progress_clr_pending : std_logic_vector(7 downto 0) := (others => '0');
 
 signal probe_handshake_queued_s : std_logic_vector(7 downto 0); -- The _s means "signal"
 signal probe_ubt_in_progress_s  : std_logic_vector(7 downto 0);
@@ -1300,8 +1301,26 @@ begin
     AutoTx_WaitTimeout  <= 0;
 	 UBT_in_progress     <= (others => '0');  -- already present in main
     UBT_session_done    <= (others => '0');
+	 UBT_in_progress_clr_pending <= (others => '0');
   elsif rising_edge(SysClk) then
-    -- Pulse-only defaults
+    for p in 0 to 7 loop
+		if UBT_in_progress_clr_pending(p) = '1' then
+			UBT_in_progress(p)             <= '0';
+			UBT_in_progress_clr_pending(p) <= '0';
+		end if;
+	 end loop;
+	 
+	 -- Auto-clear UBT_session_done for ports whose FIFO is empty and handshake is done
+-- Allows 1Hz re-arm to retry without µC intervention
+for p in 0 to 7 loop
+  if UBT_session_done(p) = '1'
+     and UBT_in_progress(p) = '0'
+     and PhyRxBuff_Empty(p) = '1' then
+    UBT_session_done(p) <= '0';
+  end if;
+end loop;
+	 
+	 -- Pulse-only defaults
     AutoTx_Claim        <= X"00";
     PhyTxWrReq_FPGA     <= '0';
     -- UBTTarget_wr_en     <= '0';
@@ -1401,30 +1420,59 @@ end if;
     end if;
 	 
   -- "010": Wait for reply from FEB (RX FIFO for the lane fills)
-  when "010" =>
-    if (PhyRxFilled and AutoTx_WaitMask) /= X"00" then
-      -- Reply arrived; move to immediate scan for next lane
-      for p in 0 to 7 loop
-        if AutoTx_WaitMask(p) = '1' then
-          UBT_in_progress(p) <= '0';
-          UBT_session_done(p) <= '1';   -- <<< ADD THIS LINE
-        end if;
-      end loop;
-      AutoTx_WaitMask    <= (others => '0');
-      AutoTx_WaitTimeout <= 0;
-      AutoTx_State       <= "011";	 
-    elsif AutoTx_WaitTimeout > 0 then
-      AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
-    else
-      -- Timeout (no reply): clear in-progress flag so port can be retried
-      for p in 0 to 7 loop
-        if AutoTx_WaitMask(p) = '1' then
-          UBT_in_progress(p) <= '0';   -- <<< ADD THIS LOOP
-        end if;
-      end loop;
-      AutoTx_WaitMask    <= (others => '0');
-      AutoTx_State       <= "011";
-    end if;
+--  when "010" =>
+--    if (PhyRxFilled and AutoTx_WaitMask) /= X"00" then
+--      -- Reply arrived; move to immediate scan for next lane
+--      for p in 0 to 7 loop
+--        if AutoTx_WaitMask(p) = '1' then
+--          UBT_in_progress(p) <= '0';
+--          UBT_session_done(p) <= '1';   -- <<< ADD THIS LINE
+--        end if;
+--      end loop;
+--      AutoTx_WaitMask    <= (others => '0');
+--      AutoTx_WaitTimeout <= 0;
+--      AutoTx_State       <= "011";	 
+--    elsif AutoTx_WaitTimeout > 0 then
+--      AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+--    else
+--      -- Timeout (no reply): clear in-progress flag so port can be retried
+--      for p in 0 to 7 loop
+--        if AutoTx_WaitMask(p) = '1' then
+--          UBT_in_progress(p) <= '0';   -- <<< ADD THIS LOOP
+--          UBT_session_done(p) <= '1';
+--		  end if;
+--      end loop;
+--      AutoTx_WaitMask    <= (others => '0');
+--      AutoTx_State       <= "011";
+--    end if;
+
+	-- "010": Wait for reply from FEB
+when "010" =>
+  if (PhyRxFilled and AutoTx_WaitMask) /= X"00" then
+    -- Reply arrived: mark session done first; clear in_progress next cycle
+    for p in 0 to 7 loop
+      if AutoTx_WaitMask(p) = '1' then
+        UBT_session_done(p)            <= '1';
+        UBT_in_progress_clr_pending(p) <= '1';  -- will clear in_progress next cycle
+      end if;
+    end loop;
+    AutoTx_WaitMask    <= (others => '0');
+    AutoTx_WaitTimeout <= 0;
+    AutoTx_State       <= "011";
+
+  elsif AutoTx_WaitTimeout > 0 then
+    AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+  else
+    -- Timeout: same deferred clear
+    for p in 0 to 7 loop
+      if AutoTx_WaitMask(p) = '1' then
+        UBT_session_done(p)            <= '1';
+        UBT_in_progress_clr_pending(p) <= '1';
+      end if;
+    end loop;
+    AutoTx_WaitMask <= (others => '0');
+    AutoTx_State    <= "011";
+  end if;
 
   -- "011": Immediate scan for more ready lanes (optional; could just return to "000")
   when "011" =>
@@ -1717,7 +1765,7 @@ end if;
 -- P4: startup broadcast on rising edge of DDRRd_en
 if DDRRd_en = '1' and DDRRd_EnD = '0' then
   for p in 0 to 7 loop
-    if MaskReg(p) = '1' and UBT_session_done(p) = '0' then
+    if MaskReg(p) = '1' and UBT_session_done(p) = '0' and UBT_in_progress(p) = '0' then
       rs_next(p) := '1';
     end if;
   end loop;
@@ -1783,6 +1831,8 @@ if WRDL = 1 and uCA(11 downto 10) = GA
   rs_next := rs_next and (not uCD(7 downto 0));
   -- UBT_session_done is cleared inside AutoTx_Proc to avoid multiple drivers
 end if;
+
+
 
 ReadyStatus <= rs_next;   
 -- Synchronous edge detectors for read and write strobes
