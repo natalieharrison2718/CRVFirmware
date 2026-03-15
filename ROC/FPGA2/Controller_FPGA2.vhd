@@ -1391,25 +1391,26 @@ end if;
         UBTTarget_wr_en_stretch  <= "111";
       end if;
 
-      if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
-        -- Packet complete. Request PHY TX enable.
-        AutoTx_TxEnReqPulse <= '1';
-        AutoTx_WordIdx      <= 0;
-        AutoTx_Active       <= '0';
-        AutoTx_WaitMask     <= AutoTx_Target;
-        AutoTx_WaitTimeout  <= UBT_REPLY_TIMEOUT;
-        AutoTx_State        <= "100";   -- Now wait for buffer to drain
-      else
-        AutoTx_WordIdx <= AutoTx_WordIdx + 1;
-      end if;
-    end if;
+if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
+  -- Packet words written. Wait for tag FIFO and data FIFO to be ready.
+  AutoTx_WordIdx  <= 0;
+  AutoTx_Active   <= '0';
+  AutoTx_WaitMask <= AutoTx_Target;
+  AutoTx_WaitTimeout <= UBT_REPLY_TIMEOUT;
+  AutoTx_State    <= "100";   -- wait for both FIFOs ready, THEN pulse TxEnReq
+else
+  AutoTx_WordIdx <= AutoTx_WordIdx + 1;
+end if;    end if;
 
   -- "100": Wait for PhyTxBuff_Empty after UBT send
-  when "100" =>
-    if PhyTxBuff_Empty = '1' then
-      -- After buffer drains, wait for FEB reply (RX FIFO fill for the lane)
-      AutoTx_State <= "010";
-    end if;
+-- "100": Wait for PhyTxBuff data AND UBTTarget tag to both be ready
+when "100" =>
+  if PhyTxBuff_Empty = '0' and UBTTarget_empty = '0' then
+    -- Both data FIFO and tag FIFO are ready: now request TX enable
+    AutoTx_TxEnReqPulse <= '1';
+    AutoTx_State        <= "010";   -- proceed to wait for reply
+  end if;
+  -- (no timeout needed here; UBTTarget write takes only ~4 i50MHz cycles)
 	 
   -- "010": Wait for reply from FEB (RX FIFO for the lane fills)
 --  when "010" =>
