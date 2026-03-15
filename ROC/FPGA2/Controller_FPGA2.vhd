@@ -1717,7 +1717,7 @@ end if;
 -- P4: startup broadcast on rising edge of DDRRd_en
 if DDRRd_en = '1' and DDRRd_EnD = '0' then
   for p in 0 to 7 loop
-    if MaskReg(p) = '1' then
+    if MaskReg(p) = '1' and UBT_session_done(p) = '0' then
       rs_next(p) := '1';
     end if;
   end loop;
