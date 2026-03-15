@@ -1310,15 +1310,7 @@ begin
 		end if;
 	 end loop;
 	 
-	 -- Auto-clear UBT_session_done for ports whose FIFO is empty and handshake is done
--- Allows 1Hz re-arm to retry without µC intervention
-for p in 0 to 7 loop
-  if UBT_session_done(p) = '1'
-     and UBT_in_progress(p) = '0'
-     and PhyRxBuff_Empty(p) = '1' then
-    UBT_session_done(p) <= '0';
-  end if;
-end loop;
+
 	 
 	 -- Pulse-only defaults
     AutoTx_Claim        <= X"00";
@@ -1783,6 +1775,7 @@ if Counter1s = 0 and PowerOnReady_done = '1' then
        and UBT_in_progress(p) = '0'
        and UBT_session_done(p) = '0' then  -- <<< ADD THIS CONDITION
       rs_next(p) := '1';
+		exit;
     end if;
   end loop;
 end if;
