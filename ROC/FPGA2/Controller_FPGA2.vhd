@@ -354,6 +354,7 @@ signal AutoTx_WaitMask : std_logic_vector(7 downto 0) := (others => '0');
 signal PhyRxBuff_WasEmpty : std_logic_vector(7 downto 0) := (others => '1'); -- previous cycle empty
 signal PhyRxFilled : std_logic_vector(7 downto 0) := (others => '0'); -- rising edge: empty->non empty
 signal AutoTx_WaitTimeout : integer range 0 to 10000000 := 0; -- ~100 ms at 100 MHz
+signal AutoTx_DrainCnt : integer range 0 to 63 := 0;
 -- FIX 1: Startup holdoff counter. Delays the PowerOnReady_done pulse until
 -- the reset synchroniser, FIFOs, and AutoTx FSM have all fully settled.
 -- 256 SysClk cycles @ 100 MHz = 2.56 us, well after CpldRst_sync stabilises.
@@ -1302,6 +1303,7 @@ begin
 	 UBT_in_progress     <= (others => '0');  -- already present in main
     UBT_session_done    <= (others => '0');
 	 UBT_in_progress_clr_pending <= (others => '0');
+	 AutoTx_DrainCnt <= 0;
   elsif rising_edge(SysClk) then
     for p in 0 to 7 loop
 		if UBT_in_progress_clr_pending(p) = '1' then
@@ -1377,6 +1379,7 @@ probe_ubt_in_progress_s <= UBT_in_progress;
 probe_autotx_port_s <= std_logic_vector(to_unsigned(AutoTx_Port, 3));
 
 end if;
+
   -- "001": Write UBT packet words
   when "001" =>
     if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0'
@@ -1392,24 +1395,35 @@ end if;
       end if;
 
 if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
-  -- Packet words written. Wait for tag FIFO and data FIFO to be ready.
-  AutoTx_WordIdx  <= 0;
-  AutoTx_Active   <= '0';
-  AutoTx_WaitMask <= AutoTx_Target;
+  AutoTx_WordIdx     <= 0;
+  AutoTx_Active      <= '0';
+  AutoTx_WaitMask    <= AutoTx_Target;
   AutoTx_WaitTimeout <= UBT_REPLY_TIMEOUT;
-  AutoTx_State    <= "100";   -- wait for both FIFOs ready, THEN pulse TxEnReq
+  AutoTx_DrainCnt    <= 32;   -- wait 32 SysClk cycles for CDC flags to settle
+  AutoTx_State       <= "100";
 else
   AutoTx_WordIdx <= AutoTx_WordIdx + 1;
-end if;    end if;
+end if;
+end if;
+
 
   -- "100": Wait for PhyTxBuff_Empty after UBT send
 -- "100": Wait for PhyTxBuff data AND UBTTarget tag to both be ready
+-- "100": Fixed drain wait - enough cycles for CDC flags to settle
+--        (replaces unreliable polling of read-side empty in SysClk domain)
 when "100" =>
-  if PhyTxBuff_Empty = '0' and UBTTarget_empty = '0' then
-    -- Both data FIFO and tag FIFO are ready: now request TX enable
-    AutoTx_TxEnReqPulse <= '1';
-    AutoTx_State        <= "010";   -- proceed to wait for reply
+  if AutoTx_DrainCnt = 0 then
+    -- Only fire TxEnReq once UBTTarget tag has propagated (UBTTarget_empty = '0')
+    -- UBTTarget is i50MHz domain but we read it here as a stall: safe for false-negatives
+    if UBTTarget_empty = '0' then
+      AutoTx_TxEnReqPulse <= '1';
+      AutoTx_State        <= "010";
+    end if;
+    -- else: stall one more cycle waiting for the tag FIFO to drain write->read
+  else
+    AutoTx_DrainCnt <= AutoTx_DrainCnt - 1;
   end if;
+ 
   -- (no timeout needed here; UBTTarget write takes only ~4 i50MHz cycles)
 	 
   -- "010": Wait for reply from FEB (RX FIFO for the lane fills)
