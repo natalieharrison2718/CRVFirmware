@@ -1375,11 +1375,8 @@ begin
       AutoTx_WaitMask    <= (others => '0');
       AutoTx_WaitTimeout <= 0;
       AutoTx_State       <= "011";
-    elsif AutoTx_WaitTimeout > 0 then
-      --AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
-		if Counter1ms = 0 and AutoTx_WaitTimeout > 0 then
-			AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
-		end if;
+    elsif AutoTx_WaitTimeout > 0 and Counter1ms = 0 then
+      AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
     else
       -- Timeout (no reply)?move on anyway, clear mask
       AutoTx_WaitMask    <= (others => '0');
