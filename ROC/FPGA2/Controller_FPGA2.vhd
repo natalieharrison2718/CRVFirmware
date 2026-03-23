@@ -1287,6 +1287,7 @@ begin
     AutoTx_WaitPort     <= 0;
     AutoTx_WaitMask     <= (others => '0');
     AutoTx_WaitTimeout  <= 0;
+	 AutoTx_Busy <= (others => '0');
 
   elsif rising_edge(SysClk) then
     -- Pulse-only defaults
@@ -1308,6 +1309,7 @@ begin
   when "000" =>
     AutoTx_Active <= '0';
     AutoTx_Target <= (others => '0');
+	 AutoTx_Busy <= (others => '0');   -- clear all busy bits in idle
     found_port := 0; have_port := false;
 
     for i in 0 to 7 loop
@@ -1331,6 +1333,7 @@ begin
       onehot(found_port)        := '1';
       AutoTx_Target             <= onehot;
       AutoTx_State              <= "001";
+		AutoTx_Busy(found_port) <= '1';   -- mark this port busy immediately
     end if;
 
   -- "001": Write UBT packet words
@@ -1374,18 +1377,19 @@ begin
       -- Reply arrived; move to immediate scan for next lane
       AutoTx_WaitMask    <= (others => '0');
       AutoTx_WaitTimeout <= 0;
-      AutoTx_State       <= "011";
+      AutoTx_State       <= "000"; -- was 011
     elsif AutoTx_WaitTimeout > 0 then
       AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
     else
       -- Timeout (no reply)?move on anyway, clear mask
       AutoTx_WaitMask    <= (others => '0');
-      AutoTx_State       <= "011";
+      AutoTx_State       <= "000"; -- was 011
     end if;
 
   -- "011": Immediate scan for more ready lanes (optional; could just return to "000")
   when "011" =>
     AutoTx_Target <= (others => '0');
+	 AutoTx_Busy <= (others => '0');   -- clear busy on exit from wait
     found_port := 0; have_port := false;
     for i in 0 to 7 loop
       if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' then
@@ -1406,6 +1410,7 @@ begin
       onehot                    := (others => '0');
       onehot(found_port)        := '1';
       AutoTx_Target             <= onehot;
+		AutoTx_Busy(found_port) <= '1';   -- re-mark busy for next port
       AutoTx_State              <= "001";
     else
       AutoTx_State <= "000";
@@ -1621,6 +1626,8 @@ variable rs_next : std_logic_vector(7 downto 0);
 	-- UBTTarget_wr_en         <= '0';
 	-- UBTTarget_wr_en_stretch <= "000";
 	AutoTx_Claim_d <= (others => '0');
+	--AutoTx_Busy <= (others => '0');
+	
 	 
 elsif rising_edge (SysClk) then 
 if PllLock = '1' then
@@ -1648,7 +1655,7 @@ end if;
 -- PowerOnReady_done is cleared on reset (in the CpldRst_sync='0' branch).
 if PowerOnReady_done = '0' and StartupHoldoff = X"FF" and CpldRst_sync = '1' then
   for p in 0 to 7 loop
-    if MaskReg(p) = '1' then
+    if MaskReg(p) = '1' and AutoTx_Busy(p) = '0' then
       rs_next(p) := '1';
     end if;
   end loop;
