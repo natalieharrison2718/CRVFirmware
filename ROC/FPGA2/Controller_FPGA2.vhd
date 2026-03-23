@@ -351,7 +351,7 @@ signal AutoTx_WaitPort : integer range 0 to 7 := 0;
 signal AutoTx_WaitMask : std_logic_vector(7 downto 0) := (others => '0');
 signal PhyRxBuff_WasEmpty : std_logic_vector(7 downto 0) := (others => '1'); -- previous cycle empty
 signal PhyRxFilled : std_logic_vector(7 downto 0) := (others => '0'); -- rising edge: empty->non empty
-signal AutoTx_WaitTimeout : integer range 0 to 10000000 := 0; -- ~100 ms at 100 MHz
+signal AutoTx_WaitTimeout : integer range 0 to 100000 := 0; -- ~100 ms at 100 MHz
 -- FIX 1: Startup holdoff counter. Delays the PowerOnReady_done pulse until
 -- the reset synchroniser, FIFOs, and AutoTx FSM have all fully settled.
 -- 256 SysClk cycles @ 100 MHz = 2.56 us, well after CpldRst_sync stabilises.
@@ -388,7 +388,6 @@ signal UBTTarget_dout  : std_logic_vector(7 downto 0) := (others => '0');
 signal UBTTarget_wr_en         : std_logic := '0';  -- stretched pulse out
 signal UBTTarget_wr_en_stretch : std_logic_vector(2 downto 0) := "000";  -- FIX 2: stretch SR
 signal UBTTarget_rd_en : std_logic := '0';
-signal UBTTarget_rd_en_lock : std_logic := '0';  -- FIX 3: one-cycle lockout
 signal UBTTarget_full  : std_logic := '0';
 signal UBTTarget_empty : std_logic := '0';
 signal UBTPacket_start : std_logic := '0'; -- pulses when first word of new packet is written
@@ -832,7 +831,6 @@ PhyTxBuff_rdreq <= '0'; TxEnAck <= '0'; PreambleTx <= '0';
 PreambleCnt <= "000"; Preamble <= X"00";
 PhyTxBuff_Out_r <= (others => '0');
 TxEnMask <= X"FF";
-UBTTarget_rd_en_lock <= '0';
 
 -- Clock fanout SPI signals
 SPI_Adddr <= X"0800"; SPI_Shift <= (others => '0');
@@ -1004,28 +1002,19 @@ else PhyTxBuff_rdreq <= '0';
 end if;
 
 -- When preamble starts, load TxEnMask from the target tag FIFO
--- When preamble starts, load TxEnMask from the target tag FIFO.
--- FIX 3: UBTTarget_rd_en_lock ensures rd_en is asserted for exactly one
--- i50MHz cycle even if PreambleTx stays high or glitches.
-if PreambleTx = '1' and PreambleTx_d = '0' and UBTTarget_rd_en_lock = '0' then
+if PreambleTx = '1' and PreambleTx_d = '0' then
   if UBTTarget_empty = '0' then
-    TxEnMask             <= UBTTarget_dout;
-    UBTTarget_rd_en      <= '1';
-    UBTTarget_rd_en_lock <= '1';   -- FIX 3: lock out further rd_en this preamble
+    TxEnMask        <= UBTTarget_dout;
+    UBTTarget_rd_en <= '1';
   else
-    TxEnMask             <= TxEnMask;
-    UBTTarget_rd_en      <= '0';
-    UBTTarget_rd_en_lock <= '0';
+    TxEnMask        <= TxEnMask;  -- hold
+    UBTTarget_rd_en <= '0';
   end if;
-elsif PreambleTx = '0' then
-  -- Release the lock when preamble ends so the next packet can read
-  UBTTarget_rd_en_lock <= '0';
-  UBTTarget_rd_en      <= '0';
-  TxEnMask             <= TxEnMask;
 else
-  TxEnMask             <= TxEnMask;
-  UBTTarget_rd_en      <= '0';
+  TxEnMask        <= TxEnMask;  -- hold
+  UBTTarget_rd_en <= '0';
 end if;
+
 
 -- Set Tx Enables high until the Tx FIFO is empty
   if Clk25MHz = '0' and TxEnAck = '1' then TxEn <= TxEnMask;
@@ -1112,11 +1101,6 @@ begin
       wptr  := 0;
       rptr  := 0;
       count := 0;
-      -- FIX 4: explicitly zero all memory locations so no stale entries
-      -- survive a reset. Variables are not re-initialised by signal edges.
-      for k in 0 to 7 loop
-        mem(k) := (others => '0');
-      end loop;
       UBTTarget_full  <= '0';
       UBTTarget_empty <= '1';
       UBTTarget_dout  <= (others => '0');
@@ -1303,7 +1287,6 @@ begin
     AutoTx_WaitPort     <= 0;
     AutoTx_WaitMask     <= (others => '0');
     AutoTx_WaitTimeout  <= 0;
-	 AutoTx_Busy <= (others => '0');
 
   elsif rising_edge(SysClk) then
     -- Pulse-only defaults
@@ -1325,7 +1308,6 @@ begin
   when "000" =>
     AutoTx_Active <= '0';
     AutoTx_Target <= (others => '0');
-	 AutoTx_Busy <= (others => '0');   -- clear all busy bits in idle
     found_port := 0; have_port := false;
 
     for i in 0 to 7 loop
@@ -1349,13 +1331,10 @@ begin
       onehot(found_port)        := '1';
       AutoTx_Target             <= onehot;
       AutoTx_State              <= "001";
-		AutoTx_Busy(found_port) <= '1';   -- mark this port busy immediately
     end if;
 
   -- "001": Write UBT packet words
   when "001" =>
-	 -- Mark this port busy so re-arm guards in main process fire correctly
-    AutoTx_Busy(AutoTx_Port) <= '1';
     if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0'
        and PhyTxBuff_wreq = '0' then
 
@@ -1374,7 +1353,7 @@ begin
         AutoTx_WordIdx      <= 0;
         AutoTx_Active       <= '0';
         AutoTx_WaitMask     <= AutoTx_Target;
-        AutoTx_WaitTimeout  <= 10000000;
+        AutoTx_WaitTimeout  <= 100000;
         AutoTx_State        <= "100";   -- Now wait for buffer to drain
       else
         AutoTx_WordIdx <= AutoTx_WordIdx + 1;
@@ -1383,32 +1362,32 @@ begin
 
   -- "100": Wait for PhyTxBuff_Empty after UBT send
   when "100" =>
-		AutoTx_Busy(AutoTx_Port) <= '1';   -- still busy: buffer drainin    
-		if PhyTxBuff_Empty = '1' then
+    if PhyTxBuff_Empty = '1' then
       -- After buffer drains, wait for FEB reply (RX FIFO fill for the lane)
       AutoTx_State <= "010";
     end if;
 
   -- "010": Wait for reply from FEB (RX FIFO for the lane fills)
   when "010" =>
-    AutoTx_Busy(AutoTx_Port) <= '1';   -- still busy: awaiting FEB reply
     -- PhyRxFilled is a one-cycle pulse per port, AND with AutoTx_WaitMask gives the port(s) we?re tracking
     if (PhyRxFilled and AutoTx_WaitMask) /= X"00" then
       -- Reply arrived; move to immediate scan for next lane
       AutoTx_WaitMask    <= (others => '0');
       AutoTx_WaitTimeout <= 0;
-      AutoTx_State       <= "000"; -- was 011
+      AutoTx_State       <= "011";
     elsif AutoTx_WaitTimeout > 0 then
-      AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+      --AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+		if Counter1ms = 0 and AutoTx_WaitTimeout > 0 then
+			AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+		end if;
     else
       -- Timeout (no reply)?move on anyway, clear mask
       AutoTx_WaitMask    <= (others => '0');
-      AutoTx_State       <= "000"; -- was 011
+      AutoTx_State       <= "011";
     end if;
 
   -- "011": Immediate scan for more ready lanes (optional; could just return to "000")
   when "011" =>
-    AutoTx_Busy <= (others => '0');   -- clear busy on exit from wait
     AutoTx_Target <= (others => '0');
     found_port := 0; have_port := false;
     for i in 0 to 7 loop
@@ -1430,7 +1409,6 @@ begin
       onehot                    := (others => '0');
       onehot(found_port)        := '1';
       AutoTx_Target             <= onehot;
-		AutoTx_Busy(found_port) <= '1';   -- re-mark busy for next port
       AutoTx_State              <= "001";
     else
       AutoTx_State <= "000";
@@ -1442,7 +1420,147 @@ begin
 end case;
 
 
-
+--    case AutoTx_State is
+--
+--      -- -------------------------------------------------------
+--      -- State "000": idle ? find next port to send UBT to
+--      -- -------------------------------------------------------
+--      when "000" =>
+--        AutoTx_Active <= '0';
+--        AutoTx_Target <= (others => '0');
+--
+--        if AutoTxKickPulse = '1' and PhyTxBuff_Full = '0'
+--           and PhyTxBuff_wreq = '0' and UBTTarget_full = '0' then
+--          -- Forced kick: lowest set bit of AutoTxKickMask
+--          onehot := (others => '0');
+--          for p in 0 to 7 loop
+--            if AutoTxKickMask(p) = '1' then
+--              onehot(p) := '1';
+--              exit;
+--            end if;
+--          end loop;
+--          if onehot /= X"00" then
+--            AutoTx_Target      <= onehot;
+--            AutoTx_Port        <= 0;
+--			   RoundRobin_Last    <= 0;
+--            AutoTx_WordIdx     <= 0;
+--            AutoTx_Claim       <= onehot;
+--            AutoTx_Active      <= '1';
+--            AutoTx_State       <= "001";
+--          end if;
+--
+--        else
+--          -- Normal scan of ReadyStatus
+--          found_port := 0; have_port := false;
+--			-- scan from last+1 wrapping around
+--			for i in 0 to 7 loop
+--				if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' then
+--					found_port := (RoundRobin_Last + 1 + i) mod 8;
+--					have_port  := true;
+--					exit;
+--				end if;
+--			end loop;
+--
+--          if have_port and PhyTxBuff_Full = '0'
+--             and PhyTxBuff_wreq = '0' and UBTTarget_full = '0' then
+--            AutoTx_Port               <= found_port;
+--				RoundRobin_Last           <= found_port;
+--            AutoTx_WordIdx            <= 0;
+--            AutoTx_Claim(found_port)  <= '1';
+--            AutoTx_Active             <= '1';
+--            onehot                    := (others => '0');
+--            onehot(found_port)        := '1';
+--            AutoTx_Target             <= onehot;
+--            AutoTx_State              <= "001";
+--          end if;
+--        end if;
+--
+--      -- -------------------------------------------------------
+--      -- State "001": write UBT packet words
+--      -- -------------------------------------------------------
+--      when "001" =>
+--        if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0'
+--           and PhyTxBuff_wreq = '0' then
+--
+--          PhyTxDin_FPGA      <= ubt_ascii_word(AutoTx_WordIdx, '1');
+--          PhyTxWrReq_FPGA    <= '1';
+--          AutoTx_WordPending <= '1';
+--
+--          if AutoTx_WordIdx = 0 then
+--            -- load the stretch shift register instead of a bare one-cycle pulse
+--				UBTTarget_din            <= AutoTx_Target;
+--				UBTTarget_wr_en_stretch  <= "111";   -- will stay high for 3 SysClk cycles
+--          end if;
+--
+--          if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
+--            -- Packet complete: request PHY TX enable, then wait for FEB reply
+--            AutoTx_TxEnReqPulse <= '1';
+--            AutoTx_WordIdx      <= 0;
+--            AutoTx_Active       <= '0';
+--            -- Record which port we are waiting on
+--            AutoTx_WaitMask     <= AutoTx_Target;
+--            AutoTx_WaitTimeout  <= 10000000;  -- ~100 ms at 100 MHz
+--            AutoTx_State        <= "010";
+--          else
+--            AutoTx_WordIdx <= AutoTx_WordIdx + 1;
+--          end if;
+--        end if;
+--
+--      -- -------------------------------------------------------
+--      -- State "010": wait for FEB RX FIFO to go non-empty
+--      --              (PhyRxFilled is a one-cycle pulse in SysClk domain)
+--      -- -------------------------------------------------------
+--      when "010" =>
+--        -- Check whether the waited-on port's FIFO just filled
+--        if (PhyRxFilled and AutoTx_WaitMask) /= X"00" then
+--          -- FEB responded: move on to check for more ports
+--          AutoTx_WaitMask    <= (others => '0');
+--          AutoTx_WaitTimeout <= 0;
+--          AutoTx_State       <= "011";
+--
+--        elsif AutoTx_WaitTimeout > 0 then
+--          -- Still waiting
+--          AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+--
+--        else
+--          -- Timeout: give up waiting, move on anyway
+--          AutoTx_WaitMask    <= (others => '0');
+--          AutoTx_State       <= "011";
+--        end if;
+--
+--      -- -------------------------------------------------------
+--      -- State "011": check for next ready port immediately
+--      -- -------------------------------------------------------
+--      when "011" =>
+--			AutoTx_Target <= (others => '0');
+--
+--			found_port := 0; have_port := false;
+--			for i in 0 to 7 loop                    -- round robin scan
+--				if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' then
+--					found_port := (RoundRobin_Last + 1 + i) mod 8;
+--					have_port  := true;
+--					exit;
+--				end if;
+--			end loop;
+--
+--        if have_port and PhyTxBuff_Full = '0'
+--           and PhyTxBuff_wreq = '0' and UBTTarget_full = '0' then
+--          AutoTx_Port               <= found_port;
+--			 RoundRobin_Last           <= found_port;
+--          AutoTx_WordIdx            <= 0;
+--          AutoTx_Claim(found_port)  <= '1';
+--          AutoTx_Active             <= '1';
+--          onehot                    := (others => '0');
+--          onehot(found_port)        := '1';
+--          AutoTx_Target             <= onehot;
+--          AutoTx_State              <= "001";
+--        else
+--          AutoTx_State <= "000";
+--        end if;
+--
+--      when others =>
+--        AutoTx_State <= "000";
+--    end case;
   end if;
 end process AutoTx_Proc;
 
@@ -1506,8 +1624,6 @@ variable rs_next : std_logic_vector(7 downto 0);
 	-- UBTTarget_wr_en         <= '0';
 	-- UBTTarget_wr_en_stretch <= "000";
 	AutoTx_Claim_d <= (others => '0');
-	--AutoTx_Busy <= (others => '0');
-	
 	 
 elsif rising_edge (SysClk) then 
 if PllLock = '1' then
@@ -1535,7 +1651,7 @@ end if;
 -- PowerOnReady_done is cleared on reset (in the CpldRst_sync='0' branch).
 if PowerOnReady_done = '0' and StartupHoldoff = X"FF" and CpldRst_sync = '1' then
   for p in 0 to 7 loop
-    if MaskReg(p) = '1' and AutoTx_Busy(p) = '0' then
+    if MaskReg(p) = '1' then
       rs_next(p) := '1';
     end if;
   end loop;
@@ -1551,7 +1667,18 @@ if DDRRd_en = '1' and DDRRd_EnD = '0' then
   end loop;
 end if;
 
-
+-- Background re-arm at 1 Hz.
+-- If a port is masked, its RX FIFO is empty (no pending data), and
+-- ReadyStatus is not already set, re-assert it so AutoTx will retry.
+-- Fired at Counter1s = 0 to avoid flooding; gated on PowerOnReady_done
+-- so it only activates after the normal startup path has had its chance.
+--if Counter1s = 0 and PowerOnReady_done = '1' then
+--  for p in 0 to 7 loop
+--    if MaskReg(p) = '1' and PhyRxBuff_Empty(p) = '1' and rs_next(p) = '0' then
+--      rs_next(p) := '1';
+--    end if;
+--  end loop;
+--end if;
 
 -- FIXED: Background re-arm at 1 Hz.
 -- Only re-arm a port if:
@@ -1559,33 +1686,37 @@ end if;
 --   2. Its RX FIFO is empty (no pending data)
 --   3. ReadyStatus is not already set
 --   4. The AutoTx FSM is NOT currently mid-handshake waiting on this port
---if Counter1s = 0 and PowerOnReady_done = '1' then
---  for p in 0 to 7 loop
---    if MaskReg(p) = '1'
---       and PhyRxBuff_Empty(p) = '1'
---       and rs_next(p) = '0'
---		 and AutoTx_Busy(p) = '0'
---       -- FIX: suppress re-arm while FSM is waiting for FEB reply on this port
---       and not (AutoTx_WaitMask(p) = '1'
---                and (AutoTx_State = "010" or AutoTx_State = "100"))
---    then
---      rs_next(p) := '1';
---    end if;
---  end loop;
---end if;
 if Counter1s = 0 and PowerOnReady_done = '1' then
   for p in 0 to 7 loop
     if MaskReg(p) = '1'
        and PhyRxBuff_Empty(p) = '1'
        and rs_next(p) = '0'
-       and AutoTx_Busy(p) = '0'          -- FIX 1: Busy now actually driven
-       and AutoTx_State = "000"           -- FIX 1: only re-arm when FSM is truly idle
+		 and AutoTx_Busy(p) = '0'
+       -- FIX: suppress re-arm while FSM is waiting for FEB reply on this port
+       and not (AutoTx_WaitMask(p) = '1'
+                and (AutoTx_State = "010" or AutoTx_State = "100"))
     then
       rs_next(p) := '1';
     end if;
   end loop;
 end if;
 
+-- P3: set bit when RX FIFO transitions non-empty->empty
+-- Guard with CpldRst_sync to prevent spurious sets during reset
+--for p in 0 to 7 loop
+--  if CpldRst_sync = '1'
+--     and phy_empty_d(p)(0) = '1'
+--     and phy_empty_d(p)(1) = '0'
+--     and AutoTx_Claim(p) = '0' then
+--    rs_next(p) := '1';
+--  end if;
+--end loop;
+--
+---- ReadyForce write
+--if WRDL = 1 and uCA(11 downto 10) = GA
+--   and uCA(9 downto 0) = ReadyForceAddr then
+--  rs_next := rs_next or uCD(7 downto 0);
+--end if;
 
 -- FIXED P3: use AutoTx_Claim_d (one cycle delayed) as guard,
 -- consistent with how the P2 clear uses it.
@@ -1598,13 +1729,15 @@ for p in 0 to 7 loop
      and AutoTx_Claim(p) = '0'     -- not just claimed this cycle
      and AutoTx_Claim_d(p) = '0'   -- not claimed last cycle either
 	  and AutoTx_Busy(p) = '0'
-	  and AutoTx_State = "000"          -- FIX 2: FSM must be idle (closes race in state "011")
   then
     rs_next(p) := '1';
   end if;
 end loop;
 
-
+-- P2: AutoTx claim clears
+--if AutoTx_Claim /= X"00" then
+--  rs_next := rs_next and (not AutoTx_Claim);
+--end if;
 
 -- P2: use the delayed claim so ReadyStatus is stable for one full cycle
 -- before being cleared, giving AutoTx_Proc time to latch it.
