@@ -343,6 +343,7 @@ signal AutoTx_Busy : std_logic_vector(7 downto 0) := (others => '0');
 signal AutoTx_Target       : std_logic_vector(7 downto 0) := (others => '0'); -- one-hot chosen port
 signal AutoTx_BroadcastMode: std_logic := '0'; -- if '1', ignore AutoTx_Target and broadcast to TxEn bitssignal AutoTx_Cooldown : integer range 0 to 1000000 := 0;  -- ~10ms at 100MHz
 signal AutoTx_Cooldown : integer range 0 to 1000000 := 0;  -- ~10ms at 100MHz
+signal AutoTx_TimedOut : std_logic_vector(7 downto 0) := (others => '0');
 signal AutoTxKickMask  : std_logic_vector(7 downto 0) := (others => '0');
 signal AutoTxKickPulse : std_logic := '0';
 signal AutoTx_TxEnReqPulse : std_logic := '0';
@@ -1287,6 +1288,8 @@ begin
     AutoTx_WaitPort     <= 0;
     AutoTx_WaitMask     <= (others => '0');
     AutoTx_WaitTimeout  <= 0;
+	 AutoTx_Busy     <= (others => '0');
+	 AutoTx_TimedOut <= (others => '0');  -- ADD to AutoTx_Proc reset
 
   elsif rising_edge(SysClk) then
     -- Pulse-only defaults
@@ -1326,7 +1329,9 @@ begin
       RoundRobin_Last           <= found_port;
       AutoTx_WordIdx            <= 0;
       AutoTx_Claim(found_port)  <= '1';
+      AutoTx_Busy(found_port)   <= '1';
       AutoTx_Active             <= '1';
+		AutoTx_TimedOut(found_port) <= '0';  -- ADD: clear timed-out flag when claiming
       onehot                    := (others => '0');
       onehot(found_port)        := '1';
       AutoTx_Target             <= onehot;
@@ -1341,7 +1346,7 @@ begin
       PhyTxDin_FPGA      <= ubt_ascii_word(AutoTx_WordIdx, '1');
       PhyTxWrReq_FPGA    <= '1';
       AutoTx_WordPending <= '1';
-
+		--AutoTx_Busy(AutoTx_Port) <= '1';
       if AutoTx_WordIdx = 0 then
         UBTTarget_din            <= AutoTx_Target;
         UBTTarget_wr_en_stretch  <= "111";
@@ -1349,7 +1354,7 @@ begin
 
       if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
         -- Packet complete. Request PHY TX enable.
-        AutoTx_TxEnReqPulse <= '1';
+        --AutoTx_TxEnReqPulse <= '1';
         AutoTx_WordIdx      <= 0;
         AutoTx_Active       <= '0';
         AutoTx_WaitMask     <= AutoTx_Target;
@@ -1362,9 +1367,10 @@ begin
 
   -- "100": Wait for PhyTxBuff_Empty after UBT send
   when "100" =>
-    if PhyTxBuff_Empty = '1' then
+    if PhyTxBuff_Empty = '0' then
       -- After buffer drains, wait for FEB reply (RX FIFO fill for the lane)
-      AutoTx_State <= "010";
+      AutoTx_TxEnReqPulse <= '1';
+		AutoTx_State <= "101";
     end if;
 
   -- "010": Wait for reply from FEB (RX FIFO for the lane fills)
@@ -1372,15 +1378,28 @@ begin
     -- PhyRxFilled is a one-cycle pulse per port, AND with AutoTx_WaitMask gives the port(s) we?re tracking
     if (PhyRxFilled and AutoTx_WaitMask) /= X"00" then
       -- Reply arrived; move to immediate scan for next lane
-      AutoTx_WaitMask    <= (others => '0');
+      --AutoTx_TimedOut(AutoTx_Port) <= '1';
+		AutoTx_TimedOut(AutoTx_Port) <= '0';
+		AutoTx_WaitMask    <= (others => '0');
       AutoTx_WaitTimeout <= 0;
+		AutoTx_Busy(AutoTx_Port) <= '0';
       AutoTx_State       <= "011";
-    elsif AutoTx_WaitTimeout > 0 and Counter1ms = 0 then
-      AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+    elsif AutoTx_WaitTimeout > 0 then
+		if Counter1ms = 0 then
+			AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+		end if;
     else
       -- Timeout (no reply)?move on anyway, clear mask
+		AutoTx_TimedOut(AutoTx_Port) <= '1';
       AutoTx_WaitMask    <= (others => '0');
+		AutoTx_Busy(AutoTx_Port) <= '0';
       AutoTx_State       <= "011";
+    end if;
+	
+  -- 	TxEnAck in SMI_Proc requires PhyTxBuff_Empty = '0' to latch. By firing TxEnReqPulse only after the FIFO is confirmed non-empty, the i50MHz-domain TxEnAck handshake will succeed and TxEn will actually be driven.
+  when "101" =>
+    if PhyTxBuff_Empty = '1' then
+        AutoTx_State <= "010";
     end if;
 
   -- "011": Immediate scan for more ready lanes (optional; could just return to "000")
@@ -1394,7 +1413,7 @@ begin
         exit;
       end if;
     end loop;
-    if have_port and PhyTxBuff_Empty = '1'
+      if have_port and PhyTxBuff_Empty = '1'
        and PhyTxBuff_Full = '0'
        and PhyTxBuff_wreq = '0'
        and UBTTarget_full = '0' then
@@ -1402,162 +1421,23 @@ begin
       RoundRobin_Last           <= found_port;
       AutoTx_WordIdx            <= 0;
       AutoTx_Claim(found_port)  <= '1';
+      AutoTx_Busy(found_port)   <= '1';
       AutoTx_Active             <= '1';
+		AutoTx_TimedOut(found_port) <= '0'; -- ADD: clear timed-out flag when re-claiming
       onehot                    := (others => '0');
       onehot(found_port)        := '1';
       AutoTx_Target             <= onehot;
       AutoTx_State              <= "001";
     else
       AutoTx_State <= "000";
-    end if;
+    end if;  
 
   -- catch-all
   when others =>
+	 AutoTx_Busy <= (others => '0');
     AutoTx_State <= "000";
 end case;
 
-
---    case AutoTx_State is
---
---      -- -------------------------------------------------------
---      -- State "000": idle ? find next port to send UBT to
---      -- -------------------------------------------------------
---      when "000" =>
---        AutoTx_Active <= '0';
---        AutoTx_Target <= (others => '0');
---
---        if AutoTxKickPulse = '1' and PhyTxBuff_Full = '0'
---           and PhyTxBuff_wreq = '0' and UBTTarget_full = '0' then
---          -- Forced kick: lowest set bit of AutoTxKickMask
---          onehot := (others => '0');
---          for p in 0 to 7 loop
---            if AutoTxKickMask(p) = '1' then
---              onehot(p) := '1';
---              exit;
---            end if;
---          end loop;
---          if onehot /= X"00" then
---            AutoTx_Target      <= onehot;
---            AutoTx_Port        <= 0;
---			   RoundRobin_Last    <= 0;
---            AutoTx_WordIdx     <= 0;
---            AutoTx_Claim       <= onehot;
---            AutoTx_Active      <= '1';
---            AutoTx_State       <= "001";
---          end if;
---
---        else
---          -- Normal scan of ReadyStatus
---          found_port := 0; have_port := false;
---			-- scan from last+1 wrapping around
---			for i in 0 to 7 loop
---				if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' then
---					found_port := (RoundRobin_Last + 1 + i) mod 8;
---					have_port  := true;
---					exit;
---				end if;
---			end loop;
---
---          if have_port and PhyTxBuff_Full = '0'
---             and PhyTxBuff_wreq = '0' and UBTTarget_full = '0' then
---            AutoTx_Port               <= found_port;
---				RoundRobin_Last           <= found_port;
---            AutoTx_WordIdx            <= 0;
---            AutoTx_Claim(found_port)  <= '1';
---            AutoTx_Active             <= '1';
---            onehot                    := (others => '0');
---            onehot(found_port)        := '1';
---            AutoTx_Target             <= onehot;
---            AutoTx_State              <= "001";
---          end if;
---        end if;
---
---      -- -------------------------------------------------------
---      -- State "001": write UBT packet words
---      -- -------------------------------------------------------
---      when "001" =>
---        if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0'
---           and PhyTxBuff_wreq = '0' then
---
---          PhyTxDin_FPGA      <= ubt_ascii_word(AutoTx_WordIdx, '1');
---          PhyTxWrReq_FPGA    <= '1';
---          AutoTx_WordPending <= '1';
---
---          if AutoTx_WordIdx = 0 then
---            -- load the stretch shift register instead of a bare one-cycle pulse
---				UBTTarget_din            <= AutoTx_Target;
---				UBTTarget_wr_en_stretch  <= "111";   -- will stay high for 3 SysClk cycles
---          end if;
---
---          if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
---            -- Packet complete: request PHY TX enable, then wait for FEB reply
---            AutoTx_TxEnReqPulse <= '1';
---            AutoTx_WordIdx      <= 0;
---            AutoTx_Active       <= '0';
---            -- Record which port we are waiting on
---            AutoTx_WaitMask     <= AutoTx_Target;
---            AutoTx_WaitTimeout  <= 10000000;  -- ~100 ms at 100 MHz
---            AutoTx_State        <= "010";
---          else
---            AutoTx_WordIdx <= AutoTx_WordIdx + 1;
---          end if;
---        end if;
---
---      -- -------------------------------------------------------
---      -- State "010": wait for FEB RX FIFO to go non-empty
---      --              (PhyRxFilled is a one-cycle pulse in SysClk domain)
---      -- -------------------------------------------------------
---      when "010" =>
---        -- Check whether the waited-on port's FIFO just filled
---        if (PhyRxFilled and AutoTx_WaitMask) /= X"00" then
---          -- FEB responded: move on to check for more ports
---          AutoTx_WaitMask    <= (others => '0');
---          AutoTx_WaitTimeout <= 0;
---          AutoTx_State       <= "011";
---
---        elsif AutoTx_WaitTimeout > 0 then
---          -- Still waiting
---          AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
---
---        else
---          -- Timeout: give up waiting, move on anyway
---          AutoTx_WaitMask    <= (others => '0');
---          AutoTx_State       <= "011";
---        end if;
---
---      -- -------------------------------------------------------
---      -- State "011": check for next ready port immediately
---      -- -------------------------------------------------------
---      when "011" =>
---			AutoTx_Target <= (others => '0');
---
---			found_port := 0; have_port := false;
---			for i in 0 to 7 loop                    -- round robin scan
---				if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' then
---					found_port := (RoundRobin_Last + 1 + i) mod 8;
---					have_port  := true;
---					exit;
---				end if;
---			end loop;
---
---        if have_port and PhyTxBuff_Full = '0'
---           and PhyTxBuff_wreq = '0' and UBTTarget_full = '0' then
---          AutoTx_Port               <= found_port;
---			 RoundRobin_Last           <= found_port;
---          AutoTx_WordIdx            <= 0;
---          AutoTx_Claim(found_port)  <= '1';
---          AutoTx_Active             <= '1';
---          onehot                    := (others => '0');
---          onehot(found_port)        := '1';
---          AutoTx_Target             <= onehot;
---          AutoTx_State              <= "001";
---        else
---          AutoTx_State <= "000";
---        end if;
---
---      when others =>
---        AutoTx_State <= "000";
---    end case;
   end if;
 end process AutoTx_Proc;
 
@@ -1709,23 +1589,25 @@ end if;
 --  end if;
 --end loop;
 --
----- ReadyForce write
---if WRDL = 1 and uCA(11 downto 10) = GA
---   and uCA(9 downto 0) = ReadyForceAddr then
---  rs_next := rs_next or uCD(7 downto 0);
---end if;
+-- ReadyForce write
+if WRDL = 1 and uCA(11 downto 10) = GA
+   and uCA(9 downto 0) = ReadyForceAddr then
+  rs_next := rs_next or uCD(7 downto 0);
+end if;
 
 -- FIXED P3: use AutoTx_Claim_d (one cycle delayed) as guard,
 -- consistent with how the P2 clear uses it.
 -- This closes the 1-cycle race window where the empty edge fires in
 -- the same cycle as the claim pulse, causing a spurious re-arm.
+-- FIXED P3
 for p in 0 to 7 loop
   if CpldRst_sync = '1'
-     and phy_empty_d(p)(0) = '1'   -- current: empty
-     and phy_empty_d(p)(1) = '0'   -- previous: non-empty
-     and AutoTx_Claim(p) = '0'     -- not just claimed this cycle
-     and AutoTx_Claim_d(p) = '0'   -- not claimed last cycle either
-	  and AutoTx_Busy(p) = '0'
+     and phy_empty_d(p)(0) = '1'
+     and phy_empty_d(p)(1) = '0'
+     and AutoTx_Claim(p) = '0'
+     and AutoTx_Claim_d(p) = '0'
+     and AutoTx_Busy(p) = '0'
+     and AutoTx_TimedOut(p) = '0'   -- ? ADD: don't re-arm timed-out ports via P3
   then
     rs_next(p) := '1';
   end if;
