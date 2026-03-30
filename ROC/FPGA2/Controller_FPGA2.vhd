@@ -347,6 +347,7 @@ signal AutoTx_TimedOut : std_logic_vector(7 downto 0) := (others => '0');
 signal AutoTxKickMask  : std_logic_vector(7 downto 0) := (others => '0');
 signal AutoTxKickPulse : std_logic := '0';
 signal AutoTx_TxEnReqPulse : std_logic := '0';
+signal AutoTx_TxEnReqHold : std_logic := '0';  -- sticky, driven only from main
 -- Sequential UBT handshake: track which port we are waiting on
 signal AutoTx_WaitPort : integer range 0 to 7 := 0;
 signal AutoTx_WaitMask : std_logic_vector(7 downto 0) := (others => '0');
@@ -1341,13 +1342,13 @@ begin
 
   -- "001": Write UBT packet words
   when "001" =>
+    AutoTx_Busy(AutoTx_Port) <= '1';   -- FIX: keep busy asserted throughout write phase
     if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0'
        and PhyTxBuff_wreq = '0' then
 
       PhyTxDin_FPGA      <= ubt_ascii_word(AutoTx_WordIdx, '1');
       PhyTxWrReq_FPGA    <= '1';
       AutoTx_WordPending <= '1';
-		--AutoTx_Busy(AutoTx_Port) <= '1';
       if AutoTx_WordIdx = 0 then
         UBTTarget_din            <= AutoTx_Target;
         UBTTarget_wr_en_stretch  <= "111";
@@ -1366,14 +1367,12 @@ begin
       end if;
     end if;
 
-  -- "100": Wait for PhyTxBuff_Empty after UBT send
+  -- "100": Fire TxEnReq while FIFO is still non-empty, then wait for drain in "101"
   when "100" =>
-	 AutoTx_Busy(AutoTx_Port) <= '1';   -- ADD: keep busy while waiting for drain
-    if PhyTxBuff_Empty = '0' then
-      -- After buffer drains, wait for FEB reply (RX FIFO fill for the lane)
-      AutoTx_TxEnReqPulse <= '1';
-		AutoTx_State <= "101";
-    end if;
+    AutoTx_Busy(AutoTx_Port) <= '1';
+    -- Fire TxEnReqPulse immediately: FIFO is non-empty here so SMI_Proc can latch TxEnAck
+    AutoTx_TxEnReqPulse <= '1';
+    AutoTx_State <= "101";
 
   -- "010": Wait for reply from FEB (RX FIFO for the lane fills)
   when "010" =>
@@ -1399,10 +1398,11 @@ begin
     end if;
 	
   -- 	TxEnAck in SMI_Proc requires PhyTxBuff_Empty = '0' to latch. By firing TxEnReqPulse only after the FIFO is confirmed non-empty, the i50MHz-domain TxEnAck handshake will succeed and TxEn will actually be driven.
+  -- "101": Wait for PhyTxBuff to fully drain (PHY has finished transmitting)
   when "101" =>
-	 AutoTx_Busy(AutoTx_Port) <= '1';   -- ADD: keep busy while waiting for empty
-    if PhyTxBuff_Empty = '1' then
-        AutoTx_State <= "010";
+    AutoTx_Busy(AutoTx_Port) <= '1';
+    if PhyTxBuff_Empty = '1' then      -- FIX: wait until PHY has sent the packet
+      AutoTx_State <= "010";           -- now wait for FEB reply
     end if;
 
   -- "011": Immediate scan for more ready lanes (optional; could just return to "000")
@@ -1504,6 +1504,7 @@ variable rs_next : std_logic_vector(7 downto 0);
 	--UBTTarget_wr_en         <= '0';
 	--UBTTarget_wr_en_stretch <= "000";
 	AutoTx_Claim_d <= (others => '0');
+	AutoTx_TxEnReqHold <= '0';
 	 
 elsif rising_edge (SysClk) then 
 if PllLock = '1' then
@@ -1596,6 +1597,7 @@ end if;
 -- consistent with how the P2 clear uses it.
 -- This closes the 1-cycle race window where the empty edge fires in
 -- the same cycle as the claim pulse, causing a spurious re-arm.
+-- Also suppress re-arm while FSM is mid-handshake waiting on this port.
 -- FIXED P3
 for p in 0 to 7 loop
   if CpldRst_sync = '1'
@@ -1605,6 +1607,7 @@ for p in 0 to 7 loop
      and AutoTx_Claim_d(p) = '0'
      and AutoTx_Busy(p) = '0'
      and AutoTx_TimedOut(p) = '0'   -- ? ADD: don't re-arm timed-out ports via P3
+     and AutoTx_WaitMask(p) = '0'   -- FIX: don't re-arm while FSM is waiting for FEB reply on this port (WaitMask bit is '1' while UBT is in-flight)
   then
     rs_next(p) := '1';
   end if;
@@ -1923,12 +1926,22 @@ else RxIn(1).Clr_Err <= '0';
 end if;
 
 -- Enable PHY transmit either from a uC CSR write OR from AutoTx completion
+-- AutoTx_TxEnReqPulse is a single-cycle pulse. If TxEnAck is still asserted from a
+-- previous transmission when the pulse arrives, TxEnReq = '0' and TxEnAck = '0' will
+-- not both be true and the pulse would be silently dropped. The sticky hold latches
+-- the pulse and holds it until TxEnReq is successfully set, preventing missed TX enables.
+if AutoTx_TxEnReqPulse = '1' then
+  AutoTx_TxEnReqHold <= '1';
+elsif TxEnReq = '1' then
+  AutoTx_TxEnReqHold <= '0';  -- clear once TxEnReq has been accepted
+end if;
+
 if TxEnReq = '0' and TxEnAck = '0' and (
      (WRDL = 1 and (
         (uCA(11 downto 10) = GA and uCA(9 downto 0) = PhyTxCSRAddr and uCD(0) = '1')
         or (uCA(9 downto 0) = PhyTxCSRBroadCastAd and uCD(0) = '1')
      ))
-     or (AutoTx_TxEnReqPulse = '1')  -- AutoTx requests a transmit start
+     or AutoTx_TxEnReqHold = '1'   -- FIX: use sticky hold, not raw pulse
    )
 then
   TxEnReq <= '1';
