@@ -68,11 +68,14 @@ entity Controller_FPGA2 is port(
 	-- debug outputs for testbench visibility
 	-- synthesis translate_off
 	;
-	probe_MaskReg         : out std_logic_vector(7 downto 0);
-	probe_PhyRxEmpty      : out std_logic_vector(7 downto 0);
-	probe_Rx_active       : out std_logic_vector(7 downto 0);
-	probe_PhyTxBuff_Count : out std_logic_vector(10 downto 0);
-	probe_ReadyStatus     : out std_logic_vector(7 downto 0)
+	probe_MaskReg          : out std_logic_vector(7 downto 0);
+	probe_PhyRxEmpty       : out std_logic_vector(7 downto 0);
+	probe_Rx_active        : out std_logic_vector(7 downto 0);
+	probe_PhyTxBuff_Count  : out std_logic_vector(10 downto 0);
+	probe_ReadyStatus      : out std_logic_vector(7 downto 0);
+	probe_UBT_in_progress  : out std_logic_vector(7 downto 0);
+	probe_handshake_queued : out std_logic_vector(7 downto 0);
+	probe_AutoTx_Port      : out std_logic_vector(2 downto 0)
 	-- synthesis translate_on	 
 );
 
@@ -1367,12 +1370,20 @@ begin
       end if;
     end if;
 
-  -- "100": Fire TxEnReq while FIFO is still non-empty, then wait for drain in "101"
+  -- "100": Wait until FIFO is confirmed non-empty in SysClk domain before firing
+  --        TxEnReqPulse.  This ensures the i50MHz-domain gray-code synchroniser has
+  --        had time to propagate the non-empty state, so that when TxEnReq='1' is
+  --        seen by SMI_Proc, PhyTxBuff_Empty is already '0' there and TxEnAck can
+  --        be asserted immediately.  Without this guard the pulse can fire while
+  --        PhyTxBuff_Empty is still '1' in the i50MHz domain, preventing TxEnAck
+  --        from ever being set and causing the UBT to not appear on startup.
   when "100" =>
     AutoTx_Busy(AutoTx_Port) <= '1';
-    -- Fire TxEnReqPulse immediately: FIFO is non-empty here so SMI_Proc can latch TxEnAck
-    AutoTx_TxEnReqPulse <= '1';
-    AutoTx_State <= "101";
+    if PhyTxBuff_Empty = '0' then
+      -- FIFO is confirmed non-empty; fire pulse and move to drain wait
+      AutoTx_TxEnReqPulse <= '1';
+      AutoTx_State <= "101";
+    end if;
 
   -- "010": Wait for reply from FEB (RX FIFO for the lane fills)
   when "010" =>
@@ -1640,11 +1651,14 @@ WRDL(1) <= WRDL(0);
 
 -- debug probes for testbench
 -- synthesis translate_off
-probe_ReadyStatus     <= ReadyStatus;
-probe_MaskReg         <= MaskReg;
-probe_PhyRxEmpty      <= PhyRxBuff_Empty;
-probe_Rx_active       <= Rx_active;
-probe_PhyTxBuff_Count <= PhyTxBuff_Count;
+probe_ReadyStatus      <= ReadyStatus;
+probe_MaskReg          <= MaskReg;
+probe_PhyRxEmpty       <= PhyRxBuff_Empty;
+probe_Rx_active        <= Rx_active;
+probe_PhyTxBuff_Count  <= PhyTxBuff_Count;
+probe_UBT_in_progress  <= AutoTx_Busy;
+probe_handshake_queued <= AutoTx_WaitMask;
+probe_AutoTx_Port      <= std_logic_vector(to_unsigned(AutoTx_Port, 3));
 -- synthesis translate_on
 
 
