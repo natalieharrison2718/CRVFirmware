@@ -395,6 +395,9 @@ signal UBTPacket_start : std_logic := '0'; -- pulses when first word of new pack
 signal UBTTarget_rd_en_sync : std_logic_vector(1 downto 0) := "00";
 signal UBTTarget_wr_en_50  : std_logic := '0';
 signal UBTTarget_wr_en_sync_50 : std_logic_vector(3 downto 0) := "0000";
+signal UBT_in_progress          : std_logic_vector(7 downto 0) := (others => '0');
+signal UBT_session_done         : std_logic_vector(7 downto 0) := (others => '0');
+signal UBT_in_progress_clr_pending : std_logic_vector(7 downto 0) := (others => '0');
 -- (3 stages: 2 for metastability, 1 for edge detect)
 
 constant READY_WORD_COUNT : integer := 2; -- number of words in the READY packet (update if you change helper)
@@ -1390,10 +1393,18 @@ begin
 		end if;
     else
       -- Timeout (no reply)?move on anyway, clear mask
-		AutoTx_TimedOut(AutoTx_Port) <= '1';
-      AutoTx_WaitMask    <= (others => '0');
-		AutoTx_Busy(AutoTx_Port) <= '0';
-      AutoTx_State       <= "011";
+		--AutoTx_TimedOut(AutoTx_Port) <= '1';
+      --AutoTx_WaitMask    <= (others => '0');
+		--AutoTx_Busy(AutoTx_Port) <= '0';
+      --AutoTx_State       <= "011";
+		for p in 0 to 7 loop
+			if AutoTx_WaitMask(p) = '1' then
+				UBT_in_progress_clr_pending(p) <= '1';
+				-- UBT_session_done intentionally NOT set
+			end if;
+		end loop;
+		AutoTx_WaitMask <= (others => '0');
+		AutoTx_State    <= "011";
     end if;
 	
   -- 	TxEnAck in SMI_Proc requires PhyTxBuff_Empty = '0' to latch. By firing TxEnReqPulse only after the FIFO is confirmed non-empty, the i50MHz-domain TxEnAck handshake will succeed and TxEn will actually be driven.
@@ -1526,10 +1537,22 @@ end if;
 -- P5: power-on init ? set ReadyStatus for all masked ports once, on first PllLock
 -- This fires exactly once after reset+PLL-lock, with or without DDRRd_en.
 -- PowerOnReady_done is cleared on reset (in the CpldRst_sync='0' branch).
+--if PowerOnReady_done = '0' and StartupHoldoff = X"FF" and CpldRst_sync = '1' then
+--  for p in 0 to 7 loop
+--    if MaskReg(p) = '1' then
+--      rs_next(p) := '1';
+--    end if;
+--  end loop;
+--  PowerOnReady_done <= '1';
+--end if;
 if PowerOnReady_done = '0' and StartupHoldoff = X"FF" and CpldRst_sync = '1' then
   for p in 0 to 7 loop
-    if MaskReg(p) = '1' then
+    if MaskReg(p) = '1' 
+       and PhyRxBuff_Empty(p) = '1'
+       and UBT_in_progress(p) = '0'
+       and UBT_session_done(p) = '0' then
       rs_next(p) := '1';
+      -- no exit: all matching ports get set
     end if;
   end loop;
   PowerOnReady_done <= '1';
@@ -1588,6 +1611,10 @@ end if;
 --    rs_next(p) := '1';
 --  end if;
 --end loop;
+
+-- REMOVE the P3 loop entirely
+
+
 --
 -- ReadyForce write
 if WRDL = 1 and uCA(11 downto 10) = GA
@@ -1600,18 +1627,28 @@ end if;
 -- This closes the 1-cycle race window where the empty edge fires in
 -- the same cycle as the claim pulse, causing a spurious re-arm.
 -- FIXED P3
-for p in 0 to 7 loop
-  if CpldRst_sync = '1'
-     and phy_empty_d(p)(0) = '1'
-     and phy_empty_d(p)(1) = '0'
-     and AutoTx_Claim(p) = '0'
-     and AutoTx_Claim_d(p) = '0'
-     and AutoTx_Busy(p) = '0'
-     and AutoTx_TimedOut(p) = '0'   -- ? ADD: don't re-arm timed-out ports via P3
-  then
-    rs_next(p) := '1';
-  end if;
-end loop;
+--for p in 0 to 7 loop
+--  if CpldRst_sync = '1'
+--     and phy_empty_d(p)(0) = '1'
+--     and phy_empty_d(p)(1) = '0'
+--     and AutoTx_Claim(p) = '0'
+--     and AutoTx_Claim_d(p) = '0'
+--     and AutoTx_Busy(p) = '0'
+--     and AutoTx_TimedOut(p) = '0'   -- ? ADD: don't re-arm timed-out ports via P3
+--  then
+--    rs_next(p) := '1';
+--  end if;
+--end loop;
+
+if DDR_Write_Seq = IncrBuffCnt and SDwr_empty = '1' then
+  for p in 0 to 7 loop
+    if MaskReg(p) = '1' 
+       and UBT_session_done(p) = '0'
+       and UBT_in_progress(p) = '0' then
+      rs_next(p) := '1';
+    end if;
+  end loop;
+end if;
 
 -- P2: AutoTx claim clears
 --if AutoTx_Claim /= X"00" then
