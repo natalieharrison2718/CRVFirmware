@@ -351,6 +351,12 @@ signal AutoTxKickMask  : std_logic_vector(7 downto 0) := (others => '0');
 signal AutoTxKickPulse : std_logic := '0';
 signal AutoTx_TxEnReqPulse : std_logic := '0';
 signal AutoTx_TxEnReqHold : std_logic := '0';  -- sticky, driven only from main
+-- CDC settling delay: counts down in SysClk domain after the last UBT word is
+-- written, ensuring the i50MHz gray-code write-pointer synchroniser has had
+-- sufficient time to de-assert PhyTxBuff_Empty before TxEnReq is raised.
+-- 6 SysClk cycles @ 100 MHz (60 ns) >= 3 i50MHz cycles, which covers the
+-- standard 2-FF synchroniser plus one cycle of margin.
+signal AutoTx_CdcDelay : integer range 0 to 7 := 0;
 -- Sequential UBT handshake: track which port we are waiting on
 signal AutoTx_WaitPort : integer range 0 to 7 := 0;
 signal AutoTx_WaitMask : std_logic_vector(7 downto 0) := (others => '0');
@@ -1294,7 +1300,8 @@ begin
     AutoTx_WaitTimeout  <= 0;
 	 AutoTx_Busy     <= (others => '0');
 	 AutoTx_TimedOut <= (others => '0');  -- ADD to AutoTx_Proc reset
-	 UBTTarget_wr_en_stretch <= "000";  
+	 UBTTarget_wr_en_stretch <= "000";
+	 AutoTx_CdcDelay    <= 0;
 	
 	elsif rising_edge(SysClk) then
     -- Pulse-only defaults
@@ -1364,25 +1371,26 @@ begin
         AutoTx_Active       <= '0';
         AutoTx_WaitMask     <= AutoTx_Target;
         AutoTx_WaitTimeout  <= 100000;
+        AutoTx_CdcDelay     <= 6;   -- allow 6 SysClk cycles for CDC settling
         AutoTx_State        <= "100";   -- Now wait for buffer to drain
       else
         AutoTx_WordIdx <= AutoTx_WordIdx + 1;
       end if;
     end if;
 
-  -- "100": Wait until FIFO is confirmed non-empty in SysClk domain before firing
-  --        TxEnReqPulse.  This ensures the i50MHz-domain gray-code synchroniser has
-  --        had time to propagate the non-empty state, so that when TxEnReq='1' is
-  --        seen by SMI_Proc, PhyTxBuff_Empty is already '0' there and TxEnAck can
-  --        be asserted immediately.  Without this guard the pulse can fire while
-  --        PhyTxBuff_Empty is still '1' in the i50MHz domain, preventing TxEnAck
-  --        from ever being set and causing the UBT to not appear on startup.
+  -- "100": Wait a fixed number of SysClk cycles for the PhyTxBuff write-pointer
+  --        gray-code synchroniser to propagate into the i50MHz domain, then fire
+  --        TxEnReqPulse.  Reading PhyTxBuff_Empty here (an i50MHz signal) from
+  --        the SysClk domain is a CDC violation and can result in TxEnAck never
+  --        being asserted; using a deterministic counter avoids any metastability.
+  --        6 SysClk cycles @ 100 MHz = 60 ns, covering a 2-FF sync plus margin.
   when "100" =>
     AutoTx_Busy(AutoTx_Port) <= '1';
-    if PhyTxBuff_Empty = '0' then
-      -- FIFO is confirmed non-empty; fire pulse and move to drain wait
+    if AutoTx_CdcDelay = 0 then
       AutoTx_TxEnReqPulse <= '1';
       AutoTx_State <= "101";
+    else
+      AutoTx_CdcDelay <= AutoTx_CdcDelay - 1;
     end if;
 
   -- "010": Wait for reply from FEB (RX FIFO for the lane fills)
