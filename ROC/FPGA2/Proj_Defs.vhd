@@ -243,6 +243,7 @@ constant WriteCmd : std_logic_vector (2 downto 0) := "000";
 -- 0x1A1 = 417 decimal  = "0110100001" (10 bits)
 constant ReadyStatusAddr : std_logic_vector(9 downto 0) := "0110100000";
 constant ReadyClearAddr  : std_logic_vector(9 downto 0) := "0110100001";
+constant ReadyForceAddr  : std_logic_vector(9 downto 0) := "0110100010";
 ----------------------------- Type Defs -------------------------------
 
 -- Inter-module link FM serializer and deserializer type declarations
