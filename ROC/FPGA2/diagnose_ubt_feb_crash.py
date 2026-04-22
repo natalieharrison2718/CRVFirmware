@@ -1,0 +1,1165 @@
+#!/usr/bin/env python3
+"""
+Diagnostic script to identify why UBT signals cause FEB resets.
+
+Tests multiple scenarios:
+1. Single-lane vs multi-lane transmission
+2. Transmission rate variations
+3. Register state monitoring during transmission
+4. CurrentTarget stability verification
+5. Preamble/timing analysis
+
+Requires: uc_adapter_tcp.py
+
+# Run all tests on lane 0 (most thorough)
+python diagnose_ubt_feb_crash.py --test all --lane-mask 0x01 --output results.json
+
+# Test just rate sensitivity
+python diagnose_ubt_feb_crash.py --test rate --lane-mask 0x01 --delays 10,50,100,200,500
+
+# Check a specific lane
+python diagnose_ubt_feb_crash.py --test single --lane-mask 0x04  # Lane 2
+"""
+
+import argparse
+import sys
+import time
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass, asdict
+from datetime import datetime
+import json
+
+try:
+    import uc_adapter_tcp as uc
+except ImportError as e:
+    print(f"Error: could not import uc_adapter_tcp: {e}")
+    sys.exit(1)
+
+
+# Register addresses from Proj_Defs.vhd
+class RegAddr:
+    """10-bit register addresses from Proj_Defs.vhd"""
+    CSRRegAddr          = 0x000
+    TxEnMaskAd          = 0x00E
+    PhyTxCSRAddr        = 0x012  # bit0=TxEnAck, bit1=Empty
+    PhyTxCntAddr        = 0x013  # FIFO wr_data_count (11-bit)
+    TxCurrentTargetAddr = 0x04A  # CurrentTarget (lower 8 bits)
+    AutoTxKickAddr      = 0x04D  # Kick Auto-TX
+    TxFifoResetAddr     = 0x04E  # Reset TX FIFO
+    TxFifoCtrlAddr      = 0x04F  # Control bits
+    TxFifoWrCountAddr   = 0x05E  # Mirrored wr_data_count
+    TxFifoRawEmptyAddr  = 0x05F  # Raw empty bit
+    ReadyStatusAddr     = 0x1A0  # 416 decimal
+    ReadyClearAddr      = 0x1A1  # 417 decimal
+    DebugAddr           = 0x061
+    OverflowCntAd       = 0x080
+    LastTxTargetAddr    = 0x049
+
+@dataclass
+class TransmitSnapshot:
+    """Snapshot of critical registers during transmission"""
+    timestamp: float
+    tx_en_mask: int
+    tx_en_ack: bool
+    tx_empty: bool
+    fifo_count: int
+    current_target: int
+    ready_status: int
+    debug_reg: int
+    
+    def is_multi_lane(self) -> bool:
+        """Check if CurrentTarget has multiple bits set"""
+        return bin(self.current_target).count('1') > 1
+    
+    def target_matches_mask(self, mask: int) -> bool:
+        """Check if CurrentTarget matches expected mask"""
+        return (self.current_target & 0xFF) == (mask & 0xFF)
+
+
+def compose_a16(ga: int, addr10: int) -> int:
+    """Compose 16-bit address from GA and 10-bit register address"""
+    return uc.compose_a16(ga, addr10)
+
+
+def safe_read(addr16: int, name: str = "register") -> Tuple[bool, Optional[int]]:
+    """Safe register read with error handling"""
+    try:
+        val = uc.uc_read(addr16)
+        return True, val
+    except Exception as e:
+        print(f"ERROR: Failed to read {name} (0x{addr16:04X}): {e}")
+        return False, None
+
+
+def safe_write(addr16: int, value: int, name: str = "register") -> bool:
+    """Safe register write with error handling"""
+    try:
+        ok, reply = uc.uc_write(addr16, value)
+        if not ok:
+            print(f"ERROR: Failed to write {name} (0x{addr16:04X}={value:04X}): {reply}")
+        return ok
+    except Exception as e:
+        print(f"ERROR: Exception writing {name} (0x{addr16:04X}={value:04X}): {e}")
+        return False
+
+
+def capture_snapshot(ga: int, timestamp: Optional[float] = None) -> Optional[TransmitSnapshot]:
+    """Capture all critical registers at once"""
+    if timestamp is None:
+        timestamp = time.time()
+    
+    # Read all registers
+    ok_mask, mask_val = safe_read(compose_a16(ga, RegAddr.TxEnMaskAd), "TxEnMask")
+    ok_csr, csr_val = safe_read(compose_a16(ga, RegAddr.PhyTxCSRAddr), "PhyTxCSR")
+    ok_cnt, cnt_val = safe_read(compose_a16(ga, RegAddr.PhyTxCntAddr), "PhyTxCnt")
+    ok_tgt, tgt_val = safe_read(compose_a16(ga, RegAddr.TxCurrentTargetAddr), "CurrentTarget")
+    ok_rdy, rdy_val = safe_read(compose_a16(ga, RegAddr.ReadyStatusAddr), "ReadyStatus")
+    ok_dbg, dbg_val = safe_read(compose_a16(ga, RegAddr.DebugAddr), "Debug")
+
+    latch_val = 0
+    t_deadline = time.time() + 0.5
+    a_sticky = compose_a16(ga, RegAddr.LastTxTargetAddr)
+    while time.time() < t_deadline:
+        ok, val = safe_read(a_sticky, "LastTxTarget")
+        if ok and (val & 0xFF):
+            latch_val = val & 0xFF
+            break
+        time.sleep(0.01)
+    
+    if not all([ok_mask, ok_csr, ok_cnt, ok_tgt, ok_rdy, ok_dbg]):
+        return None
+    
+    return TransmitSnapshot(
+        timestamp=timestamp,
+        tx_en_mask=mask_val & 0xFFFF,
+        tx_en_ack=(csr_val & 0x0001) != 0,
+        tx_empty=(csr_val & 0x0002) != 0,
+        fifo_count=cnt_val & 0x07FF,
+        current_target=tgt_val & 0x00FF,
+        ready_status=rdy_val & 0x00FF,
+        debug_reg=dbg_val & 0xFFFF
+    )
+
+def clear_last_tx_target(ga: int) -> bool:
+    """Clear the sticky LastTxTarget latch."""
+    return safe_write(compose_a16(ga, RegAddr.LastTxTargetAddr), 0x0000, "LastTxTarget (clear)")
+
+
+def test_sticky_target(ga: int, lane_mask: int, num_ubts: int = 5) -> Dict:
+    """
+    Send UBTs and verify the sticky LastTxTarget latch after each one.
+
+    Because LastTxTarget persists until cleared, we can poll it at leisure
+    (even with 10ms Python loops) and still reliably see which lane was hit.
+
+    Returns:
+        dict with per-UBT results and pass/fail summary.
+    """
+    """
+    print(f"\n{'='*60}")
+    print(f"Test: Sticky LastTxTarget Latch (lane_mask=0x{lane_mask:02X}, n={num_ubts})")
+    print(f"{'='*60}")
+
+    a_txmask    = compose_a16(ga, RegAddr.TxEnMaskAd)
+    a_kick      = compose_a16(ga, RegAddr.AutoTxKickAddr)
+    a_csr       = compose_a16(ga, RegAddr.PhyTxCSRAddr)
+    a_sticky    = compose_a16(ga, RegAddr.LastTxTargetAddr)
+
+    per_ubt = []
+    issues  = []
+
+    # Set TxEnMask once
+    if not safe_write(a_txmask, lane_mask, "TxEnMask"):
+        return {"success": False, "error": "Failed to set TxEnMask"}
+    time.sleep(0.02)
+
+    for i in range(num_ubts):
+        print(f"\n  UBT #{i+1}/{num_ubts}")
+
+        # 0. Wait for any previous transmission to fully drain
+        if not wait_for_autotx_idle(ga):         # ← called here
+            issues.append(f"UBT #{i+1}: previous transmission did not drain")
+            continue
+
+        
+        # 1. Clear the sticky latch BEFORE the transmission
+        if not clear_last_tx_target(ga):
+            issues.append(f"UBT #{i+1}: failed to clear latch")
+            continue
+
+        # Brief settle
+        time.sleep(0.005)
+
+        # Verify latch is actually zero before we start
+        ok, pre = safe_read(a_sticky, "LastTxTarget (pre)")
+        if not ok:
+            issues.append(f"UBT #{i+1}: pre-read failed")
+            continue
+        if pre & 0xFF:
+            issues.append(f"UBT #{i+1}: latch not cleared (pre=0x{pre:02X})")
+
+        ok, csr = safe_read(compose_a16(ga, RegAddr.PhyTxCSRAddr), "PhyTxCSR pre-kick")
+        if ok:
+            tx_ack = (csr & 0x0001) != 0
+            tx_empty = (csr & 0x0002) != 0
+            print(f"    Pre-kick CSR: TxEnAck={tx_ack}, FIFO_Empty={tx_empty}")
+            if tx_ack:
+                print("    ⚠️  WARNING: TxEnAck already high — FIFO may not have drained")
+            
+        # 2. Kick Auto-TX
+        if not safe_write(a_kick, lane_mask, f"AutoTxKick #{i+1}"):
+            issues.append(f"UBT #{i+1}: kick failed")
+            continue
+        time.sleep(0.005)
+
+        # 3. Assert TxEnReq
+        if not safe_write(a_csr, 0x0001, f"TxEnReq #{i+1}"):
+            issues.append(f"UBT #{i+1}: TxEnReq failed")
+            continue
+
+        # 4. Poll the sticky latch — it was set at PhyTxBuff_rdreq time and stays set.
+        #    10ms poll interval is fine here; the latch holds across the 320ns window.
+        latch_val = 0
+        t_deadline = time.time() + 0.5   # 500ms timeout
+        while time.time() < t_deadline:
+            ok, val = safe_read(a_sticky, "LastTxTarget")
+            if ok and (val & 0xFF):
+                latch_val = val & 0xFF
+                break
+            time.sleep(0.01)  # 10ms — no longer a problem
+
+        # 5. Analyse
+        expected = lane_mask & 0xFF
+        multi_lane = bin(latch_val).count('1') > 1
+        correct    = (latch_val == expected)
+
+        result = {
+            "ubt_index"   : i,
+            "pre_latch"   : pre & 0xFF,
+            "latch_val"   : latch_val,
+            "expected"    : expected,
+            "correct"     : correct,
+            "multi_lane"  : multi_lane,
+        }
+        per_ubt.append(result)
+
+        status = "✓" if correct and not multi_lane else "✗"
+        print(f"    {status} LastTxTarget=0x{latch_val:02X}  expected=0x{expected:02X}"
+              f"  multi-lane={'YES ⚠️' if multi_lane else 'no'}")
+
+        if not correct:
+            issues.append(f"UBT #{i+1}: latch=0x{latch_val:02X} != expected=0x{expected:02X}")
+        if multi_lane:
+            issues.append(f"UBT #{i+1}: MULTI-LANE latch=0x{latch_val:02X}")
+
+        # Wait between UBTs
+        time.sleep(0.1)
+
+    success = len(issues) == 0 and len(per_ubt) == num_ubts
+
+    print(f"\n{'='*60}")
+    if success:
+        print(f"  ✓ PASS: All {num_ubts} UBTs targeted lane 0x{lane_mask:02X} exclusively")
+    else:
+        print(f"  ✗ FAIL: {len(issues)} issue(s) detected:")
+        for iss in issues:
+            print(f"    - {iss}")
+    print(f"{'='*60}")
+
+    return {
+        "success" : success,
+        "per_ubt" : per_ubt,
+        "issues"  : issues,
+    }
+    """
+
+    print(f"\n{'='*60}")
+    print(f"Test: Sticky LastTxTarget Latch (lane_mask=0x{lane_mask:02X}, n={num_ubts})")
+    print(f"{'='*60}")
+
+    a_txmask = compose_a16(ga, RegAddr.TxEnMaskAd)
+    a_kick   = compose_a16(ga, RegAddr.AutoTxKickAddr)
+    a_csr    = compose_a16(ga, RegAddr.PhyTxCSRAddr)
+    a_sticky = compose_a16(ga, RegAddr.LastTxTargetAddr)
+    a_tgt    = compose_a16(ga, RegAddr.TxCurrentTargetAddr)
+    a_cnt    = compose_a16(ga, RegAddr.PhyTxCntAddr)
+    a_rdy    = compose_a16(ga, RegAddr.ReadyStatusAddr)
+
+    print(f"\n  [DEBUG] Address map:")
+    print(f"    TxEnMaskAd       = 0x{a_txmask:04X}")
+    print(f"    AutoTxKickAddr   = 0x{a_kick:04X}")
+    print(f"    PhyTxCSRAddr     = 0x{a_csr:04X}")
+    print(f"    LastTxTargetAddr = 0x{a_sticky:04X}")
+    print(f"    TxCurrentTarget  = 0x{a_tgt:04X}")
+    print(f"    PhyTxCntAddr     = 0x{a_cnt:04X}")
+    print(f"    ReadyStatusAddr  = 0x{a_rdy:04X}")
+
+    per_ubt = []
+    issues  = []
+
+    # Set TxEnMask
+    print(f"\n  [DEBUG] Writing TxEnMask = 0x{lane_mask:02X} to 0x{a_txmask:04X}")
+    if not safe_write(a_txmask, lane_mask, "TxEnMask"):
+        return {"success": False, "error": "Failed to set TxEnMask"}
+    time.sleep(0.02)
+
+    # Read it back to confirm
+    ok, readback = safe_read(a_txmask, "TxEnMask readback")
+    print(f"  [DEBUG] TxEnMask readback = 0x{readback:04X}" if ok else "  [DEBUG] TxEnMask readback FAILED")
+
+    for i in range(num_ubts):
+        print(f"\n  {'='*50}")
+        print(f"  UBT #{i+1}/{num_ubts}")
+        print(f"  {'='*50}")
+
+        # 0. Wait for idle
+        print(f"  [DEBUG] Waiting for AutoTx idle...")
+        idle_ok = wait_for_autotx_idle(ga, timeout_s=2.0)
+        ok, csr = safe_read(a_csr, "PhyTxCSR after idle wait")
+        if ok:
+            tx_ack   = (csr & 0x0001) != 0
+            tx_empty = (csr & 0x0002) != 0
+            print(f"  [DEBUG] After idle wait: CSR=0x{csr:04X}  TxEnAck={tx_ack}  FIFO_Empty={tx_empty}  idle_ok={idle_ok}")
+        ok, cnt = safe_read(a_cnt, "PhyTxCnt after idle wait")
+        if ok:
+            print(f"  [DEBUG] FIFO word count = {cnt & 0x07FF}")
+
+        # 1. Clear sticky latch
+        print(f"  [DEBUG] Clearing LastTxTarget (write 0x0000 to 0x{a_sticky:04X})")
+        if not clear_last_tx_target(ga):
+            issues.append(f"UBT #{i+1}: failed to clear latch")
+            continue
+        time.sleep(0.005)
+
+        ok, pre = safe_read(a_sticky, "LastTxTarget pre")
+        pre_val = (pre & 0xFF) if ok else -1
+        print(f"  [DEBUG] LastTxTarget after clear = 0x{pre_val:02X}" if ok else "  [DEBUG] LastTxTarget pre-read FAILED")
+        if pre_val != 0:
+            issues.append(f"UBT #{i+1}: latch not cleared (pre=0x{pre_val:02X})")
+
+        # Read ReadyStatus before kick
+        ok, rdy = safe_read(a_rdy, "ReadyStatus pre-kick")
+        if ok:
+            print(f"  [DEBUG] ReadyStatus before kick = 0x{rdy & 0xFF:02X}")
+
+        # 2. Kick
+        print(f"  [DEBUG] Writing AutoTxKick = 0x{lane_mask:02X} to 0x{a_kick:04X}")
+        if not safe_write(a_kick, lane_mask, f"AutoTxKick #{i+1}"):
+            issues.append(f"UBT #{i+1}: kick failed")
+            continue
+
+        # Poll for FIFO count to increase (confirms FSM wrote words)
+        print(f"  [DEBUG] Polling for FIFO count increase...")
+        fifo_increased = False
+        t_fifo = time.time() + 0.5
+        while time.time() < t_fifo:
+            ok, cnt = safe_read(a_cnt)
+            if ok and (cnt & 0x07FF) > 0:
+                print(f"  [DEBUG] FIFO count = {cnt & 0x07FF} after {(time.time()-(t_fifo-0.5))*1000:.1f}ms")
+                fifo_increased = True
+                break
+            time.sleep(0.001)
+        if not fifo_increased:
+            print(f"  [DEBUG] *** FIFO count never increased — AutoTx FSM did NOT write any words ***")
+            issues.append(f"UBT #{i+1}: FIFO never loaded (FSM did not respond to kick)")
+
+        # Read ReadyStatus after kick
+        ok, rdy = safe_read(a_rdy, "ReadyStatus post-kick")
+        if ok:
+            print(f"  [DEBUG] ReadyStatus after kick  = 0x{rdy & 0xFF:02X}")
+
+        # 3. Poll CurrentTarget (confirms transmission started)
+        print(f"  [DEBUG] Polling for CurrentTarget != 0...")
+        tgt_seen = False
+        t_tgt = time.time() + 1.0
+        while time.time() < t_tgt:
+            ok, tgt = safe_read(a_tgt)
+            if ok and (tgt & 0xFF) != 0:
+                print(f"  [DEBUG] CurrentTarget = 0x{tgt & 0xFF:02X}")
+                tgt_seen = True
+                break
+            time.sleep(0.002)
+        if not tgt_seen:
+            print(f"  [DEBUG] *** CurrentTarget never asserted — preamble/TxEnAck path not triggered ***")
+            # Read CSR to understand why
+            ok, csr = safe_read(a_csr, "PhyTxCSR at tgt timeout")
+            if ok:
+                print(f"  [DEBUG] PhyTxCSR at timeout: 0x{csr:04X}  TxEnAck={(csr&1)!=0}  Empty={(csr&2)!=0}")
+
+        # 4. Poll LastTxTarget
+        print(f"  [DEBUG] Polling LastTxTarget for up to 1.0s...")
+        latch_val = 0
+        t_latch = time.time() + 1.0
+        polls = 0
+        while time.time() < t_latch:
+            ok, val = safe_read(a_sticky, "LastTxTarget")
+            polls += 1
+            if ok and (val & 0xFF):
+                latch_val = val & 0xFF
+                print(f"  [DEBUG] LastTxTarget set to 0x{latch_val:02X} after {polls} polls")
+                break
+            time.sleep(0.01)
+        if latch_val == 0:
+            print(f"  [DEBUG] *** LastTxTarget still 0x00 after {polls} polls ***")
+            # Final register dump at failure point
+            for reg_name, reg_addr in [("PhyTxCSR", a_csr), ("PhyTxCnt", a_cnt),
+                                        ("CurrentTarget", a_tgt), ("ReadyStatus", a_rdy),
+                                        ("TxEnMask", a_txmask)]:
+                ok, v = safe_read(reg_addr, reg_name)
+                if ok:
+                    print(f"  [DEBUG]   {reg_name:18s} = 0x{v:04X}")
+
+        # 5. Analyse
+        expected   = lane_mask & 0xFF
+        multi_lane = bin(latch_val).count('1') > 1
+        correct    = (latch_val == expected)
+
+        result = {
+            "ubt_index"     : i,
+            "pre_latch"     : pre_val,
+            "latch_val"     : latch_val,
+            "expected"      : expected,
+            "correct"       : correct,
+            "multi_lane"    : multi_lane,
+            "fifo_increased": fifo_increased,
+            "tgt_seen"      : tgt_seen,
+        }
+        per_ubt.append(result)
+
+        status = "✓" if correct and not multi_lane else "✗"
+        print(f"\n  {status} LastTxTarget=0x{latch_val:02X}  expected=0x{expected:02X}"
+              f"  multi-lane={'YES ⚠️' if multi_lane else 'no'}")
+
+        if not correct:
+            issues.append(f"UBT #{i+1}: latch=0x{latch_val:02X} != expected=0x{expected:02X}")
+        if multi_lane:
+            issues.append(f"UBT #{i+1}: MULTI-LANE latch=0x{latch_val:02X}")
+
+        time.sleep(0.1)
+
+    success = len(issues) == 0 and len(per_ubt) == num_ubts
+    print(f"\n{'='*60}")
+    if success:
+        print(f"  ✓ PASS: All {num_ubts} UBTs targeted lane 0x{lane_mask:02X} exclusively")
+    else:
+        print(f"  ✗ FAIL: {len(issues)} issue(s):")
+        for iss in issues:
+            print(f"    - {iss}")
+    print(f"{'='*60}")
+
+    return {"success": success, "per_ubt": per_ubt, "issues": issues}
+
+def monitor_transmission(ga: int, duration_s: float = 0.5, interval_ms: int = 10) -> List[TransmitSnapshot]:
+    """Monitor transmission for specified duration"""
+    snapshots = []
+    t_start = time.time()
+    t_end = t_start + duration_s
+    
+    while time.time() < t_end:
+        snap = capture_snapshot(ga)
+        if snap:
+            snapshots.append(snap)
+        time.sleep(interval_ms / 1000.0)
+    
+    return snapshots
+
+
+def analyze_snapshots(snapshots: List[TransmitSnapshot], expected_mask: int) -> Dict:
+    """Analyze captured snapshots for issues"""
+    if not snapshots:
+        return {"error": "No snapshots captured"}
+    
+    issues = []
+    multi_lane_count = 0
+    mismatch_count = 0
+    active_transmit_count = 0
+    max_fifo = 0
+    
+    for snap in snapshots:
+        if snap.current_target != 0:
+            active_transmit_count += 1
+            
+        if snap.is_multi_lane():
+            multi_lane_count += 1
+            issues.append(f"t={snap.timestamp:.3f}: MULTI-LANE CurrentTarget=0x{snap.current_target:02X}")
+        
+        if snap.current_target != 0 and not snap.target_matches_mask(expected_mask):
+            mismatch_count += 1
+            issues.append(f"t={snap.timestamp:.3f}: MISMATCH CurrentTarget=0x{snap.current_target:02X}, expected=0x{expected_mask:02X}")
+        
+        max_fifo = max(max_fifo, snap.fifo_count)
+    
+    return {
+        "total_samples": len(snapshots),
+        "active_transmit_samples": active_transmit_count,
+        "multi_lane_violations": multi_lane_count,
+        "target_mismatches": mismatch_count,
+        "max_fifo_count": max_fifo,
+        "issues": issues,
+        "first_snapshot": asdict(snapshots[0]) if snapshots else None,
+        "last_snapshot": asdict(snapshots[-1]) if snapshots else None
+    }
+
+
+def test_single_ubt(ga: int, lane_mask: int, delay_after_ms: int = 100, monitor_ms: int = 500) -> Dict:
+    """
+    Send a single UBT and monitor the transmission.
+    
+    Returns dict with:
+    - success: bool
+    - snapshots: List[TransmitSnapshot]
+    - analysis: Dict
+    """
+    print(f"\n{'='*60}")
+    print(f"Test: Single UBT to lane mask 0x{lane_mask:02X}")
+    print(f"{'='*60}")
+    
+    # Addresses
+    a_txmask = compose_a16(ga, RegAddr.TxEnMaskAd)
+    a_csr = compose_a16(ga, RegAddr.PhyTxCSRAddr)
+    a_kick = compose_a16(ga, RegAddr.AutoTxKickAddr)
+    
+    # Capture baseline
+    print("Capturing baseline...")
+    baseline = capture_snapshot(ga)
+    if not baseline:
+        return {"success": False, "error": "Failed to capture baseline"}
+    
+    print(f"Baseline: FIFO={baseline.fifo_count}, Target=0x{baseline.current_target:02X}, TxEnAck={baseline.tx_en_ack}")
+    
+    # Set TxEnMask
+    print(f"Setting TxEnMask to 0x{lane_mask:02X}...")
+    if not safe_write(a_txmask, lane_mask, "TxEnMask"):
+        return {"success": False, "error": "Failed to set TxEnMask"}
+    
+    time.sleep(0.05)
+    
+    # Kick Auto-TX
+    print(f"Kicking Auto-TX (addr=0x{a_kick:04X}, data=0x{lane_mask:02X})...")
+    if not safe_write(a_kick, lane_mask, "AutoTxKick"):
+        return {"success": False, "error": "Failed to kick Auto-TX"}
+    
+    time.sleep(0.02)
+    
+    # Assert TxEnReq
+    print("Asserting TxEnReq...")
+    if not safe_write(a_csr, 0x0001, "PhyTxCSR"):
+        return {"success": False, "error": "Failed to assert TxEnReq"}
+    
+    # Monitor transmission
+    print(f"Monitoring transmission for {monitor_ms}ms...")
+    snapshots = monitor_transmission(ga, duration_s=monitor_ms/1000.0, interval_ms=10)
+    
+    # Wait after transmission
+    time.sleep(delay_after_ms / 1000.0)
+    
+    # Capture final state
+    final = capture_snapshot(ga)
+    if final:
+        snapshots.append(final)
+    
+    # Analyze
+    analysis = analyze_snapshots(snapshots, lane_mask)
+    
+    # Print summary
+    print("\nAnalysis:")
+    print(f"  Samples: {analysis['total_samples']}")
+    print(f"  Active transmit samples: {analysis['active_transmit_samples']}")
+    print(f"  Multi-lane violations: {analysis['multi_lane_violations']}")
+    print(f"  Target mismatches: {analysis['target_mismatches']}")
+    print(f"  Max FIFO count: {analysis['max_fifo_count']}")
+    
+    if analysis['issues']:
+        print(f"\n  ⚠️  {len(analysis['issues'])} ISSUES DETECTED:")
+        for issue in analysis['issues'][:10]:  # Show first 10
+            print(f"    {issue}")
+        if len(analysis['issues']) > 10:
+            print(f"    ... and {len(analysis['issues']) - 10} more")
+    
+    success = (analysis['multi_lane_violations'] == 0 and 
+               analysis['target_mismatches'] == 0)
+    
+    if success:
+        print("\n  ✓ PASS: Single-lane transmission verified")
+    else:
+        print("\n  ✗ FAIL: Transmission issues detected")
+    
+    return {
+        "success": success,
+        "baseline": asdict(baseline),
+        "snapshots": [asdict(s) for s in snapshots],
+        "analysis": analysis
+    }
+
+
+def test_rate_sensitivity(ga: int, lane_mask: int, delays_ms: List[int]) -> Dict:
+    """
+    Test UBT transmission at different rates to find minimum safe delay.
+    
+    Sends pairs of UBT commands with varying delays between them.
+    """
+    print(f"\n{'='*60}")
+    print(f"Test: Rate Sensitivity")
+    print(f"Testing delays: {delays_ms} ms")
+    print(f"{'='*60}")
+    
+    results = {}
+    
+    for delay_ms in delays_ms:
+        print(f"\n--- Testing {delay_ms}ms inter-UBT delay ---")
+        
+        # Send first UBT
+        result1 = test_single_ubt(ga, lane_mask, delay_after_ms=delay_ms, monitor_ms=200)
+        if not result1["success"]:
+            print(f"  ✗ First UBT failed at {delay_ms}ms delay")
+            results[delay_ms] = {"success": False, "stage": "first_ubt"}
+            continue
+        
+        # Wait configured delay
+        print(f"  Waiting {delay_ms}ms before second UBT...")
+        time.sleep(delay_ms / 1000.0)
+        
+        # Send second UBT
+        result2 = test_single_ubt(ga, lane_mask, delay_after_ms=100, monitor_ms=200)
+        if not result2["success"]:
+            print(f"  ✗ Second UBT failed at {delay_ms}ms delay")
+            results[delay_ms] = {"success": False, "stage": "second_ubt"}
+            continue
+        
+        print(f"  ✓ Both UBTs successful at {delay_ms}ms delay")
+        results[delay_ms] = {"success": True}
+        
+        # Wait before next test
+        time.sleep(0.5)
+    
+    # Summary
+    print(f"\n{'='*60}")
+    print("Rate Sensitivity Summary:")
+    for delay_ms, result in results.items():
+        status = "✓ PASS" if result["success"] else f"✗ FAIL ({result.get('stage', 'unknown')})"
+        print(f"  {delay_ms:5d}ms: {status}")
+    print(f"{'='*60}")
+    
+    return results
+
+
+def test_broadcast_mode(ga: int, lane_mask: int) -> Dict:
+    """
+    Test if broadcast mode causes issues.
+    Compares single-lane vs multi-lane transmission.
+    """
+    print(f"\n{'='*60}")
+    print(f"Test: Broadcast Mode Analysis")
+    print(f"{'='*60}")
+    
+    results = {}
+    
+    # Test 1: Single lane (one bit set)
+    single_lane_tests = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80]
+    print("\n--- Testing single-lane transmissions ---")
+    
+    for mask in single_lane_tests:
+        if bin(mask).count('1') != 1:
+            continue
+        lane_idx = mask.bit_length() - 1
+        print(f"\nLane {lane_idx} (mask=0x{mask:02X}):")
+        result = test_single_ubt(ga, mask, delay_after_ms=100, monitor_ms=300)
+        results[f"single_lane_{lane_idx}"] = result["success"]
+        time.sleep(0.3)
+    
+    # Test 2: Multi-lane (if requested)
+    if bin(lane_mask).count('1') > 1:
+        print(f"\n--- Testing multi-lane transmission (mask=0x{lane_mask:02X}) ---")
+        result = test_single_ubt(ga, lane_mask, delay_after_ms=100, monitor_ms=300)
+        results["multi_lane"] = result["success"]
+    
+    # Summary
+    print(f"\n{'='*60}")
+    print("Broadcast Mode Summary:")
+    single_passes = sum(1 for k, v in results.items() if k.startswith("single") and v)
+    single_total = sum(1 for k in results.keys() if k.startswith("single"))
+    print(f"  Single-lane: {single_passes}/{single_total} passed")
+    if "multi_lane" in results:
+        print(f"  Multi-lane:  {'✓ PASS' if results['multi_lane'] else '✗ FAIL'}")
+    print(f"{'='*60}")
+    
+    return results
+
+
+def test_fifo_overflow(ga: int, lane_mask: int, rapid_count: int = 10) -> Dict:
+    """
+    Test if rapid UBT sends cause FIFO overflow or corruption.
+    """
+    print(f"\n{'='*60}")
+    print(f"Test: FIFO Overflow (rapid {rapid_count} UBTs)")
+    print(f"{'='*60}")
+    
+    a_txmask = compose_a16(ga, RegAddr.TxEnMaskAd)
+    a_kick = compose_a16(ga, RegAddr.AutoTxKickAddr)
+    a_csr = compose_a16(ga, RegAddr.PhyTxCSRAddr)
+    a_cnt = compose_a16(ga, RegAddr.PhyTxCntAddr)
+    a_tgt = compose_a16(ga, RegAddr.TxCurrentTargetAddr)
+    
+    # Set mask
+    safe_write(a_txmask, lane_mask, "TxEnMask")
+    time.sleep(0.05)
+    
+    # Capture initial FIFO count
+    ok, cnt_initial = safe_read(a_cnt, "PhyTxCnt")
+    if not ok:
+        return {"success": False, "error": "Failed to read initial FIFO count"}
+    cnt_initial &= 0x07FF
+    
+    print(f"Initial FIFO count: {cnt_initial}")
+    print(f"Sending {rapid_count} UBTs rapidly...")
+    
+    # Send rapid UBTs
+    fifo_counts = [cnt_initial]
+    targets_seen = set()
+    
+    for i in range(rapid_count):
+        # Kick
+        safe_write(a_kick, lane_mask, f"Kick #{i}")
+        time.sleep(0.001)  # 1ms between kicks
+        
+        # Assert TxEnReq every few kicks
+        if i % 3 == 0:
+            safe_write(a_csr, 0x0001, f"TxEnReq #{i}")
+        
+        # Sample FIFO and target
+        ok_cnt, cnt = safe_read(a_cnt)
+        ok_tgt, tgt = safe_read(a_tgt)
+        
+        if ok_cnt:
+            fifo_counts.append(cnt & 0x07FF)
+        if ok_tgt:
+            targets_seen.add(tgt & 0xFF)
+    
+    # Wait for transmission to complete
+    print("Waiting for transmission to drain...")
+    time.sleep(0.5)
+    
+    # Final FIFO count
+    ok, cnt_final = safe_read(a_cnt)
+    cnt_final = (cnt_final & 0x07FF) if ok else -1
+    
+    print(f"Final FIFO count: {cnt_final}")
+    print(f"FIFO count range: {min(fifo_counts)} - {max(fifo_counts)}")
+    print(f"Unique targets seen: {[f'0x{t:02X}' for t in sorted(targets_seen)]}")
+    
+    # Check for issues
+    issues = []
+    if max(fifo_counts) > 1000:  # PHYTX_FIFO_DEPTH=1024
+        issues.append(f"FIFO near capacity: {max(fifo_counts)}/1024")
+    
+    if len(targets_seen) > 1:
+        issues.append(f"Multiple targets during transmission: {targets_seen}")
+    
+    if 0 in targets_seen and len(targets_seen) == 1:
+        issues.append("CurrentTarget never asserted (stuck at 0x00)")
+    
+    success = len(issues) == 0
+    
+    if success:
+        print("\n  ✓ PASS: No overflow or corruption detected")
+    else:
+        print("\n  ✗ FAIL: Issues detected:")
+        for issue in issues:
+            print(f"    - {issue}")
+    
+    return {
+        "success": success,
+        "fifo_counts": fifo_counts,
+        "targets_seen": list(targets_seen),
+        "issues": issues
+    }
+
+
+def test_preamble_timing(ga: int, lane_mask: int) -> Dict:
+    """
+    Test if preamble/timing is causing issues.
+    Monitors TxEn assertion timing relative to FIFO state.
+    """
+    print(f"\n{'='*60}")
+    print(f"Test: Preamble/Timing Analysis")
+    print(f"{'='*60}")
+    
+    a_txmask = compose_a16(ga, RegAddr.TxEnMaskAd)
+    a_kick = compose_a16(ga, RegAddr.AutoTxKickAddr)
+    a_csr = compose_a16(ga, RegAddr.PhyTxCSRAddr)
+    
+    # Set mask
+    safe_write(a_txmask, lane_mask, "TxEnMask")
+    time.sleep(0.05)
+    
+    # Kick and immediately start monitoring
+    snapshots_pre = []
+    snapshots_post = []
+    
+    # Pre-kick samples
+    print("Sampling pre-kick state...")
+    for _ in range(5):
+        snap = capture_snapshot(ga)
+        if snap:
+            snapshots_pre.append(snap)
+        time.sleep(0.01)
+    
+    # Kick
+    print("Kicking Auto-TX...")
+    t_kick = time.time()
+    safe_write(a_kick, lane_mask, "AutoTxKick")
+    
+    # High-rate sampling immediately after kick
+    print("High-rate sampling post-kick...")
+    for _ in range(50):
+        snap = capture_snapshot(ga, timestamp=time.time())
+        if snap:
+            snapshots_post.append(snap)
+        time.sleep(0.005)  # 5ms sampling
+    
+    # Assert TxEnReq partway through
+    time.sleep(0.1)
+    safe_write(a_csr, 0x0001, "TxEnReq")
+    
+    # Continue monitoring
+    for _ in range(30):
+        snap = capture_snapshot(ga)
+        if snap:
+            snapshots_post.append(snap)
+        time.sleep(0.01)
+    
+    # Analysis
+    print("\nTiming Analysis:")
+    
+    # Find when TxEnAck asserted
+    ack_time = None
+    for snap in snapshots_post:
+        if snap.tx_en_ack:
+            ack_time = snap.timestamp - t_kick
+            break
+    
+    # Find when CurrentTarget first asserted
+    target_time = None
+    for snap in snapshots_post:
+        if snap.current_target != 0:
+            target_time = snap.timestamp - t_kick
+            break
+    
+    # Find when FIFO first increased
+    fifo_time = None
+    baseline_fifo = snapshots_pre[-1].fifo_count if snapshots_pre else 0
+    for snap in snapshots_post:
+        if snap.fifo_count > baseline_fifo:
+            fifo_time = snap.timestamp - t_kick
+            break
+    
+    print(f"  FIFO increased after: {fifo_time*1000:.1f}ms" if fifo_time else "  FIFO never increased")
+    print(f"  CurrentTarget asserted after: {target_time*1000:.1f}ms" if target_time else "  CurrentTarget never asserted")
+    print(f"  TxEnAck asserted after: {ack_time*1000:.1f}ms" if ack_time else "  TxEnAck never asserted")
+    
+    # Check timing relationships
+    issues = []
+    if not fifo_time:
+        issues.append("FIFO count did not increase (UBT words not queued)")
+    if not target_time:
+        issues.append("CurrentTarget never asserted (no transmission)")
+    if not ack_time:
+        issues.append("TxEnAck never asserted (handshake failed)")
+    
+    if ack_time and target_time and ack_time > target_time:
+        issues.append(f"TxEnAck lagged CurrentTarget by {(ack_time - target_time)*1000:.1f}ms (potential race)")
+    
+    success = len(issues) == 0
+    
+    if success:
+        print("\n  ✓ PASS: Timing looks correct")
+    else:
+        print("\n  ✗ FAIL: Timing issues detected:")
+        for issue in issues:
+            print(f"    - {issue}")
+    
+    return {
+        "success": success,
+        "fifo_time_ms": fifo_time * 1000 if fifo_time else None,
+        "target_time_ms": target_time * 1000 if target_time else None,
+        "ack_time_ms": ack_time * 1000 if ack_time else None,
+        "issues": issues,
+        "snapshots_pre": [asdict(s) for s in snapshots_pre],
+        "snapshots_post": [asdict(s) for s in snapshots_post]
+    }
+
+
+def reset_tx_state(ga: int) -> bool:
+    """Reset TX FIFO and clear TxEnReq"""
+    print("Resetting TX state...")
+    
+    a_csr = compose_a16(ga, RegAddr.PhyTxCSRAddr)
+    a_fifo_rst = compose_a16(ga, RegAddr.TxFifoResetAddr)
+    
+    # Clear TxEnReq
+    if not safe_write(a_csr, 0x0000, "PhyTxCSR (clear)"):
+        return False
+    
+    # Pulse FIFO reset
+    if not safe_write(a_fifo_rst, 0x0001, "TxFifoReset"):
+        return False
+    time.sleep(0.01)
+    if not safe_write(a_fifo_rst, 0x0000, "TxFifoReset (clear)"):
+        return False
+    
+    time.sleep(0.05)
+    print("  ✓ Reset complete")
+    return True
+
+
+def check_feb_responses(ga: int, num_samples: int = 20) -> Dict:
+    """
+    Monitor ReadyStatus to see if FEBs are responding.
+    A healthy FEB should set ReadyStatus bits when ready for data.
+    """
+    print(f"\n{'='*60}")
+    print(f"Test: FEB Response Check")
+    print(f"{'='*60}")
+    
+    a_ready = compose_a16(ga, RegAddr.ReadyStatusAddr)
+    
+    print(f"Sampling ReadyStatus {num_samples} times over {num_samples * 50}ms...")
+    samples = []
+    
+    for i in range(num_samples):
+        ok, val = safe_read(a_ready, "ReadyStatus")
+        if ok:
+            samples.append((time.time(), val & 0xFF))
+        time.sleep(0.05)  # 50ms between samples
+    
+    if not samples:
+        return {"success": False, "error": "No samples captured"}
+    
+    # Analysis
+    unique_values = set(val for _, val in samples)
+    all_zero = all(val == 0 for _, val in samples)
+    all_same = len(unique_values) == 1
+    
+    print(f"\nReadyStatus samples: {[f'0x{v:02X}' for _, v in samples[:10]]}")
+    if len(samples) > 10:
+        print(f"  ... and {len(samples) - 10} more")
+    
+    print(f"\nUnique values: {[f'0x{v:02X}' for v in sorted(unique_values)]}")
+    
+    issues = []
+    if all_zero:
+        issues.append("ReadyStatus always 0x00 (FEBs never ready or not connected)")
+    elif all_same:
+        issues.append(f"ReadyStatus stuck at 0x{samples[0][1]:02X} (possible FEB hang)")
+    
+    success = len(issues) == 0
+    
+    if success:
+        print("\n  ✓ PASS: FEBs responding normally")
+    else:
+        print("\n  ⚠️  WARNINGS:")
+        for issue in issues:
+            print(f"    - {issue}")
+    
+    return {
+        "success": success,
+        "samples": samples,
+        "unique_values": list(unique_values),
+        "issues": issues
+    }
+
+
+def dump_all_registers(ga: int) -> Dict[str, int]:
+    """Dump all relevant registers for debugging"""
+    print(f"\n{'='*60}")
+    print(f"Register Dump (GA={ga})")
+    print(f"{'='*60}")
+    
+    regs = {}
+    reg_list = [
+        ("CSRRegAddr",          RegAddr.CSRRegAddr),
+        ("TxEnMaskAd",          RegAddr.TxEnMaskAd),
+        ("PhyTxCSRAddr",        RegAddr.PhyTxCSRAddr),
+        ("PhyTxCntAddr",        RegAddr.PhyTxCntAddr),
+        ("TxCurrentTargetAddr", RegAddr.TxCurrentTargetAddr),
+        ("AutoTxKickAddr",      RegAddr.AutoTxKickAddr),
+        ("TxFifoWrCountAddr",   RegAddr.TxFifoWrCountAddr),
+        ("TxFifoRawEmptyAddr",  RegAddr.TxFifoRawEmptyAddr),
+        ("ReadyStatusAddr",     RegAddr.ReadyStatusAddr),
+        ("DebugAddr",           RegAddr.DebugAddr),
+        ("OverflowCntAd",       RegAddr.OverflowCntAd),
+    ]
+    
+    for name, addr10 in reg_list:
+        a16 = compose_a16(ga, addr10)
+        ok, val = safe_read(a16, name)
+        if ok:
+            regs[name] = val
+            print(f"  {name:25s} (0x{addr10:03X}): 0x{val:04X}  ({val:5d})")
+        else:
+            regs[name] = None
+            print(f"  {name:25s} (0x{addr10:03X}): READ FAILED")
+    
+    return regs
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Diagnose UBT transmission issues causing FEB resets",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Test single lane 0 (mask 0x01)
+  %(prog)s --test single --lane-mask 0x01
+  
+  # Test rate sensitivity with delays 10, 50, 100, 200ms
+  %(prog)s --test rate --lane-mask 0x01 --delays 10,50,100,200
+  
+  # Test all single lanes (broadcast mode check)
+  %(prog)s --test broadcast --lane-mask 0xFF
+  
+  # Test rapid UBT (overflow check)
+  %(prog)s --test overflow --lane-mask 0x01 --rapid-count 20
+  
+  # Check FEB responses
+  %(prog)s --test feb-check
+  
+  # Dump all registers
+  %(prog)s --test dump
+  
+  # Run all tests (recommended)
+  %(prog)s --test all --lane-mask 0x01
+        """
+    )
+    
+    parser.add_argument("--ga", type=int, default=0, help="Geographic address (0..3)")
+    parser.add_argument("--ip", default="192.168.157.97", help="Target IP")
+    parser.add_argument("--port", type=int, default=5002, help="Target port")
+    parser.add_argument("--test", required=True,
+                        choices=["single", "rate", "sticky","broadcast", "overflow", "feb-check", "dump", "all"],
+                        help="Test to run")
+    parser.add_argument("--lane-mask", type=lambda x: int(x, 0), default=0x01,
+                        help="Lane mask (one-hot for single-lane, multi-bit for broadcast)")
+    parser.add_argument("--delays", type=str, default="10,50,100,200,500",
+                        help="Comma-separated delays in ms for rate test")
+    parser.add_argument("--rapid-count", type=int, default=10,
+                        help="Number of rapid UBTs for overflow test")
+    parser.add_argument("--output", type=str, help="Save results to JSON file")
+    parser.add_argument("--reset-before", action="store_true",
+                        help="Reset TX state before tests")
+    
+    args = parser.parse_args()
+    
+    # Configure adapter
+    uc.set_config(host=args.ip, port=args.port, debug=False)
+    
+    results = {}
+    
+    try:
+        # Optional reset
+        if args.reset_before:
+            reset_tx_state(args.ga)
+        
+        # Run requested test(s)
+        if args.test == "single" or args.test == "all":
+            results["single"] = test_single_ubt(args.ga, args.lane_mask)
+        
+        if args.test == "rate" or args.test == "all":
+            delays = [int(d.strip()) for d in args.delays.split(",")]
+            results["rate"] = test_rate_sensitivity(args.ga, args.lane_mask, delays)
+        
+        if args.test == "broadcast" or args.test == "all":
+            results["broadcast"] = test_broadcast_mode(args.ga, args.lane_mask)
+        
+        if args.test == "overflow" or args.test == "all":
+            results["overflow"] = test_fifo_overflow(args.ga, args.lane_mask, args.rapid_count)
+        
+        if args.test == "feb-check" or args.test == "all":
+            results["feb_check"] = check_feb_responses(args.ga)
+        
+        if args.test == "dump" or args.test == "all":
+            results["register_dump"] = dump_all_registers(args.ga)
+
+        if args.test == "sticky" or args.test == "all":
+            results["sticky"] = test_sticky_target(args.ga, args.lane_mask, num_ubts=5)
+        # Save results if requested
+        if args.output:
+            with open(args.output, 'w') as f:
+                json.dump(results, f, indent=2, default=str)
+            print(f"\nResults saved to: {args.output}")
+        
+        # Final summary
+        print(f"\n{'='*60}")
+        print("FINAL SUMMARY")
+        print(f"{'='*60}")
+        
+        all_passed = True
+        for test_name, test_result in results.items():
+            if isinstance(test_result, dict) and "success" in test_result:
+                status = "✓ PASS" if test_result["success"] else "✗ FAIL"
+                print(f"  {test_name:15s}: {status}")
+                all_passed = all_passed and test_result["success"]
+        
+        print(f"{'='*60}")
+        
+        if args.test == "all":
+            if all_passed:
+                print("\n✓✓✓ ALL TESTS PASSED ✓✓✓")
+                print("\nRecommendations:")
+                print("  - Your single-lane UBT transmission appears correct")
+                print("  - Check ROC (was FEB?) firmware for sensitivity to:")
+                print("    * Packet rate (try longer delays)")
+                print("    * Power supply transients")
+                print("    * Specific UBT format expectations")
+            else:
+                print("\n✗✗✗ SOME TESTS FAILED ✗✗✗")
+                print("\nLikely causes of FEB reset:")
+                
+                if results.get("broadcast", {}).get("success") == False:
+                    print("  ⚠️  Multi-lane transmission detected - likely causing signal corruption")
+                    print("      Fix: Ensure TxEnMask has only ONE bit set")
+                
+                if results.get("rate", {}).get("success") == False:
+                    print("  ⚠️  Rate-dependent failure - FEB can't keep up")
+                    print("      Fix: Add longer delay between UBT commands (>100ms)")
+                
+                if results.get("overflow", {}).get("success") == False:
+                    print("  ⚠️  FIFO overflow or corruption detected")
+                    print("      Fix: Check PHYTX_RESERVED_SLOTS, reduce transmission rate")
+                
+                if results.get("feb_check", {}).get("success") == False:
+                    print("  ⚠️  FEB not responding properly")
+                    print("      Fix: Check FEB power, connection, firmware version")
+        
+        return 0 if all_passed else 1
+    
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user")
+        return 130
+    except Exception as e:
+        print(f"\n\nFATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return 2
+    finally:
+        uc.close()
+
+def wait_for_autotx_idle(ga: int, timeout_s: float = 2.0) -> bool:
+    """Wait until BOTH clock domains agree the FIFO is empty."""
+    a_csr = compose_a16(ga, RegAddr.PhyTxCSRAddr)
+    a_cnt = compose_a16(ga, RegAddr.PhyTxCntAddr)
+    t_deadline = time.time() + timeout_s
+    while time.time() < t_deadline:
+        ok_csr, csr = safe_read(a_csr)
+        ok_cnt, cnt = safe_read(a_cnt)
+        if ok_csr and ok_cnt:
+            tx_ack   = (csr & 0x0001) != 0
+            rd_empty = (csr & 0x0002) != 0   # read domain (i50MHz)
+            wr_count = cnt & 0x07FF           # write domain (SysClk)
+            if not tx_ack and rd_empty and wr_count == 0:
+                return True
+        time.sleep(0.01)
+    return False
+        
+if __name__ == "__main__":
+    sys.exit(main())
