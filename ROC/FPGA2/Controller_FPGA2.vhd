@@ -1459,16 +1459,16 @@ case AutoTx_State is
     AutoTx_Target <= (others => '0');
     found_port := 0; have_port := false;
 
-	 --AutoTx_RxGot(found_port) <= '0';  -- add after AutoTx_Claim(found_port) <= '1';
-    for i in 0 to 7 loop
-     if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1'
-        and MaskReg((RoundRobin_Last + 1 + i) mod 8) = '1'
-		  then
-		  found_port := (RoundRobin_Last + 1 + i) mod 8;
+    if MaskReg /= X"00" then           -- ADD: skip scan entirely if mask not set
+      for i in 0 to 7 loop
+        if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1'
+           and MaskReg((RoundRobin_Last + 1 + i) mod 8) = '1'
+        then		  found_port := (RoundRobin_Last + 1 + i) mod 8;
 		  have_port  := true;
         exit;
-      end if;
-    end loop;
+		  end if;
+      end loop;
+	 end if;
     -- Only send UBT if buffer is empty
     if have_port and PhyTxBuff_Empty = '1'
        and PhyTxBuff_Full = '0'
@@ -1755,12 +1755,14 @@ end if;
 -- PowerOnReady_done is cleared on reset (in the CpldRst_sync='0' branch).
 if PowerOnReady_done = '0'
    and StartupHoldoff = std_logic_vector(to_unsigned(2000000, 21))
-   and CpldRst_sync = '1' then
+   and MaskReg /= X"00"
+	and CpldRst_sync = '1' then
   for p in 0 to 7 loop
     if MaskReg(p) = '1' then
       rs_next(p) := '1';
     end if;
   end loop;
+  ReadyStatus <= MaskReg;
   PowerOnReady_done <= '1';
 end if;
 
