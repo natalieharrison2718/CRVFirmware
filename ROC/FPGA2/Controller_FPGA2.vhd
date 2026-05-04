@@ -1575,7 +1575,7 @@ case AutoTx_State is
 	-- "110": wait for all enabled-lane RX FIFOs to drain (DDR sequencer consumed
   --         the FEB reply data).  "Done" = all masked lanes have empty FIFOs.
   when "110" =>
-    AutoTx_Busy <= AutoTx_Busy;  -- hold all lane busy bits during drain wait
+    -- AutoTx_Busy retains its value (= MaskReg) from state "000" until cleared below.
     -- All lanes are drained when each enabled lane's FIFO is empty.
     -- Disabled lanes (MaskReg(i)='0') are ignored via bitwise OR with ~MaskReg.
     if (PhyRxBuff_Empty or not MaskReg) = X"FF" then
@@ -1618,7 +1618,7 @@ case AutoTx_State is
 
   -- "101": Wait for PhyTxBuff to fully drain (PHY has finished transmitting)
 when "101" =>
-    AutoTx_Busy <= AutoTx_Busy;  -- hold all lane busy bits during TX drain
+    -- AutoTx_Busy retains its value (= MaskReg) from state "000" until cleared.
     if PhyTxBuff_Empty_s = '1' then
       -- FIFO drained cleanly; give FEB 10 ms to reply
       AutoTx_WaitTimeout <= 10000;
