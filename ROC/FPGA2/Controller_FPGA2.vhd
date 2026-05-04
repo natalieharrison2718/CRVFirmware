@@ -2,11 +2,25 @@
 
 -- Sten Hansen Fermilab 10/26/2015
 
--- FPGA responsible for handling data from eight Ethernet PHY chips,
--- and eight LVDS I/Os
--- Collects data from eight phy chips and sends it to FPGA 1 via an 800 Mbit
--- LVDS Link. A 512Mb LPDDR RAM is available as a data buffer
--- Microcontroller interface
+-- FPGA responsible for handling data from eight Ethernet PHY chips (8 lanes)
+-- and eight LVDS I/Os (8 FM lanes), all connected to a SINGLE FEB.
+-- The 8 PHY ports are 8 parallel lanes of one FEB (not 8 separate FEBs).
+-- The 8 FM receive links are the 8 FM lanes of that same single FEB.
+-- Collects data from eight lanes and sends it to FPGA 1 via an 800 Mbit
+-- LVDS Link. A 512Mb LPDDR RAM is available as a data buffer.
+-- Microcontroller interface.
+--
+-- Semantic note (single-FEB model):
+--   * PortNo / lane index : index of a lane of the single FEB, not a FEB index.
+--   * MaskReg(i)          : enables lane i of the single FEB.
+--   * Rx_active(i)        : lane i of the FEB is active (carrying FM transitions).
+--   * FEB_Present         : aggregate OR of Rx_active -- at least one FEB lane alive.
+--   * ReadyStatus(i)      : per-lane UBT ready bit of the single FEB.
+--   * AutoTx_Busy(i)      : per-lane busy bit; all enabled-lane bits set together
+--                           when a UBT broadcast is in flight to the FEB.
+--   * EventStat(7:0)      : per-lane error flags of the single FEB (not per-FEB).
+--   * EventWdCnt          : total word count across all active lanes minus per-lane
+--                           headers, plus one combined event header for the FEB.
 
 ----------------------------- Main Body of design -------------------------
 
@@ -290,10 +304,14 @@ signal FEBRxOut : Array_OutRec_x8;
 Type Array_InRec_x8 is Array(0 to 7) of RxInRec;
 signal FEBRxIn : Array_InRec_x8;
 
--- Signals used to determine which ports have FEBs plugged into them
+-- Signals used to determine which lanes of the single FEB are active.
+-- Rx_active(i) = '1' when lane i shows FM transitions; index is a lane index
+-- of the single FEB, not a FEB index.
+-- FEB_Present is the aggregate: '1' when any lane of the FEB is active.
 signal RxDl : Array_8x2;
 signal TransitionCount : Array_8x4;
 signal Rx_active : std_logic_vector(7 downto 0);
+signal FEB_Present : std_logic;                                             -- aggregate OR of Rx_active lanes
 signal Rx_active_rxclk    : std_logic_vector(7 downto 0);  -- ADD: RxFMClk-domain copy
 signal Rx_active_sync     : Array_8x2;                      -- ADD: 2-FF synchroniser
 signal LinkStatEn : std_logic;
@@ -335,7 +353,16 @@ constant MAX_TX_WORDS : std_logic_vector(15 downto 0) := X"1ffc";-- X"2000";
 -- constant UB_MISMATCH_STATUS_BIT : std_logic_vector(7 downto 0) := X"10";
 constant OVERFLOW_STATUS_BIT : std_logic_vector(15 downto 0) := X"1000"; -- bit 12
 
--- added 11/24: Auto-TX FPGA automatic READY Packet sender, 2 words for now? Can change later. 
+-- Signals used by the AutoTx / UBT handshake.
+-- Single-FEB model: the FEB is treated as one entity across 8 lanes.
+-- AutoTx_BroadcastMode = '1' means the UBT packet is sent to all enabled lanes.
+-- AutoTx_Target holds the enabled-lane mask for the current transaction.
+-- AutoTx_Busy(i) is set for every enabled lane simultaneously when a UBT is
+--   in flight; cleared for all lanes when the FEB transaction completes.
+-- AutoTx_TimedOut(i) is set per-lane if a reply timeout occurred on that lane.
+-- AutoTx_WaitMask holds the mask of lanes we are waiting for a reply from.
+-- RoundRobin_Last is retained for backward register compatibility but is no
+--   longer updated (the FEB is a single entity; no round-robin is needed).
 signal PhyTxDin_FPGA      : std_logic_vector(15 downto 0) := (others => '0'); -- FPGA-produced write data
 signal PhyTxDin_mux       : std_logic_vector(15 downto 0) := (others => '0'); -- selected DIN to PhyTx_Buff (uC or FPGA)
 signal PhyTxBuff_wr_en_mux: std_logic := '0';                                  -- combined wr_en into PhyTx_Buff
@@ -476,6 +503,10 @@ end process PhyPDn_sync_proc;
 
 CpldRst_sync <= CpldRst_r(1);
 ResetHi <= not CpldRst_sync;
+
+-- Aggregate "FEB present" signal: '1' when at least one lane of the FEB is active.
+-- The index of Rx_active is a lane index of the single FEB, not a FEB index.
+FEB_Present <= '1' when Rx_active /= X"00" else '0';
 
 -- You can't use type defs in the pin list. Remap type def elements to 
 -- separate std_logic_vectors
@@ -707,7 +738,8 @@ AddrBuff : SCFIFO_1Kx28
     empty => AddrBuff_empty);
 
 ----------------------------------------------------------------------------
----- Loop through eight Phy receive channels, eight FM receive channels ----
+---- Loop through eight PHY receive channels (8 lanes of the single FEB)  ----
+---- and eight FM receive channels (8 FM lanes of the same single FEB)    ----
 ----------------------------------------------------------------------------
 
 Debug(3) <= FEBRxBuff_Empty(0);
@@ -1391,17 +1423,24 @@ begin
 end process;
 
 ------------------------------------------------------------------------------
--- AutoTx_Proc: sequential UBT handshake
---   State "000": idle - scan ReadyStatus (or honour kick) for next port
---   State "001": write UBT packet words into PhyTxBuff
---   State "010": wait for the target PHY RX FIFO to go non-empty
---                (i.e. FEB has responded), with timeout fallback
---   State "011": immediately check for another ready port
+-- AutoTx_Proc: UBT handshake for the single FEB (8 lanes)
+--   Single-FEB model: the FEB is one entity; all 8 PHY lanes carry data from
+--   the same FEB.  A UBT request is broadcast to all enabled lanes at once.
+--   A reply from any enabled lane is treated as "FEB has replied".
+--
+--   State "000": idle - FEB ready when any masked lane has ReadyStatus set;
+--                broadcast UBT to all enabled lanes.
+--   State "001": write UBT packet words into PhyTxBuff (broadcast target)
+--   State "010": wait for any enabled-lane RX FIFO to go non-empty
+--                (i.e. FEB has responded on at least one lane), with timeout
+--   State "011": immediately re-check FEB readiness after a transaction
+--   State "100": CDC settling delay before asserting TxEnReqPulse
+--   State "101": wait for PhyTxBuff to drain (PHY has finished transmitting)
+--   State "110": wait for all enabled-lane RX FIFOs to drain (DDR sequencer
+--                has consumed the FEB reply data)
 ------------------------------------------------------------------------------
 AutoTx_Proc : process(SysClk, CpldRst_sync)
-  variable found_port : integer range 0 to 7;
-  variable have_port  : boolean;
-  variable onehot     : std_logic_vector(7 downto 0);
+  -- rxgot_v: local copy of AutoTx_RxGot used within this process cycle
   variable rxgot_v : std_logic_vector(7 downto 0);-- Replace the signal-based sticky latch with a variable
   
   begin
@@ -1453,48 +1492,42 @@ end loop;
 AutoTx_RxGot <= rxgot_v;
 
 case AutoTx_State is
-  -- "000": Idle ? scan for a ready lane and only send UBT if buffer is empty
+  -- "000": Idle - FEB is ready when any masked lane has ReadyStatus set.
+  -- Broadcast a single UBT to all enabled lanes (they all go to one FEB).
   when "000" =>
     AutoTx_Active <= '0';
     AutoTx_Target <= (others => '0');
-    found_port := 0; have_port := false;
 
-    if MaskReg /= X"00" then           -- ADD: skip scan entirely if mask not set
-      for i in 0 to 7 loop
-        if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1'
-           and MaskReg((RoundRobin_Last + 1 + i) mod 8) = '1'
-        then		  found_port := (RoundRobin_Last + 1 + i) mod 8;
-		  have_port  := true;
-        exit;
-		  end if;
-      end loop;
-	 end if;
-    -- Only send UBT if buffer is empty
-    if have_port and PhyTxBuff_Empty = '1'
+    -- FEB is ready if any masked lane has its ReadyStatus bit set
+    if (ReadyStatus and MaskReg) /= X"00"
+       and PhyTxBuff_Empty = '1'
        and PhyTxBuff_Full = '0'
        and PhyTxBuff_wreq = '0'
-       and UBTTarget_full = '0' 
-		 -- synthesis translate_off
-		and probe_AutoTx_Inhibit = '0'
-		-- synthesis translate_on 
-		then
-      AutoTx_Port               <= found_port;
-      RoundRobin_Last           <= found_port;
+       and UBTTarget_full = '0'
+       -- synthesis translate_off
+       and probe_AutoTx_Inhibit = '0'
+       -- synthesis translate_on
+    then
+      -- Broadcast: target all enabled lanes simultaneously.
+      -- AutoTx_Port is set to 0 as a representative lane index (broadcast).
+      AutoTx_Port               <= 0;
       AutoTx_WordIdx            <= 0;
-      AutoTx_Claim(found_port)  <= '1';
-      AutoTx_Busy(found_port)   <= '1';
+      -- Claim all ready masked lanes at once
+      AutoTx_Claim              <= ReadyStatus and MaskReg;
+      -- Mark all enabled lanes busy for this FEB transaction
+      AutoTx_Busy               <= MaskReg;
       AutoTx_Active             <= '1';
-		AutoTx_TimedOut(found_port) <= '0';  -- ADD: clear timed-out flag when claiming
-      onehot                    := (others => '0');
-      onehot(found_port)        := '1';
-      AutoTx_Target             <= onehot;
+      -- Clear timed-out flags for all lanes when starting a new transaction
+      AutoTx_TimedOut           <= (others => '0');
+      -- Target = all enabled lanes (broadcast)
+      AutoTx_Target             <= MaskReg;
       AutoTx_State              <= "001";
     end if;
 
 
-  -- "001": Write UBT packet words
+  -- "001": Write UBT packet words (broadcast to all enabled lanes)
   when "001" =>
-    AutoTx_Busy(AutoTx_Port) <= '1';   -- FIX: keep busy asserted throughout write phase
+    -- AutoTx_Busy was set to MaskReg in state "000"; hold it here.
 	 AutoTx_RxGot <= AutoTx_RxGot and (not AutoTx_Target);  -- clear before waiting
     if PhyTxBuff_Full = '0' and AutoTx_WordPending = '0'
        and PhyTxBuff_wreq = '0' then
@@ -1532,80 +1565,60 @@ case AutoTx_State is
   --        being asserted; using a deterministic counter avoids any metastability.
   --        6 SysClk cycles @ 100 MHz = 60 ns, covering a 2-FF sync plus margin.
   when "100" =>
-    AutoTx_Busy(AutoTx_Port) <= '1';
+    -- AutoTx_Busy holds the value set in state "000" (= MaskReg).
     if AutoTx_CdcDelay = 0 then
       AutoTx_TxEnReqPulse <= '1';
       AutoTx_State <= "101";
     else
       AutoTx_CdcDelay <= AutoTx_CdcDelay - 1;
     end if;
-	-- New state "110": wait for PhyRxBuff to drain (DDR sequencer consumed all data)
-  
+	-- "110": wait for all enabled-lane RX FIFOs to drain (DDR sequencer consumed
+  --         the FEB reply data).  "Done" = all masked lanes have empty FIFOs.
   when "110" =>
-    AutoTx_Busy(AutoTx_Port) <= '1';
-    if PhyRxBuff_Empty(AutoTx_WaitPort) = '1' then
-		AutoTx_WaitMask  <= (others => '0');   -- clear here instead
-        AutoTx_Busy(AutoTx_WaitPort) <= '0';  -- now clears the right port
-        AutoTx_WaitTimeout <= 0;
-        AutoTx_State <= "011";
-    elsif AutoTx_WaitTimeout > 0 then         -- FIX: add timeout guard
+    -- AutoTx_Busy retains its value (= MaskReg) from state "000" until cleared below.
+    -- All lanes are drained when each enabled lane's FIFO is empty.
+    -- Disabled lanes (MaskReg(i)='0') are ignored via bitwise OR with ~MaskReg.
+    if (PhyRxBuff_Empty or not MaskReg) = X"FF" then
+      AutoTx_WaitMask    <= (others => '0');
+      AutoTx_Busy        <= (others => '0');  -- FEB transaction complete, clear all lanes
+      AutoTx_WaitTimeout <= 0;
+      AutoTx_State <= "011";
+    elsif AutoTx_WaitTimeout > 0 then         -- timeout guard
         if Counter1us = X"00" then
             AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
         end if;
     else
-        -- DDR sequencer stalled or no data arrived ? release anyway
-        AutoTx_TimedOut(AutoTx_Port) <= '1';
-        AutoTx_Busy(AutoTx_WaitPort) <= '0';
+        -- DDR sequencer stalled or no data arrived; release all lanes
+        AutoTx_TimedOut <= (others => '1');   -- mark all lanes timed-out
+        AutoTx_Busy     <= (others => '0');   -- clear all lane busy bits
         AutoTx_State <= "011";
     end if;
   
-  -- "010": Wait for reply from FEB (RX FIFO for the lane fills)
--- State "010": use the sticky flag instead of the pulse:
+  -- "010": Wait for reply from the FEB (any enabled-lane RX FIFO fills).
+  -- Single-FEB model: "FEB replied" = any masked lane has data.
   when "010" =>
---	if (rxgot_v and AutoTx_WaitMask) /= X"00" then
---    AutoTx_RxGot       <= AutoTx_RxGot and (not AutoTx_WaitMask); 
---    AutoTx_WaitMask    <= (others => '0');
---    AutoTx_WaitTimeout <= 0;
---    AutoTx_Busy(AutoTx_Port) <= '0';
---    --AutoTx_RxGot       <= AutoTx_RxGot and (not AutoTx_WaitMask);
---    AutoTx_State       <= "011";
 	if (rxgot_v and AutoTx_WaitMask) /= X"00" then
+    -- At least one lane has replied; the FEB has responded.
     AutoTx_RxGot    <= AutoTx_RxGot and (not AutoTx_WaitMask);
-    --AutoTx_WaitMask <= (others => '0');
-    -- DO NOT clear AutoTx_Busy here
-	 AutoTx_WaitPort   <= AutoTx_Port;      -- FIX: capture the port here
-        AutoTx_WaitTimeout <= 10000;           -- add drain timeout (~10ms)
-    AutoTx_State    <= "110";   -- new drain-wait state
+    -- Move to drain-wait state so DDR sequencer can consume the reply.
+    AutoTx_WaitPort   <= AutoTx_Port;      -- representative lane (broadcast: port 0)
+    AutoTx_WaitTimeout <= 10000;           -- drain timeout (~10ms)
+    AutoTx_State    <= "110";
   elsif AutoTx_WaitTimeout > 0 then
     if Counter1us = X"00" then
       AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
     end if;
   else
-    AutoTx_TimedOut(AutoTx_Port) <= '1';
-    AutoTx_WaitMask    <= (others => '0');
-    AutoTx_Busy(AutoTx_Port) <= '0';
-    AutoTx_State       <= "011";
+    -- FEB did not reply in time; clear all lane busy bits and retry.
+    AutoTx_TimedOut <= (others => '1');    -- mark all lanes timed-out
+    AutoTx_WaitMask <= (others => '0');
+    AutoTx_Busy     <= (others => '0');    -- clear all lane busy bits
+    AutoTx_State    <= "011";
   end if;
-	
-  -- 	TxEnAck in SMI_Proc requires PhyTxBuff_Empty = '0' to latch. By firing TxEnReqPulse only after the FIFO is confirmed non-empty, the i50MHz-domain TxEnAck handshake will succeed and TxEn will actually be driven.
-  -- "101": Wait for PhyTxBuff to fully drain (PHY has finished transmitting)
---when "101" =>
---    AutoTx_Busy(AutoTx_Port) <= '1';
---    if PhyTxBuff_Empty = '1' then
---      AutoTx_State <= "010";
---    elsif AutoTx_WaitTimeout > 0 then
---      if Counter1us = X"00" then
---        AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
---      end if;
---    else
---      -- Timeout: packet presumed sent, move on
---      AutoTx_State <= "010";
---    end if;AutoTx_WaitTimeout
 
--- "101" goes here. 
--- AFTER: timeout after 1 ms (1000 x 1 µs ticks) if FIFO never drains
+  -- "101": Wait for PhyTxBuff to fully drain (PHY has finished transmitting)
 when "101" =>
-    AutoTx_Busy(AutoTx_Port) <= '1';
+    -- AutoTx_Busy retains its value (= MaskReg) from state "000" until cleared.
     if PhyTxBuff_Empty_s = '1' then
       -- FIFO drained cleanly; give FEB 10 ms to reply
       AutoTx_WaitTimeout <= 10000;
@@ -1616,51 +1629,40 @@ when "101" =>
         AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
       end if;
     else
-      -- TX drain timed out (TxEnAck likely missed); proceed to reply-wait
-      -- so the FSM does not stall permanently on this port.
-      AutoTx_TimedOut(AutoTx_Port) <= '1';
-      AutoTx_WaitTimeout           <= 10000;
-      AutoTx_State                 <= "010";
+      -- TX drain timed out (TxEnAck likely missed); proceed to reply-wait.
+      AutoTx_TimedOut    <= (others => '1');  -- mark all lanes
+      AutoTx_WaitTimeout <= 10000;
+      AutoTx_State       <= "010";
     end if;
 
 
 
 
 	 
-  -- "011": Immediate scan for more ready lanes (optional; could just return to "000")
+  -- "011": Immediately re-check FEB readiness after completing a transaction.
+  -- Single-FEB model: same broadcast logic as state "000".
   when "011" =>
     AutoTx_Target <= (others => '0');
-    found_port := 0; have_port := false;
-	 --AutoTx_RxGot(found_port) <= '0';  -- add after AutoTx_Claim(found_port) <= '1';
-    for i in 0 to 7 loop
-      if ReadyStatus((RoundRobin_Last + 1 + i) mod 8) = '1' then
-        found_port := (RoundRobin_Last + 1 + i) mod 8;
-        have_port  := true;
-        exit;
-      end if;
-    end loop;
-      if have_port and PhyTxBuff_Empty = '1'
+    -- FEB is ready if any masked lane has its ReadyStatus bit set
+    if (ReadyStatus and MaskReg) /= X"00"
+       and PhyTxBuff_Empty = '1'
        and PhyTxBuff_Full = '0'
        and PhyTxBuff_wreq = '0'
        and UBTTarget_full = '0' then
-      AutoTx_Port               <= found_port;
-      RoundRobin_Last           <= found_port;
+      AutoTx_Port               <= 0;             -- broadcast: not port-specific
       AutoTx_WordIdx            <= 0;
-      AutoTx_Claim(found_port)  <= '1';
-      AutoTx_Busy(found_port)   <= '1';
+      AutoTx_Claim              <= ReadyStatus and MaskReg;
+      AutoTx_Busy               <= MaskReg;       -- all enabled lanes busy
       AutoTx_Active             <= '1';
-		AutoTx_TimedOut(found_port) <= '0'; -- ADD: clear timed-out flag when re-claiming
-      onehot                    := (others => '0');
-      onehot(found_port)        := '1';
-      AutoTx_Target             <= onehot;
+      AutoTx_TimedOut           <= (others => '0');
+      AutoTx_Target             <= MaskReg;       -- broadcast to all enabled lanes
       AutoTx_State              <= "001";
     else
       AutoTx_State <= "000";
-    end if;  
+    end if;
 
   -- catch-all
   when others =>
-	 -- AutoTx_Busy <= (others => '0');
     AutoTx_State <= "000";
 end case;
 
@@ -1788,24 +1790,22 @@ end if;
 --  end loop;
 --end if;
 
--- FIXED: Background re-arm at 1 Hz.
--- Only re-arm a port if:
---   1. It is masked
---   2. Its RX FIFO is empty (no pending data)
---   3. ReadyStatus is not already set
---   4. The AutoTx FSM is NOT currently mid-handshake waiting on this port
+-- Background re-arm at 1 Hz.
+-- Single-FEB model: re-arm per-lane ReadyStatus bits only when the FEB is not
+-- busy (no lane is busy = AutoTx_Busy = X"00") and the lane FIFO is empty.
+-- This ensures we don't re-arm while a UBT broadcast is in flight to the FEB.
 if Counter1s = 0 and PowerOnReady_done = '1' then
   for p in 0 to 7 loop
     if MaskReg(p) = '1'
        and PhyRxBuff_Empty(p) = '1'
        and rs_next(p) = '0'
-		 and AutoTx_Busy(p) = '0'
-       -- FIX: suppress re-arm while FSM is waiting for FEB reply on this port
+       and AutoTx_Busy = X"00"           -- FEB not busy (no lane busy)
+       -- Suppress re-arm while FSM is waiting for FEB reply
        and not (AutoTx_WaitMask(p) = '1'
          and (AutoTx_State = "010"
               or AutoTx_State = "100"
               or AutoTx_State = "101"
-				  or AutoTx_State = "110"))   -- ADD "101"
+              or AutoTx_State = "110"))
     then
       rs_next(p) := '1';
     end if;
@@ -1819,19 +1819,15 @@ if WRDL = 1 and uCA(11 downto 10) = GA
   rs_next := rs_next or uCD(7 downto 0);
 end if;
 
--- FIXED P3: use AutoTx_Claim_d (one cycle delayed) as guard,
--- consistent with how the P2 clear uses it.
--- This closes the 1-cycle race window where the empty edge fires in
--- the same cycle as the claim pulse, causing a spurious re-arm.
--- Also suppress re-arm while FSM is mid-handshake waiting on this port.
--- P3: Re-arm ReadyStatus when a PhyRxBuff fills (empty->non-empty).
--- This means the FEB has responded with data and is ready for another UBT.
--- Gated on AutoTx_Busy so we don't re-arm while a UBT is already in flight
--- to that port.
+-- P3: Re-arm ReadyStatus when a lane of the FEB fills (empty->non-empty).
+-- Single-FEB model: a lane fill indicates the FEB has responded with data
+-- and is ready for another UBT transaction.
+-- Gated on AutoTx_Busy = X"00" (FEB not busy) to prevent re-arming while a
+-- UBT broadcast is already in flight to the FEB.
 for p in 0 to 7 loop
   if CpldRst_sync = '1'
      and PhyRxFilled(p) = '1'
-     and AutoTx_Busy(p) = '0'
+     and AutoTx_Busy = X"00"             -- FEB not busy (no lane busy)
      and AutoTx_Claim(p) = '0'
      and AutoTx_Claim_d(p) = '0'
   then
@@ -1866,13 +1862,20 @@ WRDL(1) <= WRDL(0);
 
 -- debug probes for testbench
 -- synthesis translate_off
+-- ReadyStatus: per-lane UBT ready bits of the single FEB
 probe_ReadyStatus      <= ReadyStatus;
+-- MaskReg: per-lane enable bits for the single FEB
 probe_MaskReg          <= MaskReg;
+-- PhyRxBuff_Empty: per-lane FIFO empty flags (lane index = FEB lane index)
 probe_PhyRxEmpty       <= PhyRxBuff_Empty;
+-- Rx_active: per-lane FM-activity flags of the single FEB
 probe_Rx_active        <= Rx_active;
 probe_PhyTxBuff_Count  <= PhyTxBuff_Count;
+-- AutoTx_Busy: per-lane busy bits; all enabled lanes set together during a UBT broadcast
 probe_UBT_in_progress  <= AutoTx_Busy;
+-- AutoTx_WaitMask: lanes we are waiting for a reply on (= MaskReg during a broadcast)
 probe_handshake_queued <= AutoTx_WaitMask;
+-- AutoTx_Port: "0" in broadcast mode (representative lane index, not a FEB index)
 probe_AutoTx_Port      <= std_logic_vector(to_unsigned(AutoTx_Port, 3));
 probe_PhyTxBuff_Empty  <= PhyTxBuff_Empty;
 -- synthesis translate_on
@@ -1994,7 +1997,8 @@ else
 	FrameReg <= "11111";
 end if;
 	
---- Channel mask register. One bit corresponds to one FEB
+--- Channel/lane mask register.
+-- Single-FEB model: one bit enables one PHY lane of the single FEB (not a per-FEB enable).
 if WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = InputMaskAddr
 then MaskReg <= uCD(7 downto 0);
 else MaskReg <= MaskReg;
@@ -2589,9 +2593,10 @@ end if;
 
 
 
--- Sum the word counts from the eight PHY receive FIFOs. The four header 
--- words from each FEB are stripped off, then the four header words for the 
--- concatenated data are appended
+-- Sum the word counts from the eight PHY receive FIFOs (8 lanes of the single FEB).
+-- The four header words from each lane are stripped off, then four header words for
+-- the combined single-FEB event are appended.  PortNo here is a lane index of the
+-- single FEB, not a FEB index.
 if DDR_Write_Seq = Idle 
 	  then EventWdCnt <= (others => '0');
   elsif DDR_Write_Seq = Rd_WdCount and PhyRxBuff_Out(PortNo) >= 4
@@ -2607,7 +2612,7 @@ end if;
    else FirstActive <=  FirstActive;
  end if;	
 
--- Load the microbunch number from the first active port
+-- Load the microbunch number from the first active lane of the single FEB
 	if FirstActive = '1' then
 	  if DDR_Write_Seq = Rd_uBunchHi then uBunch <= PhyRxBuff_Out(PortNo) & uBunch(15 downto 0); 
 	   elsif DDR_Write_Seq = Rd_uBunchLo then uBunch <= uBunch(31 downto 16) & PhyRxBuff_Out(PortNo);
@@ -2615,11 +2620,11 @@ end if;
     else uBunch <= uBunch;
 	end if;
 
--- "OR" the status bits from the FEBs and compare the first microbunch to any additional microbunches.
--- EventStat
--- bit 0 to 7: indicate error on port
--- bit 8 to 10: what error(s)
--- bit 11: uB mismatch between ports
+-- "OR" the status bits from the FEB lanes and compare the first microbunch to any additional lanes.
+-- EventStat (single-FEB model):
+-- bit 0 to 7: indicate error on lane N of the single FEB (not per-FEB error)
+-- bit 8 to 10: what error type(s) occurred across all lanes
+-- bit 11: uBunch mismatch between lanes of the FEB
 
 if DDR_Write_Seq = Idle then EventStat <= (others => '0'); 
 elsif	DDR_Write_Seq = Rd_Stat then
@@ -2653,7 +2658,8 @@ then WrtHi_LoSel <= not WrtHi_LoSel;
 else WrtHi_LoSel <= WrtHi_LoSel;
 end if;
 
--- loop through eight Phy Rx buffer read request and event status lines
+-- loop through eight PHY Rx buffer read request and event status lines
+-- (i is a lane index of the single FEB, not a FEB index)
 for i in 0 to 7 loop
 
 -- Sequencer read to microcontroller reads of the PhyRx FIFOs  
@@ -2668,7 +2674,8 @@ then PhyRxBuff_rdreq(i) <= '1';
 else PhyRxBuff_rdreq(i) <= '0';
 end if;
 
--- Status indicating a port is active and a complete event is available for readout
+-- Status indicating a lane of the single FEB is active and a complete event
+-- word count is available for readout from that lane's FIFO
  if Rx_active(i) = '1' and PhyRxBuff_Empty(i) = '0' and PhyRxBuff_RdCnt(i) >= PhyRxBuff_Out(i)
   then PhyRxBuff_RdStat(i) <= '1';
   else PhyRxBuff_RdStat(i) <= '0';
@@ -2712,19 +2719,20 @@ end loop;
    else HitFlag <= HitFlag;
  end if;
 
--- Signal to indicate if all active ports have an event ready
+-- Signal to indicate if all active lanes of the single FEB have an event ready
   if Rx_active = PhyRxBuff_RdStat then EventRdy <= '1'; 
   else EventRdy <= '0'; 
   end if; 
 
--- Use this variable to cycle through the input ports during DDR writes
+-- Use this variable to cycle through the lane FIFOs of the single FEB during DDR writes.
+-- PortNo is a lane index (0..7) of the single FEB, not a FEB index.
 if PortNo /= 7 and (DDR_Write_Seq = IncrPort0 or DDR_Write_Seq = IncrPort1)
 	      then PortNo <= PortNo + 1;
            elsif DDR_Write_Seq = ResetPortNo or (DDR_Write_Seq = Idle and EventRdy = '1') then PortNo <= 0; 
        else PortNo <= PortNo;
 end if;
 
--- Load the words counts from the headers into eight counters, one for each port
+-- Load the word counts from the lane headers into eight counters, one per lane of the FEB
 	if DDR_Write_Seq = Idle then PortWdCounter <= (others => (others => '0'));
 	  elsif DDR_Write_Seq = Rd_WdCount and PhyRxBuff_Out(PortNo) /= 0
 		then PortWdCounter(PortNo) <= PhyRxBuff_Out(PortNo) - 1;
@@ -2738,6 +2746,8 @@ end if;
 -- Idle,ChkWrtBuff,SndCmd,WtCmdMtpy,IncrPort0,CheckActive0,Rd_WdCount,Rd_uBunchHi,Rd_uBunchLo,
 -- Rd_Stat,CheckActive1,ResetPortNo,Write_Wd_Count,Wrt_Stat,
 -- Wrt_uBunchHi,Wrt_uBunchLo,WrtDDR,WritePad,IncrBuffCnt
+-- Single-FEB model: PortNo iterates over lanes (0..7) of the single FEB.
+-- One combined event header is written per FEB event (not one per lane).
 
 Case DDR_Write_Seq is
    When Idle => DDRWrtStat <= X"0"; Debug(10 downto 7) <= X"0"; 
