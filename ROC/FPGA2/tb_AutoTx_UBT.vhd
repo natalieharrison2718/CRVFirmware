@@ -32,12 +32,10 @@ architecture sim of tb_AutoTx_UBT is
   constant RESET_CYCLES : integer := 20;
 
   -- -------------------------------------------------------------------------
-  -- UBT packet word count: 4 ASCII words ("UB", "T ", "<d><CR>", "<LF><NUL>")
-  -- plus 1 trailing zero padding word written by AutoTx state "001" to keep
-  -- PhyTxBuff_Empty = '0' across the full transmission of the last real word.
-  -- See Controller_FPGA2.vhd state "001" comment for rationale.
+  -- UBT packet word count: 4 ASCII words ("UB", "T ", "<d><CR>", "<LF><NUL>").
+  -- AutoTx state "001" writes exactly UBT_ASC_COUNT words (no trailing pad).
   -- -------------------------------------------------------------------------
-  constant TB_UBT_WORD_COUNT : integer := 5;
+  constant TB_UBT_WORD_COUNT : integer := 4;
 
   -- -------------------------------------------------------------------------
   -- VHDL-93 compatible hex conversion (replaces VHDL-2008 to_hstring)
