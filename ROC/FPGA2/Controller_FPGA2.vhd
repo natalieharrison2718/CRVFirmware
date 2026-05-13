@@ -1515,7 +1515,8 @@ case AutoTx_State is
         UBTTarget_wr_en_stretch  <= "111";
       end if;
 
-      if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
+      if AutoTx_WordIdx >= UBT_ASC_COUNT then
+      --if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
         -- Packet complete. Request PHY TX enable.
         --AutoTx_TxEnReqPulse <= '1';
         AutoTx_WordIdx      <= 0;
