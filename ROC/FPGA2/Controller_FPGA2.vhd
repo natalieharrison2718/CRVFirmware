@@ -1085,7 +1085,7 @@ end if;
 
 -- Set Tx Enables high until the Tx FIFO is empty
   if Clk25MHz = '0' and TxEnAck = '1' then TxEn <= TxEnMask;
-  elsif Clk25MHz = '0' and PhyTxBuff_Empty = '1' then TxEn <= X"00"; 
+  elsif Clk25MHz = '0' and PhyTxBuff_Empty = '1' and TxNibbleCount = "11" then TxEn <= X"00"; 
   end if;
 
 ---------------- Logic used to set up the LVDS clock buffer ---------------
