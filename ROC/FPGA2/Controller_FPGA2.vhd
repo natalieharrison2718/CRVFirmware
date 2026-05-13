@@ -1515,8 +1515,15 @@ case AutoTx_State is
         UBTTarget_wr_en_stretch  <= "111";
       end if;
 
-      if AutoTx_WordIdx + 1 >= UBT_ASC_COUNT then
-        -- Packet complete. Request PHY TX enable.
+      -- Write UBT_ASC_COUNT real words PLUS one trailing zero padding word.
+      -- The padding word keeps PhyTxBuff_Empty = '0' across the full
+      -- transmission of the last real word, preventing a CDC-induced empty
+      -- glitch at the word(N-1)/word(N) read-pointer boundary from
+      -- prematurely deasserting TxEnAck and dropping the final word from the
+      -- wire. ubt_ascii_word returns 0x0000 for idx >= UBT_ASC_COUNT via its
+      -- `when others` clause, so no Proj_Defs change is required.
+      if AutoTx_WordIdx >= UBT_ASC_COUNT then
+        -- Packet (plus padding) complete. Request PHY TX enable.
         --AutoTx_TxEnReqPulse <= '1';
         AutoTx_WordIdx      <= 0;
         AutoTx_Active       <= '0';
