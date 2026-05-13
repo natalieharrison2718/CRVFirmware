@@ -993,7 +993,7 @@ end if;
 -- TxEn is used to hold off sending Phy data until a block of data has been 
 -- loaded into the transmit FIFO
 if Clk25MHz = '0' and TxEnAck = '0' and TxEnReq = '1' and PhyTxBuff_Empty = '0' then TxEnAck <= '1';
-elsif PhyTxBuff_Empty = '1' and Clk25MHz = '0' then TxEnAck <= '0';
+elsif PhyTxBuff_Empty = '1' and Clk25MHz = '0' and TxNibbleCount = "11" then TxEnAck <= '0';
 else TxEnAck <= TxEnAck;
 end if;
 
@@ -1085,7 +1085,7 @@ end if;
 
 -- Set Tx Enables high until the Tx FIFO is empty
   if Clk25MHz = '0' and TxEnAck = '1' then TxEn <= TxEnMask;
-  elsif Clk25MHz = '0' and PhyTxBuff_Empty = '1' and TxNibbleCount = "11" then TxEn <= X"00"; 
+  elsif Clk25MHz = '0' and TxEnAck = '0' then TxEn <= X"00"; 
   end if;
 
 ---------------- Logic used to set up the LVDS clock buffer ---------------
