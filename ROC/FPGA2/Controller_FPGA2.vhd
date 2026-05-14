@@ -897,6 +897,11 @@ PhyTxBuff_rdreq <= '0'; TxEnAck <= '0'; PreambleTx <= '0';
 PreambleCnt <= "000"; Preamble <= X"00";
 PhyTxBuff_Out_r <= (others => '0');
 TxEnMask <= X"00"; -- was X"FF"
+-- ROBUSTNESS FIX #5: TxEnMask resets to X"00" here on CpldRst_sync='0', and
+-- the UBTTarget FIFO resets in UBTTarget_FIFO_proc on ResetHi='1' (see
+-- ResetHi <= not CpldRst_sync below).  Both are driven by the same reset
+-- source, so a soft reset can never leave TxEnMask and the target FIFO
+-- out of sync.
  
 -- Clock fanout SPI signals
 SPI_Adddr <= X"0800"; SPI_Shift <= (others => '0');
@@ -991,7 +996,19 @@ end if;
 
 -- TxEn is used to hold off sending Phy data until a block of data has been 
 -- loaded into the transmit FIFO
-if Clk25MHz = '0' and TxEnAck = '0' and TxEnReq = '1' and PhyTxBuff_Empty = '0' then TxEnAck <= '1';
+-- ROBUSTNESS FIX: also require UBTTarget_empty = '0'.  This makes preamble
+-- transmission impossible until the AutoTx target tag is provably visible in
+-- the i50MHz domain, eliminating the CDC race where TxEnMask could be loaded
+-- with a stale value (typically X"00" after reset) because the SysClk write
+-- pulse had not yet propagated through the 4-stage UBTTarget_wr_en_sync_50.
+-- The consumer (this gate) now waits for evidence that the producer's data
+-- has arrived, which is correct by construction across all PVT.
+-- Note: legacy SysClk-side TxEnReq paths that do not use UBTTarget (e.g.
+-- broadcast TxEnReq from the FM_Tx_Rx engine) still write into PhyTxBuff and
+-- therefore queue a target via AutoTx_Target/UBTTarget; if a future feature
+-- needs to bypass UBTTarget it must qualify TxEnReq through a separate path.
+if Clk25MHz = '0' and TxEnAck = '0' and TxEnReq = '1'
+   and PhyTxBuff_Empty = '0' and UBTTarget_empty = '0' then TxEnAck <= '1';
 elsif PhyTxBuff_Empty = '1' and Clk25MHz = '0' and TxNibbleCount = "11" then TxEnAck <= '0';
 else TxEnAck <= TxEnAck;
 end if;
@@ -1067,13 +1084,18 @@ if TxNibbleCount = 2 and Clk25MHz = '0' and PreambleTx = '0' then PhyTxBuff_rdre
 else PhyTxBuff_rdreq <= '0'; 
 end if;
 
--- When preamble starts, load TxEnMask from the target tag FIFO
+-- When preamble starts, load TxEnMask from the target tag FIFO.
+-- ROBUSTNESS FIX: with TxEnAck now gated on UBTTarget_empty='0' above, the
+-- empty branch below should be unreachable.  If it is ever taken (e.g. due
+-- to a reset glitch or an unexpected TxEnReq path), drive TxEnMask to X"00"
+-- so the symptom is "no transmission at all" — a safe, observable failure —
+-- rather than "transmission to whatever stale port was last loaded".
 if PreambleTx = '1' and PreambleTx_d = '0' then
   if UBTTarget_empty = '0' then
     TxEnMask        <= UBTTarget_dout;
     UBTTarget_rd_en <= '1';
   else
-    TxEnMask        <= TxEnMask;  -- hold
+    TxEnMask        <= X"00";  -- fail-safe: no PHY enabled if FIFO is empty
     UBTTarget_rd_en <= '0';
   end if;
 else
@@ -1342,10 +1364,16 @@ begin
 --      end if;
       -- Drive CurrentTarget: hold for 4 nibbles, then follow candidate
 
-	-- rdreq: latch the new target
+	-- rdreq: latch the new target.
+	-- ROBUSTNESS FIX: also require TxEn /= ZERO8.  Without this, LastTxTarget
+	-- would be latched from tgt_candidate (which can come from AutoTx_Target)
+	-- even when TxEnMask was X"00" because of the CDC race fixed in change #1
+	-- — i.e. the diagnostic register would lie and report "UBT fired" when
+	-- nothing was actually driven onto the wire.  Gating on TxEn closes that
+	-- observability gap: LastTxTarget now only latches when a PHY is enabled.
 if PhyTxBuff_rdreq = '1' then
     TxTarget_hold <= tgt_candidate;
-    if tgt_candidate /= ZERO8 then
+    if tgt_candidate /= ZERO8 and TxEn /= ZERO8 then
         LastTxTarget <= tgt_candidate;
     end if;
     nibble_hold_cnt <= 4;
@@ -1528,9 +1556,15 @@ case AutoTx_State is
         AutoTx_Active       <= '0';
         AutoTx_WaitMask     <= AutoTx_Target;
         AutoTx_WaitTimeout  <= 10000;
-        AutoTx_CdcDelay     <= 12;    -- 12 SysClk @ 100 MHz = 120 ns
-                                    -- covers 4-stage i50MHz sync (4×20 ns = 80 ns)
-                                    -- plus margin for UBTTarget FIFO write propagation
+        AutoTx_CdcDelay     <= 2;     -- ROBUSTNESS FIX: with TxEnAck now
+                                    -- gated on UBTTarget_empty='0', the
+                                    -- consumer-side wait makes this delay
+                                    -- unnecessary for correctness.  Keep a
+                                    -- small value (2 SysClk = 20 ns) only to
+                                    -- ensure PhyTxBuff_Empty has deasserted
+                                    -- before TxEnReq is pulsed.  Previously
+                                    -- 12 — an unmaintainable magic number
+                                    -- tracking sync-FF latency across PVT.
         AutoTx_State        <= "100";   -- Now wait for buffer to drain
       else
         AutoTx_WordIdx <= AutoTx_WordIdx + 1;
@@ -3001,6 +3035,8 @@ iCD <= "00000" & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En & "0
 		 tx_overflow_cnt when OverflowCntAd,
 		 (15 downto 1 => '0') & PhyTxBuff_Empty when TxFifoRawEmptyAddr,
 		 X"00" & LastTxTarget  when LastTxTargetAddr,
+		 (15 downto 2 => '0') & UBTTarget_full & UBTTarget_empty
+		                       when UBTTargetStatusAddr,
        X"0011" when DebugVersion,							  
 		 X"00" & ReadyStatus when ReadyStatusAddr,
 		 X"0000"              when ReadyClearAddr,   -- write-only, read returns 0
