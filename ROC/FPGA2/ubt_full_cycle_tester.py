@@ -63,6 +63,8 @@ class R:
     FEBFMActiveAD    = 0x02F
     LastTxTargetAddr = 0x049
     TxFifoRawEmpty   = 0x04C
+    TxEnMaskAd       = 0x00E    # one-hot of last-loaded TxEn mask (0x00 = no PHY enabled)
+    UBTTargetStatusAddr = 0x062 # bit 0 = UBTTarget_empty, bit 1 = UBTTarget_full
     ReadyStatusAddr  = 0x1A0
     ReadyClearAddr   = 0x1A1
     ReadyForceAddr   = 0x1A2
@@ -315,22 +317,49 @@ def run_full_cycle_test(
             
             print(f"  {_ts(t0)} port{port} cyc {cyc:>2}  ReadyStatus[{port}] forced HIGH")
             
+            expected_mask = 1 << port
+
             def ubt_fired():
+                # ROBUSTNESS: PASS only when BOTH LastTxTarget AND TxEnMask
+                # show the expected one-hot bit.  This guards against the CDC
+                # race in which AutoTx_Target latched LastTxTarget but the
+                # UBTTarget tag had not yet propagated, so TxEnMask stayed
+                # 0x00 and no PHY enable was actually asserted.
                 last = roc.read(R.LastTxTargetAddr) or 0
-                # Register was zeroed above; any one-hot match is a fresh UBT.
-                return one_hot_port(last) == port
-            
+                mask = roc.read(R.TxEnMaskAd) or 0
+                return (one_hot_port(last) == port
+                        and (mask & 0xFF) == expected_mask)
+
             ok, ms = _wait_for(ubt_fired, t_ubt, POLL_FAST)   # ← THIS WAS MISSING
             last_val = roc.read(R.LastTxTargetAddr) or 0
+            mask_val = (roc.read(R.TxEnMaskAd) or 0) & 0xFF
+            ubt_status = roc.read(R.UBTTargetStatusAddr) or 0
+            ubt_empty  = bool(ubt_status & 0x1)
+            ubt_full   = bool(ubt_status & 0x2)
             if ok:
                 res.ubt_ok = PASS; res.ubt_ms = ms
                 print(f"  {_ts(t0)} port{port} cyc {cyc:>2}  "
-                      f"✓ UBT fired  last=0x{last_val:02X}  ({ms:.1f}ms)")
+                      f"✓ UBT fired  last=0x{last_val:02X} mask=0x{mask_val:02X}  ({ms:.1f}ms)")
             else:
                 res.ubt_ok = TOUT; res.ubt_ms = ms
-                res.note = f"⚠ UBT timeout  LastTxTarget=0x{last_val:02X}"
+                # Distinguish failure modes so future regressions are not
+                # misattributed to the FEB.
+                if (mask_val & expected_mask) == 0 and one_hot_port(last_val) == port:
+                    fail_kind = "PHY-ENABLE-MISSING"
+                    detail    = (f"LastTxTarget=0x{last_val:02X} latched but "
+                                 f"TxEnMask=0x{mask_val:02X} (expected 0x{expected_mask:02X}) — "
+                                 f"UBT staged but PHY enable never asserted "
+                                 f"(UBTTarget empty={int(ubt_empty)} full={int(ubt_full)})")
+                elif one_hot_port(last_val) != port:
+                    fail_kind = "UBT-NOT-STAGED"
+                    detail    = (f"LastTxTarget=0x{last_val:02X} TxEnMask=0x{mask_val:02X} "
+                                 f"UBTTarget empty={int(ubt_empty)} full={int(ubt_full)}")
+                else:
+                    fail_kind = "UBT-TIMEOUT"
+                    detail    = (f"LastTxTarget=0x{last_val:02X} TxEnMask=0x{mask_val:02X}")
+                res.note = f"⚠ {fail_kind}  {detail}"
                 print(f"  {_ts(t0)} port{port} cyc {cyc:>2}  "
-                  f"✗ UBT TIMEOUT   last=0x{last_val:02X}")
+                      f"✗ {fail_kind}   {detail}")
                 _print_row(res)
                 results.append(res)
                 time.sleep(0.05)

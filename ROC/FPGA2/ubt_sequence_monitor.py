@@ -444,8 +444,8 @@ def monitor(ga: int,
         print(f"    1. Check Rx_active — run: RD {uc.compose_a16(ga, R.FEB_FM_ACTIVE):03X}")
         print(f"       Should be 0x00FF. If 0x00, FM links are down.")
         print(f"    2. Check TxEn is actually toggling (oscilloscope on PHY TxEn pin)")
-        print(f"    3. Verify AutoTx_CdcDelay >= 12 in Controller_FPGA2.vhd")
-        print(f"       (was 6 — causes UBTTarget FIFO miss → TxEnMask = 0x00 → no TX)")
+        print(f"    3. Verify TxEnAck rising edge gates on UBTTarget_empty='0'")
+        print(f"       (consumer-side wait; eliminates CDC race that produced TxEnMask=0x00 → no TX)")
 
     passed = (len(violations) == 0 and len(events) > 0
               and no_replies == 0)

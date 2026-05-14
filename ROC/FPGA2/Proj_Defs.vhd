@@ -61,6 +61,10 @@ constant PhyTxCntAddr : AddrPtr := "00" & X"13";
 
 constant TxCurrentTargetAddr : AddrPtr := "00" & X"4A";
 
+-- UBTTarget FIFO status (i50MHz domain), exposed for diagnostics.
+-- bit 0 = UBTTarget_empty, bit 1 = UBTTarget_full.
+constant UBTTargetStatusAddr : AddrPtr := "00" & X"62";
+
 
 
 constant PHYTX_FIFO_DEPTH : natural := 1024; -- FIFO depth
