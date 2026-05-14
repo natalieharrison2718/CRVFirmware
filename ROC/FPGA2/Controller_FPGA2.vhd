@@ -393,8 +393,7 @@ signal LastTxTarget_clr_req  : std_logic := '0';  -- set by main (SysClk)
 signal LastTxTarget_clr_sync : std_logic_vector(2 downto 0) := "000"; -- sync in i50MHz
 signal LastTxTarget_clr_stretch_local : std_logic_vector(2 downto 0) := "000";
 -- signal port_full : std_logic_vector(7 downto 0); -- hook this to your per-port FIFO-full flagssignal debug_ReadyStatus     : std_logic_vector(7 downto 0);
-signal LastTxTarget_clr_stretch : std_logic_vector(2 downto 0) := "000";
-
+signal LastTxTarget_clr_stretch : std_logic_vector(4 downto 0) := (others => '0');
 signal RoundRobin_Last : integer range 0 to 7 := 0;
 
 
@@ -1276,7 +1275,7 @@ begin
     -- 3-stage shift: stages 0/1 = metastability FFs, stage 2 = delayed copy
     -- for rising-edge detect (stage2='0' and stage1='1').
     LastTxTarget_clr_sync <=
-    LastTxTarget_clr_sync(1 downto 0) & LastTxTarget_clr_stretch(2);
+    LastTxTarget_clr_sync(1 downto 0) & LastTxTarget_clr_stretch(0);
 	 
 	 	 
 	 
@@ -1341,19 +1340,24 @@ begin
 --          LastTxTarget <= tgt_candidate;
 --        end if;
 --      end if;
-	
-		if PhyTxBuff_rdreq = '1' then
-			TxTarget_hold <= tgt_candidate;
-			-- Clear WINS over latch
-			if LastTxTarget_clr_sync(2) = '0' and LastTxTarget_clr_sync(1) = '1' then
-				LastTxTarget <= (others => '0');
-			elsif tgt_candidate /= ZERO8 then
-				LastTxTarget <= tgt_candidate;
-			end if;
-			nibble_hold_cnt <= 4;
-		end if;
-
       -- Drive CurrentTarget: hold for 4 nibbles, then follow candidate
+
+	-- rdreq: latch the new target
+if PhyTxBuff_rdreq = '1' then
+    TxTarget_hold <= tgt_candidate;
+    if tgt_candidate /= ZERO8 then
+        LastTxTarget <= tgt_candidate;
+    end if;
+    nibble_hold_cnt <= 4;
+end if;
+
+-- µC clear: unconditional, NOT gated on rdreq
+-- Last assignment wins ? clear beats latch if both fire together
+if LastTxTarget_clr_sync(2) = '0' and LastTxTarget_clr_sync(1) = '1' then
+    LastTxTarget <= (others => '0');
+end if;
+
+
       if nibble_hold_cnt > 0 then
         CurrentTarget   <= TxTarget_hold;
         nibble_hold_cnt <= nibble_hold_cnt - 1;
@@ -1386,11 +1390,11 @@ LastTxTarget_clr_stretching : process(SysClk)
 begin
 	if rising_edge(SysClk) then
 		if CpldRst_sync = '0' then
-			LastTxTarget_clr_stretch <= "000";
+			LastTxTarget_clr_stretch <= "00000";
 		elsif LastTxTarget_clr_req = '1' then
-			LastTxTarget_clr_stretch <= "111";
+			LastTxTarget_clr_stretch <= "11111";
 		else 
-			LastTxTarget_clr_stretch <= '0' & LastTxTarget_clr_stretch(2 downto 1);
+			LastTxTarget_clr_stretch <= '0' & LastTxTarget_clr_stretch(4 downto 1);
 		end if;
 	end if;
 end process;
@@ -1437,6 +1441,7 @@ AutoTx_Proc : process(SysClk, CpldRst_sync)
     -- Pulse-only defaults
     AutoTx_Claim        <= X"00";
     PhyTxWrReq_FPGA     <= '0';
+	 AutoTx_ReArm    <= (others => '0');
     -- UBTTarget_wr_en     <= '0';
 	 -- shift the stretch register and drive the output
 	 UBTTarget_wr_en_stretch <= '0' & UBTTarget_wr_en_stretch(2 downto 1);
@@ -1753,7 +1758,7 @@ variable rs_next : std_logic_vector(7 downto 0);
 	--UBTTarget_wr_en_stretch <= "000";
 	AutoTx_Claim_d <= (others => '0');
 	AutoTx_TxEnReqHold <= '0';
-	AutoTx_ReArm <= (others => '0');
+	--AutoTx_ReArm <= (others => '0');
 	PhyRst_AutoDone <= '0';
 	 
 elsif rising_edge (SysClk) then 
@@ -1875,6 +1880,10 @@ end if;
 -- before being cleared, giving AutoTx_Proc time to latch it.
 if AutoTx_Claim_d /= X"00" then
   rs_next := rs_next and (not AutoTx_Claim_d);
+end if;
+
+if AutoTx_ReArm /= X"00" then
+    rs_next := rs_next or AutoTx_ReArm;
 end if;
 
 -- P1: microcontroller explicit clear
