@@ -77,7 +77,8 @@ entity Controller_FPGA2 is port(
 	probe_handshake_queued : out std_logic_vector(7 downto 0);
 	probe_AutoTx_Port      : out std_logic_vector(2 downto 0);
 	probe_AutoTx_Inhibit   : in  std_logic := '0';   -- TB drives this to gate AutoTx
-	probe_PhyTxBuff_Empty  : out std_logic            -- FIX 3: read-side empty flag
+	probe_PhyTxBuff_Empty  : out std_logic;           -- FIX 3: read-side empty flag
+	probe_AutoTx_TimedOut  : out std_logic_vector(7 downto 0)
 	-- synthesis translate_on	 
 );
 
@@ -154,6 +155,8 @@ signal PhaseAcc : std_logic_vector (31 downto 0);
 --signal Freq_Reg : std_logic_vector (31 downto 0);
 
 signal PhyTxFifoRst_stretch : std_logic_vector(3 downto 0) := (others => '0');
+
+signal AutoTx_FifoRst_req : std_logic := '0';
 
 -- MIG LPDDR controller signals 
 signal AuxClk : std_logic;
@@ -349,7 +352,7 @@ signal PhyTxDin_FPGA      : std_logic_vector(15 downto 0) := (others => '0'); --
 signal PhyTxDin_mux       : std_logic_vector(15 downto 0) := (others => '0'); -- selected DIN to PhyTx_Buff (uC or FPGA)
 signal PhyTxBuff_wr_en_mux: std_logic := '0';                                  -- combined wr_en into PhyTx_Buff
 signal PhyTxWrReq_FPGA    : std_logic := '0';                                  -- one-cycle FPGA write request
-type AutoTx_FSM is (AT_Idle, AT_WriteWords, AT_WaitTxDrain, AT_WaitRxFill, AT_WaitDdrDrain);
+type AutoTx_FSM is (AT_Idle, AT_WriteWords, AT_WaitTxFill, AT_WaitTxDrain, AT_WaitRxFill, AT_WaitDdrDrain);
 signal AutoTx_State : AutoTx_FSM := AT_Idle;
 signal AutoTx_Port        : integer range 0 to 7 := 0;
 signal AutoTx_WordIdx     : integer range 0 to 15 := 0; -- supports up to 16-word packets if needed
@@ -364,6 +367,13 @@ signal AutoTx_Target       : std_logic_vector(7 downto 0) := (others => '0'); --
 --signal AutoTx_BroadcastMode: std_logic := '0'; -- if '1', ignore AutoTx_Target and broadcast to TxEn bitssignal AutoTx_Cooldown : integer range 0 to 1000000 := 0;  -- ~10ms at 100MHz
 --signal AutoTx_Cooldown : integer range 0 to 1000000 := 0;  -- ~10ms at 100MHz
 signal AutoTx_TimedOut : std_logic_vector(7 downto 0) := (others => '0');
+-- Sticky 8-bit saturating counters: incremented in `main` whenever
+-- AutoTx_TimedOut(p) rises (one per port).  Cleared by the µC writing a
+-- one-hot mask to AutoTxTimeoutClrAddr.  Read back via AutoTxTimeoutCntAd[p].
+type TimeoutCnt_t is array(0 to 7) of std_logic_vector(7 downto 0);
+signal AutoTx_TimeoutCnt   : TimeoutCnt_t := (others => (others => '0'));
+signal AutoTx_TimedOut_d   : std_logic_vector(7 downto 0) := (others => '0');
+signal AutoTx_TimeoutClr   : std_logic_vector(7 downto 0) := (others => '0');
 --signal AutoTxKickMask  : std_logic_vector(7 downto 0) := (others => '0');
 --signal AutoTxKickPulse : std_logic := '0';
 signal AutoTx_TxEnReqPulse : std_logic := '0';
@@ -1385,9 +1395,12 @@ begin
     RxFilled_sticky     <= '0';
     TxEnMask_next       <= (others => '0');
     RoundRobin_Last     <= 0;
+	 AutoTx_FifoRst_req <= '0';
+
         
     elsif rising_edge(SysClk) then
         AutoTx_Claim        <= X"00";
+		  AutoTx_FifoRst_req <= '0';
         AutoTx_ReArm        <= (others => '0');
         PhyTxWrReq_FPGA     <= '0';
         AutoTx_TxEnReqPulse <= '0';
@@ -1398,6 +1411,8 @@ begin
            and PhyRxFilled(AutoTx_Port) = '1' then
             RxFilled_sticky <= '1';
         end if;
+		  
+		 
 
         case AutoTx_State is
 
@@ -1413,7 +1428,7 @@ begin
                     end if;
                 end loop;
                 if have_port
-                   and PhyTxBuff_Empty = '1'
+                   and PhyTxBuff_Empty_s = '1'
                    and PhyTxBuff_Full  = '0'
                    and PhyTxBuff_wreq  = '0' then
                     AutoTx_Port              <= found_port;
@@ -1433,10 +1448,14 @@ begin
                     PhyTxDin_FPGA   <= ubt_ascii_word(AutoTx_WordIdx, '1');
                     PhyTxWrReq_FPGA <= '1';
                     if AutoTx_WordIdx >= UBT_ASC_COUNT - 1 then
-                        AutoTx_TxEnReqPulse <= '1';
+                        -- Do NOT raise TxEnReq yet.  PhyTx_Buff is a true dual-clock FIFO
+                        -- (wr_clk=SysClk, rd_clk=i50MHz); its Empty flag needs ~3 i50MHz
+                        -- cycles after the write before it falls.  Wait for the
+                        -- synchronised Empty (PhyTxBuff_Empty_s) to fall, then pulse
+                        -- TxEnReq.  This guarantees TxEnAck in SMI_Proc can latch.
                         AutoTx_WordIdx      <= 0;
-                        AutoTx_WaitTimeout  <= 1000;  -- 1ms TX drain timeout
-                        AutoTx_State        <= AT_WaitTxDrain;
+                        AutoTx_WaitTimeout  <= 1000;  -- 1 ms safety timeout for fill
+                        AutoTx_State        <= AT_WaitTxFill;
                     else
                         AutoTx_WordIdx <= AutoTx_WordIdx + 1;
                     end if;
@@ -1453,7 +1472,8 @@ begin
                     end if;
                 else
                     AutoTx_TimedOut(AutoTx_Port) <= '1';
-                    AutoTx_Busy(AutoTx_Port)     <= '0';
+                    AutoTx_Busy(AutoTx_Port)     <= '0';  
+						  AutoTx_FifoRst_req           <= '1';
                     AutoTx_State                 <= AT_Idle;
                 end if;
 
@@ -1479,28 +1499,10 @@ begin
 				-- its ReadyStatus bit. If the DDR sequencer stalls and the timeout expires,
 				-- the same port is re-armed for a retry and AutoTx_TimedOut is flagged.
 				when AT_WaitDdrDrain =>
-					 if PhyRxBuff_Empty(AutoTx_Port) = '1' then
-						  -- DDR has consumed all FEB response data; release the port
-						  AutoTx_Busy(AutoTx_Port) <= '0';
-
-						  -- Find the next masked port after the current one (round-robin)
-						  have_port := false;
-						  for i in 0 to 7 loop
-								found_port := (AutoTx_Port + 1 + i) mod 8;
-								if MaskReg(found_port) = '1' then
-									 have_port := true;
-									 exit;
-								end if;
-						  end loop;
-
-						  -- Arm exactly one port so the sequential UBT handshake continues
-						  if have_port then
-								AutoTx_ReArm(found_port) <= '1';
-						  end if;
-
-						  AutoTx_State <= AT_Idle;
-
-					 elsif AutoTx_WaitTimeout > 0 then
+					if PhyRxBuff_Empty(AutoTx_Port) = '1' then
+							AutoTx_Busy(AutoTx_Port) <= '0';
+							AutoTx_State             <= AT_Idle;					 
+					elsif AutoTx_WaitTimeout > 0 then
 						  -- Countdown using the 1 us tick to bound the wait to ~10 ms
 						  if Counter1us = X"00" then
 								AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
@@ -1511,9 +1513,31 @@ begin
 						  -- and re-arm the same port so it will be retried next idle scan
 						  AutoTx_TimedOut(AutoTx_Port) <= '1';
 						  AutoTx_Busy(AutoTx_Port)     <= '0';
-						  AutoTx_ReArm(AutoTx_Port)    <= '1';
 						  AutoTx_State                 <= AT_Idle;
 					 end if;
+				
+            when AT_WaitTxFill =>
+                -- Self-timed CDC wait: hold here until the read-side (i50MHz) Empty
+                -- flag, double-synchronised into SysClk as PhyTxBuff_Empty_s, has
+                -- de-asserted.  Only then is it safe to pulse TxEnReq, because
+                -- SMI_Proc latches TxEnAck on (TxEnReq='1' and PhyTxBuff_Empty='0').
+                if PhyTxBuff_Empty_s = '0' then
+                    AutoTx_TxEnReqPulse <= '1';
+                    AutoTx_WaitTimeout  <= 1000;   -- 1 ms TX drain timeout
+                    AutoTx_State        <= AT_WaitTxDrain;
+                elsif AutoTx_WaitTimeout > 0 then
+                    if Counter1us = X"00" then
+                        AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+                    end if;
+                else
+                    -- Fill-side never went non-empty: FIFO/CDC is wedged.
+                    -- Flag the timeout and bail back to idle so the FSM does not
+                    -- stall this port forever.
+                    AutoTx_TimedOut(AutoTx_Port) <= '1';
+                    AutoTx_Busy(AutoTx_Port)     <= '0';  
+						  AutoTx_FifoRst_req           <= '1';   
+                    AutoTx_State                 <= AT_Idle;
+                end if;
 					 
         end case;
     end if;
@@ -1574,16 +1598,39 @@ variable rs_next : std_logic_vector(7 downto 0);
 	PowerOnReady_done <= '0';
         StartupHoldoff    <= (others => '0');
 	AutoTx_Claim_d <= (others => '0');
+	PhyRst_AutoDone <= '0';	 
 	AutoTx_TxEnReqHold <= '0';
-	PhyRst_AutoDone <= '0';
-	 
+	AutoTx_TimedOut_d  <= (others => '0');
+   for p in 0 to 7 loop
+    AutoTx_TimeoutCnt(p) <= (others => '0');
+   end loop;
+	
 elsif rising_edge (SysClk) then 
 
 
 -- register the claim so the clear arrives one cycle after the set
 AutoTx_Claim_d <= AutoTx_Claim;
 
+  -- Sticky timeout counters: rising-edge detect on AutoTx_TimedOut(p),
+  -- saturate at 0xFF, clearable by µC write of a one-hot mask.
+  AutoTx_TimedOut_d <= AutoTx_TimedOut;
+  for p in 0 to 7 loop
+    if AutoTx_TimeoutClr(p) = '1' then
+      AutoTx_TimeoutCnt(p) <= (others => '0');
+    elsif AutoTx_TimedOut(p) = '1' and AutoTx_TimedOut_d(p) = '0'
+          and AutoTx_TimeoutCnt(p) /= X"FF" then
+      AutoTx_TimeoutCnt(p) <= AutoTx_TimeoutCnt(p) + 1;
+    end if;
+  end loop;
 
+
+-- Drive TxEnReq: set on AutoTx pulse, hold until FIFO drains (SysClk-safe empty)
+    if AutoTx_TxEnReqPulse = '1' then
+        AutoTx_TxEnReqHold <= '1';
+    elsif TxEnReq = '1' then
+        AutoTx_TxEnReqHold <= '0';
+    end if;
+	 	 
 -- Snapshot current ReadyStatus into a working variable so all updates
 -- this clock cycle are applied atomically before writing back.
 rs_next := ReadyStatus;
@@ -1598,6 +1645,23 @@ for p in 0 to 7 loop
   phy_empty_d(p)(1) <= phy_empty_d(p)(0);  -- age the older sample
   phy_empty_d(p)(0) <= PhyRxBuff_Empty(p); -- capture the current sample
 end loop;
+
+-- Drain-edge detection ? fires one cycle after PhyRxBuff(p) transitions
+-- from non-empty to empty AND AutoTx is not actively managing the port.
+-- phy_empty_d(p)(1) = buffer state two cycles ago
+-- phy_empty_d(p)(0) = buffer state one cycle ago
+-- The two-cycle window aligns with AutoTx_Busy clearing in AutoTx_Proc
+-- (separate process ? one-cycle visibility delay in main).
+for p in 0 to 7 loop
+  if phy_empty_d(p)(1) = '0'       -- was non-empty two cycles ago
+     and phy_empty_d(p)(0) = '1'   -- became empty one cycle ago
+     and MaskReg(p) = '1'
+     and AutoTx_Busy(p) = '0'      -- AutoTx has released the port
+  then
+    rs_next(p) := '1';
+  end if;
+end loop;
+
 
 
 -- P5: Startup holdoff + PowerOnReady_done
@@ -1649,16 +1713,16 @@ end if;
 -- spurious re-arms during an in-flight claim by checking both the
 -- current-cycle (AutoTx_Claim) and previous-cycle (AutoTx_Claim_d)
 -- claim pulses, and the overall busy flag (AutoTx_Busy).
-for p in 0 to 7 loop
-  if CpldRst_sync = '1'
-     and PhyRxFilled(p) = '1'
-     and AutoTx_Busy(p) = '0'
-     and AutoTx_Claim(p) = '0'
-     and AutoTx_Claim_d(p) = '0'
-  then
-    rs_next(p) := '1';
-  end if;
-end loop;
+--for p in 0 to 7 loop
+--  if CpldRst_sync = '1'
+--     and PhyRxFilled(p) = '1'
+--     and AutoTx_Busy(p) = '0'
+--     and AutoTx_Claim(p) = '0'
+--     and AutoTx_Claim_d(p) = '0'
+--  then
+--    rs_next(p) := '1';
+--  end if;
+--end loop;
 
 
 -- P2: Clear ReadyStatus for any port that AutoTx_Proc has just claimed (one cycle
@@ -1672,6 +1736,14 @@ end if;
 
 if AutoTx_ReArm /= X"00" then
     rs_next := rs_next or AutoTx_ReArm;
+end if;
+
+
+if WRDL = 1 and uCA(11 downto 10) = GA
+   and uCA(9 downto 0) = AutoTxTimeoutClrAddr then
+  AutoTx_TimeoutClr <= uCD(7 downto 0);   -- one-hot mask of ports to clear
+else
+  AutoTx_TimeoutClr <= (others => '0');
 end if;
 
 
@@ -1702,6 +1774,7 @@ probe_UBT_in_progress  <= AutoTx_Busy;
 probe_handshake_queued <= AutoTx_Busy;
 probe_AutoTx_Port      <= std_logic_vector(to_unsigned(AutoTx_Port, 3));
 probe_PhyTxBuff_Empty  <= PhyTxBuff_Empty;
+probe_AutoTx_TimedOut  <= AutoTx_TimedOut;
 -- synthesis translate_on
 
 
@@ -1821,8 +1894,9 @@ end if;
 
 
 -- stretch pulse
-if WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = TxFifoResetAddr then
-  PhyTxFifoRst_stretch <= X"F";  -- hold for 16 cycles = 160ns > 3x i50MHz periods
+if (WRDL = 1 and uCA(11 downto 10) = GA and uCA(9 downto 0) = TxFifoResetAddr)
+   or AutoTx_FifoRst_req = '1' then
+  PhyTxFifoRst_stretch <= X"F";
 elsif PhyTxFifoRst_stretch /= 0 then
   PhyTxFifoRst_stretch <= PhyTxFifoRst_stretch - 1;
 end if;
@@ -2021,25 +2095,25 @@ end if;
 -- previous transmission when the pulse arrives, TxEnReq = '0' and TxEnAck = '0' will
 -- not both be true and the pulse would be silently dropped. The sticky hold latches
 -- the pulse and holds it until TxEnReq is successfully set, preventing missed TX enables.
-if AutoTx_TxEnReqPulse = '1' then
-  AutoTx_TxEnReqHold <= '1';
-elsif TxEnReq = '1' then
-  AutoTx_TxEnReqHold <= '0';  -- clear once TxEnReq has been accepted
-end if;
 
+
+
+
+-- TxEnReq: set when µC writes CSR bit-0=1, or AutoTx fires;
+-- clear only after SMI_Proc has acknowledged (TxEnAck='1')
 if TxEnReq = '0' and TxEnAck = '0' and (
-     (WRDL = 1 and (
-        (uCA(11 downto 10) = GA and uCA(9 downto 0) = PhyTxCSRAddr and uCD(0) = '1')
-        or (uCA(9 downto 0) = PhyTxCSRBroadCastAd and uCD(0) = '1')
+     ( WRDL = 1 and (
+         (uCA(11 downto 10) = GA and uCA(9 downto 0) = PhyTxCSRAddr   and uCD(0) = '1')
+       or (uCA(9 downto 0) = PhyTxCSRBroadCastAd                       and uCD(0) = '1')
      ))
-     or AutoTx_TxEnReqHold = '1'   -- FIX: use sticky hold, not raw pulse
+     or AutoTx_TxEnReqPulse = '1'
+     or AutoTx_TxEnReqHold  = '1'
    )
 then
-  TxEnReq <= '1';
+    TxEnReq <= '1';
 elsif TxEnReq = '1' and TxEnAck = '1' then
-  TxEnReq <= '0';
-else
-  TxEnReq <= TxEnReq;
+    TxEnReq <= '0';
+-- else: hold current value (implicit in clocked process)
 end if;
 
 -------------------------------- DDR Macro Interfaces -------------------------------
@@ -2770,7 +2844,15 @@ iCD <= "000000" & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En & "
 		 tx_overflow_cnt when OverflowCntAd,
 		 (15 downto 1 => '0') & PhyTxBuff_Empty when TxFifoRawEmptyAddr,
 		 X"00" & LastTxTarget  when LastTxTargetAddr,
-                 X"0011" when DebugVersion,							  
+                 X"0011" when DebugVersion,		
+		 X"00" & AutoTx_TimeoutCnt(0) when AutoTxTimeoutCntAd0,
+		 X"00" & AutoTx_TimeoutCnt(1) when AutoTxTimeoutCntAd1,
+		 X"00" & AutoTx_TimeoutCnt(2) when AutoTxTimeoutCntAd2,
+		 X"00" & AutoTx_TimeoutCnt(3) when AutoTxTimeoutCntAd3,
+       X"00" & AutoTx_TimeoutCnt(4) when AutoTxTimeoutCntAd4,
+		 X"00" & AutoTx_TimeoutCnt(5) when AutoTxTimeoutCntAd5,
+		 X"00" & AutoTx_TimeoutCnt(6) when AutoTxTimeoutCntAd6,
+		 X"00" & AutoTx_TimeoutCnt(7) when AutoTxTimeoutCntAd7,
 		 X"00" & ReadyStatus when ReadyStatusAddr,
 		 X"0000"              when ReadyClearAddr,   -- write-only, read returns 0
 		 X"0000"              when ReadyForceAddr,   -- write-only, read returns 0
