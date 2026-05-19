@@ -1501,6 +1501,7 @@ begin
 				when AT_WaitDdrDrain =>
 					if PhyRxBuff_Empty(AutoTx_Port) = '1' then
 							AutoTx_Busy(AutoTx_Port) <= '0';
+							AutoTx_ReArm(AutoTx_Port) <= '1';  -- ADD: re-arm for next cycle
 							AutoTx_State             <= AT_Idle;					 
 					elsif AutoTx_WaitTimeout > 0 then
 						  -- Countdown using the 1 us tick to bound the wait to ~10 ms
@@ -1652,15 +1653,15 @@ end loop;
 -- phy_empty_d(p)(0) = buffer state one cycle ago
 -- The two-cycle window aligns with AutoTx_Busy clearing in AutoTx_Proc
 -- (separate process ? one-cycle visibility delay in main).
-for p in 0 to 7 loop
-  if phy_empty_d(p)(1) = '0'       -- was non-empty two cycles ago
-     and phy_empty_d(p)(0) = '1'   -- became empty one cycle ago
-     and MaskReg(p) = '1'
-     and AutoTx_Busy(p) = '0'      -- AutoTx has released the port
-  then
-    rs_next(p) := '1';
-  end if;
-end loop;
+--for p in 0 to 7 loop
+--  if phy_empty_d(p)(1) = '0'       -- was non-empty two cycles ago
+--     and phy_empty_d(p)(0) = '1'   -- became empty one cycle ago
+--     and MaskReg(p) = '1'
+--     and AutoTx_Busy(p) = '0'      -- AutoTx has released the port
+--  then
+--    rs_next(p) := '1';
+--  end if;
+--end loop;
 
 
 
@@ -2845,6 +2846,8 @@ iCD <= "000000" & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En & "
 		 (15 downto 1 => '0') & PhyTxBuff_Empty when TxFifoRawEmptyAddr,
 		 X"00" & LastTxTarget  when LastTxTargetAddr,
                  X"0011" when DebugVersion,		
+		 "00" & SDWrtAd(29 downto 16)  when SDRamWrtPtrHiAd,   -- 0x002
+	    SDWrtAd(15 downto 0)          when SDRamWrtPtrLoAd,    -- 0x003
 		 X"00" & AutoTx_TimeoutCnt(0) when AutoTxTimeoutCntAd0,
 		 X"00" & AutoTx_TimeoutCnt(1) when AutoTxTimeoutCntAd1,
 		 X"00" & AutoTx_TimeoutCnt(2) when AutoTxTimeoutCntAd2,
