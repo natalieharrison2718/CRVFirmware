@@ -247,6 +247,9 @@ signal PhyTxBuff_Out,PhyTxBuff_Dat : std_logic_vector (15 downto 0);
 signal PhyTxBuff_Out_r : std_logic_vector(15 downto 0);
 signal TxNibbleCount : std_logic_vector (1 downto 0);
 
+-- FIX 4: 2-FF synchronizer for TxEnReq crossing SysClk ? i50MHz
+signal TxEnReq_sync : std_logic_vector(1 downto 0) := "00";
+
 -- Phy Rx Signals
 signal PhyRxBuff_wreq,PhyRxBuff_rdreq,PhyRxBuff_Empty,HitFlag,
 		 PhyRxBuff_Full,iCRS,PhyRxBuff_RdStat : std_logic_vector (7 downto 0);
@@ -915,6 +918,7 @@ SPIDiv <= "000"; SPIBitCnt <= (others => '0');
 SPI_State <= Idle; SPICS <= '1'; SPISClk <= '0'; 
 SPI_rdreq <= '0';
 
+
 elsif rising_edge (i50MHz) then 
 
 Clk25MHz <= not Clk25MHz; 
@@ -1002,7 +1006,7 @@ end if;
 
 -- TxEn is used to hold off sending Phy data until a block of data has been 
 -- loaded into the transmit FIFO
-if Clk25MHz = '0' and TxEnAck = '0' and TxEnReq = '1'
+if Clk25MHz = '0' and TxEnAck = '0' and TxEnReq_sync(1) = '1'
    and PhyTxBuff_Empty = '0' then TxEnAck <= '1';
 elsif PhyTxBuff_Empty = '1' and Clk25MHz = '0' and TxNibbleCount = "11" then TxEnAck <= '0';
 else TxEnAck <= TxEnAck;
@@ -1183,27 +1187,40 @@ begin
   end if;
 end process Rx_active_cdc;
 
+TxEnReq_cdc : process(i50MHz)
+begin
+    if rising_edge(i50MHz) then
+        if CpldRst_sync = '0' then
+            TxEnReq_sync <= "00";
+        else
+            TxEnReq_sync(0) <= TxEnReq;
+            TxEnReq_sync(1) <= TxEnReq_sync(0);
+        end if;
+    end if;
+end process TxEnReq_cdc;
+
+
 -- Detect when a PHY Rx FIFO transitions from empty to non-empty (FEB responded)
 -- Runs in SysClk domain; PhyRxBuff_Empty is in SysClk domain (rd_clk = SysClk)
 -- In RxFill_detect, uncomment the sticky latch:
-RxFill_detect : process(SysClk)
-begin
-  if rising_edge(SysClk) then
-    if CpldRst_sync = '0' then
-      PhyRxBuff_WasEmpty <= (others => '1');
-      PhyRxFilled        <= (others => '0');
-      --AutoTx_RxGot       <= (others => '0');
-    else
-      for i in 0 to 7 loop
-        PhyRxBuff_WasEmpty(i) <= PhyRxBuff_Empty(i);
-        PhyRxFilled(i) <= PhyRxBuff_WasEmpty(i) and (not PhyRxBuff_Empty(i));
-        --if PhyRxBuff_WasEmpty(i) = '1' and PhyRxBuff_Empty(i) = '0' then
-          --AutoTx_RxGot(i) <= '1';
-        --end if;
-      end loop;
-    end if;
-  end if;
-end process RxFill_detect;
+--RxFill_detect : process(SysClk)
+--begin
+--  if rising_edge(SysClk) then
+--    if CpldRst_sync = '0' then
+--      PhyRxBuff_WasEmpty <= (others => '1');
+--      PhyRxFilled        <= (others => '0');
+--      --AutoTx_RxGot       <= (others => '0');
+--    else
+--      for i in 0 to 7 loop
+--        PhyRxBuff_WasEmpty(i) <= PhyRxBuff_Empty(i);
+--        PhyRxFilled(i) <= PhyRxBuff_WasEmpty(i) and (not PhyRxBuff_Empty(i));
+--        --if PhyRxBuff_WasEmpty(i) = '1' and PhyRxBuff_Empty(i) = '0' then
+--          --AutoTx_RxGot(i) <= '1';
+--        --end if;
+--      end loop;
+--    end if;
+--  end if;
+--end process RxFill_detect;
 
 -- Stretch LastTxTarget_clr_req over 3 cycles in SysClk before crossing clock domain
 --LastTxTarget_clr_stretch : process(SysClk)
@@ -1478,10 +1495,11 @@ begin
                 end if;
 
             when AT_WaitRxFill =>
-                if RxFilled_sticky = '1' then
-                    RxFilled_sticky    <= '0';
-                    AutoTx_WaitTimeout <= 10000;  -- 10ms DDR drain timeout
-                    AutoTx_State       <= AT_WaitDdrDrain;
+                -- FEB responds via LVDS FM ? FEBRxBuff, NOT PhyRxBuff
+					if FEBRxBuff_Empty(AutoTx_Port) = '0' then   -- was: RxFilled_sticky
+						RxFilled_sticky    <= '0';
+						AutoTx_WaitTimeout <= 10000;
+						AutoTx_State       <= AT_WaitDdrDrain;
                 elsif AutoTx_WaitTimeout > 0 then
                     if Counter1us = X"00" then
                         AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
@@ -1489,6 +1507,7 @@ begin
                 else
                     AutoTx_TimedOut(AutoTx_Port) <= '1';
                     AutoTx_Busy(AutoTx_Port)     <= '0';
+						  --AutoTx_ReArm(AutoTx_Port)    <= '1';
                     AutoTx_State                 <= AT_Idle;
                 end if;
 
@@ -1499,7 +1518,7 @@ begin
 				-- its ReadyStatus bit. If the DDR sequencer stalls and the timeout expires,
 				-- the same port is re-armed for a retry and AutoTx_TimedOut is flagged.
 				when AT_WaitDdrDrain =>
-					if PhyRxBuff_Empty(AutoTx_Port) = '1' then
+					if FEBRxBuff_Empty(AutoTx_Port) = '1' then   -- DDR write sequencer has drained it
 							AutoTx_Busy(AutoTx_Port) <= '0';
 							AutoTx_ReArm(AutoTx_Port) <= '1';  -- ADD: re-arm for next cycle
 							AutoTx_State             <= AT_Idle;					 
@@ -1694,6 +1713,14 @@ if PowerOnReady_done = '0'
   PowerOnReady_done <= '1';
 end if;
 
+-- Auto-enable DDR and FM Rx after startup holdoff, exactly once
+if PowerOnReady_done = '0'
+   and StartupHoldoff = std_logic_vector(to_unsigned(2000000, 21))
+   and CpldRst_sync = '1' then
+  FMRxEn    <= '1';
+  DDRWrt_En <= '1';
+  DDRRd_en  <= '1';
+end if;
 
 -- Microcontroller force-set: the µC can directly assert any combination of
 -- ReadyStatus bits by writing a one-hot (or multi-hot) mask to ReadyForceAddr.
@@ -1845,7 +1872,7 @@ for i in 0 to 7 loop
                 DeadWindowCount(i) <= DeadWindowCount(i) + 1;
             end if;
             -- De-assert Rx_active after 4 consecutive dead windows
-            if DeadWindowCount(i) >= 15 or MaskReg(i) = '0' then
+            if DeadWindowCount(i) >= 4 or MaskReg(i) = '0' then
                 Rx_active(i) <= '0';
             end if;
         end if;
@@ -2846,8 +2873,6 @@ iCD <= "000000" & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En & "
 		 (15 downto 1 => '0') & PhyTxBuff_Empty when TxFifoRawEmptyAddr,
 		 X"00" & LastTxTarget  when LastTxTargetAddr,
                  X"0011" when DebugVersion,		
-		 "00" & SDWrtAd(29 downto 16)  when SDRamWrtPtrHiAd,   -- 0x002
-	    SDWrtAd(15 downto 0)          when SDRamWrtPtrLoAd,    -- 0x003
 		 X"00" & AutoTx_TimeoutCnt(0) when AutoTxTimeoutCntAd0,
 		 X"00" & AutoTx_TimeoutCnt(1) when AutoTxTimeoutCntAd1,
 		 X"00" & AutoTx_TimeoutCnt(2) when AutoTxTimeoutCntAd2,
@@ -2856,9 +2881,9 @@ iCD <= "000000" & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En & "
 		 X"00" & AutoTx_TimeoutCnt(5) when AutoTxTimeoutCntAd5,
 		 X"00" & AutoTx_TimeoutCnt(6) when AutoTxTimeoutCntAd6,
 		 X"00" & AutoTx_TimeoutCnt(7) when AutoTxTimeoutCntAd7,
+		 X"0000"              when ReadyClearAddr,   -- write-only, read returns 0                                
+       X"0000"              when ReadyForceAddr,   -- write-only, read returns 0
 		 X"00" & ReadyStatus when ReadyStatusAddr,
-		 X"0000"              when ReadyClearAddr,   -- write-only, read returns 0
-		 X"0000"              when ReadyForceAddr,   -- write-only, read returns 0
 		 X"0000" when others;
 
 

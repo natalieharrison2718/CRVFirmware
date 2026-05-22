@@ -142,6 +142,19 @@ constant SMIArrayMin : AddrPtr  := "01" & X"00";
 constant SMIArrayMax : AddrPtr  := "01" & X"7F";
 
 
+-- AutoTx timeout counters: one saturating 8-bit counter per port.
+-- Read to see how many times each port has timed out.
+-- Write a one-hot mask to AutoTxTimeoutClrAddr to clear any subset.
+constant AutoTxTimeoutCntAd0 : AddrPtr := "00" & X"B0";
+constant AutoTxTimeoutCntAd1 : AddrPtr := "00" & X"B1";
+constant AutoTxTimeoutCntAd2 : AddrPtr := "00" & X"B2";
+constant AutoTxTimeoutCntAd3 : AddrPtr := "00" & X"B3";
+constant AutoTxTimeoutCntAd4 : AddrPtr := "00" & X"B4";
+constant AutoTxTimeoutCntAd5 : AddrPtr := "00" & X"B5";
+constant AutoTxTimeoutCntAd6 : AddrPtr := "00" & X"B6";
+constant AutoTxTimeoutCntAd7 : AddrPtr := "00" & X"B7";
+constant AutoTxTimeoutClrAddr : AddrPtr := "00" & X"B8";
+
 constant AutoTxKickAddr     : std_logic_vector(9 downto 0) := "00" & X"4D";  -- 0x04D
 
   -- TX FIFO control/debug:
