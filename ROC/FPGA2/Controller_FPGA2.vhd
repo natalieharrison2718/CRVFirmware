@@ -1495,8 +1495,8 @@ begin
                 end if;
 
             when AT_WaitRxFill =>
-                -- FEB responds via LVDS FM ? FEBRxBuff, NOT PhyRxBuff
-					if FEBRxBuff_Empty(AutoTx_Port) = '0' then   -- was: RxFilled_sticky
+                -- FEB responds via LVDS FM ? 
+					if PhyRxBuff_Empty(AutoTx_Port) = '0' then   -- was: RxFilled_sticky
 						RxFilled_sticky    <= '0';
 						AutoTx_WaitTimeout <= 10000;
 						AutoTx_State       <= AT_WaitDdrDrain;
@@ -1518,7 +1518,7 @@ begin
 				-- its ReadyStatus bit. If the DDR sequencer stalls and the timeout expires,
 				-- the same port is re-armed for a retry and AutoTx_TimedOut is flagged.
 				when AT_WaitDdrDrain =>
-					if FEBRxBuff_Empty(AutoTx_Port) = '1' then   -- DDR write sequencer has drained it
+					if PhyRxBuff_Empty(AutoTx_Port) = '1' then   -- DDR write sequencer has drained it
 							AutoTx_Busy(AutoTx_Port) <= '0';
 							AutoTx_ReArm(AutoTx_Port) <= '1';  -- ADD: re-arm for next cycle
 							AutoTx_State             <= AT_Idle;					 
