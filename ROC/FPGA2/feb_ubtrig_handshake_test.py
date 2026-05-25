@@ -227,6 +227,11 @@ def preflight(roc: ROC, port: int) -> List[str]:
     else:
         print(f"  {OK}  MaskReg = 0x{mk:02X}  (port {port} enabled)")
 
+
+
+
+
+        
     act = (roc.read(R.FEBFMActiveAD) or 0) & 0xFF
     if not (act & (1 << port)):
         warnings.append(f"FM link inactive on port {port} (FEBFMActiveAD=0x{act:02X}). "
@@ -234,6 +239,14 @@ def preflight(roc: ROC, port: int) -> List[str]:
     else:
         print(f"  {OK}  FM link active on port {port}  (FEBFMActiveAD=0x{act:02X})")
 
+
+    if not (act & (1 << port)):
+    warnings.append(
+        f"FATAL: Rx_active[{port}]=0 (FEBFMActiveAD=0x{act:02X}). "
+        f"DDR write sequencer will abort at CheckActive0 even if PhyRxBuff fills. "
+        f"Check FM LVDS cable, FMRxEn=1 in CSR, and MaskReg[{port}]=1."
+    )
+    
     cnt  = (roc.read(R.PhyTxCntAddr) or 0) & 0x7FF
     raw  = (roc.read(R.TxFifoRawEmptyAddr) or 0) & 1
     tcsr = (roc.read(R.PhyTxCSRAddr) or 0)

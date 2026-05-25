@@ -673,45 +673,47 @@ package body Proj_Defs is
     return w;
   end function;
   
---  function ubt_ascii_word(idx : integer; d : std_logic) return std_logic_vector is
---  variable w   : std_logic_vector(15 downto 0) := (others => '0');
---  variable dch : std_logic_vector(7 downto 0);
---begin
---  if d = '1' then
---    dch := ASC_1;
---  else
---    dch := ASC_0;
---  end if;
---
---  case idx is
---    when 0 => w := ascii_pair(ASC_U, ASC_B);     -- "UB"
---    when 1 => w := ascii_pair(ASC_T, ASC_SP);    -- "T "
---    when 2 => w := ascii_pair(dch,  ASC_CR);     -- "<d><CR>"
---    when 3 => w := ascii_pair(ASC_LF, ASC_NUL);  -- "<LF><NUL>"
---    when others => w := (others => '0');
---  end case;
---  return w;
---end function;
-
-
---"UBTRIG\r\n" = 8 bytes = 4 x 16-bit words
--- ascii_pair(lo,hi): lo is first byte on wire (bits [7:0]
--- Word 0: U B -> 0x4255
--- Word 1: T R -> 0x5254
--- Word 2: I G -> 0x4749
--- Word 3: CR LF -> 0x0A0D
-function ubt_ascii_word(idx : integer; d : std_logic) return std_logic_vector is
+  function ubt_ascii_word(idx : integer; d : std_logic) return std_logic_vector is
   variable w   : std_logic_vector(15 downto 0) := (others => '0');
+  --variable dch : std_logic_vector(7 downto 0);
 begin
+  --if d = '1' then
+   -- dch := ASC_1;
+  --else
+   -- dch := ASC_0;
+  --end if;
 
   case idx is
     when 0 => w := ascii_pair(ASC_U, ASC_B);     -- "UB"
-    when 1 => w := ascii_pair(ASC_T, ASC_R);    -- "TR"
-    when 2 => w := ascii_pair(ASC_I,  ASC_G);     -- "IG"
-    when 3 => w := ascii_pair(ASC_CR, ASC_LF);  -- "\r\n"
+	 when 1 => w := ascii_pair(ASC_T, ASC_SP);    -- "T "
+    --when 1 => w := ascii_pair(ASC_T, ASC_SP);    -- "T "
+    --when 2 => w := ascii_pair(dch,  ASC_CR);     -- "<d><CR>"
+	 when 3 => w := ascii_pair(ASC_LF, ASC_NUL);  -- "<LF><NUL>"    
+	 --when 3 => w := ascii_pair(ASC_LF, ASC_NUL);  -- "<LF><NUL>"
     when others => w := (others => '0');
   end case;
   return w;
 end function;
+
+
+----"UBTRIG\r\n" = 8 bytes = 4 x 16-bit words
+---- ascii_pair(lo,hi): lo is first byte on wire (bits [7:0]
+---- Word 0: U B -> 0x4255
+---- Word 1: T R -> 0x5254
+---- Word 2: I G -> 0x4749
+---- Word 3: CR LF -> 0x0A0D
+--function ubt_ascii_word(idx : integer; d : std_logic) return std_logic_vector is
+--  variable w   : std_logic_vector(15 downto 0) := (others => '0');
+--begin
+--
+--  case idx is
+--    when 0 => w := ascii_pair(ASC_U, ASC_B);     -- "UB"
+--    when 1 => w := ascii_pair(ASC_T, ASC_R);    -- "TR"
+--    when 2 => w := ascii_pair(ASC_I,  ASC_G);     -- "IG"
+--    when 3 => w := ascii_pair(ASC_CR, ASC_LF);  -- "\r\n"
+--    when others => w := (others => '0');
+--  end case;
+--  return w;
+--end function;
   
 end package body Proj_Defs;

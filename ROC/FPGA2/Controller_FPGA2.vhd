@@ -2606,23 +2606,42 @@ for i in 0 to 7 loop
 
 -- Sequencer read to microcontroller reads of the PhyRx FIFOs  
 if (RDDL = 2 and AddrReg(11 downto 10) = GA and AddrReg(9 downto 0) = PhyRxRdAddr(i))
-or (PortNo = i and 
-  ((DDR_Write_Seq = CheckActive0 and Rx_active(PortNo) = '1') 
-or (DDR_Write_Seq = CheckActive1 and Rx_active(PortNo) = '1' and HitFlag(PortNo) = '1')
-  or DDR_Write_Seq = Rd_WdCount or DDR_Write_Seq = Rd_uBunchHi 
-  or DDR_Write_Seq = Rd_uBunchLo 
-  or (DDR_Write_Seq = WrtDDR and PortWdCounter(PortNo) > 1 )))
+--or (PortNo = i and 
+--  ((DDR_Write_Seq = CheckActive0 and Rx_active(PortNo) = '1') 
+--or (DDR_Write_Seq = CheckActive1 and Rx_active(PortNo) = '1' and HitFlag(PortNo) = '1')
+--  or DDR_Write_Seq = Rd_WdCount or DDR_Write_Seq = Rd_uBunchHi 
+--  or DDR_Write_Seq = Rd_uBunchLo 
+--  or (DDR_Write_Seq = WrtDDR and PortWdCounter(PortNo) > 1 )))
+-- comment this code
+or (PortNo = i and
+  ((DDR_Write_Seq = CheckActive0
+        and (Rx_active(PortNo) = '1' or PhyRxBuff_Empty(PortNo) = '0'))
+or (DDR_Write_Seq = CheckActive1
+        and (Rx_active(PortNo) = '1' or PhyRxBuff_Empty(PortNo) = '0')
+        and HitFlag(PortNo) = '1')
+   or DDR_Write_Seq = Rd_WdCount
+   or DDR_Write_Seq = Rd_uBunchHi
+   or DDR_Write_Seq = Rd_uBunchLo
+   or (DDR_Write_Seq = WrtDDR and PortWdCounter(PortNo) > 1)))
 then PhyRxBuff_rdreq(i) <= '1';
 else PhyRxBuff_rdreq(i) <= '0';
 end if;
 
--- Status indicating a port is active and a complete event is available for readout
- if Rx_active(i) = '1' and PhyRxBuff_Empty(i) = '0' and PhyRxBuff_RdCnt(i) >= PhyRxBuff_Out(i)
+---- Status indicating a port is active and a complete event is available for readout
+-- if Rx_active(i) = '1' and PhyRxBuff_Empty(i) = '0' and PhyRxBuff_RdCnt(i) >= PhyRxBuff_Out(i)
+--  then PhyRxBuff_RdStat(i) <= '1';
+--  else PhyRxBuff_RdStat(i) <= '0';
+-- end if;
+ --  AFTER 
+-- MaskReg gate is kept so that masked ports are never processed.
+-- Rx_active gate is removed: a non-empty, fully-arrived buffer is
+-- "ready" regardless of FM-link activity.
+if MaskReg(i) = '1'
+   and PhyRxBuff_Empty(i) = '0'
+   and PhyRxBuff_RdCnt(i) >= PhyRxBuff_Out(i)
   then PhyRxBuff_RdStat(i) <= '1';
   else PhyRxBuff_RdStat(i) <= '0';
- end if;
- 
- 
+end if;
 
 end loop;
 
@@ -2661,9 +2680,16 @@ end loop;
  end if;
 
 -- Signal to indicate if all active ports have an event ready
-  if Rx_active = PhyRxBuff_RdStat then EventRdy <= '1'; 
-  else EventRdy <= '0'; 
-  end if; 
+--  if Rx_active = PhyRxBuff_RdStat then EventRdy <= '1'; 
+--  else EventRdy <= '0'; 
+--  end if; 
+-- "At least one masked port has a full event waiting in PhyRxBuff."
+-- PhyRxBuff_RdStat is now non-zero only when real data is present
+-- (Fix 1), so this can never be vacuously true.
+if PhyRxBuff_RdStat /= X"00" then EventRdy <= '1';
+else EventRdy <= '0';
+end if;
+
 
 -- Use this variable to cycle through the input ports during DDR writes
 if PortNo /= 7 and (DDR_Write_Seq = IncrPort0 or DDR_Write_Seq = IncrPort1)
@@ -2707,15 +2733,29 @@ Case DDR_Write_Seq is
 		if SDwr_empty = '1' then DDR_Write_Seq <= Idle;
 		else DDR_Write_Seq <= WtCmdMtpy;
 		end if;
-	When IncrPort0 => DDR_Write_Seq <= CheckActive0; DDRWrtStat <= X"1"; Debug(10 downto 7) <= X"1";
-	When CheckActive0 => DDRWrtStat <= X"2"; Debug(10 downto 7) <= X"2"; 
-			if Rx_active = 0 then DDR_Write_Seq <= Idle;
-			elsif Rx_active(PortNo) = '1'
-			 then DDR_Write_Seq <= Rd_WdCount;
-			elsif Rx_active(PortNo) = '0' and PortNo /= 7 
-			 then DDR_Write_Seq <= IncrPort0;
-			else DDR_Write_Seq <= Write_Wd_Count;
-			end if;
+--	When IncrPort0 => DDR_Write_Seq <= CheckActive0; DDRWrtStat <= X"1"; Debug(10 downto 7) <= X"1";
+--	When CheckActive0 => DDRWrtStat <= X"2"; Debug(10 downto 7) <= X"2"; 
+--			if Rx_active = 0 then DDR_Write_Seq <= Idle;
+--			elsif Rx_active(PortNo) = '1'
+--			 then DDR_Write_Seq <= Rd_WdCount;
+--			elsif Rx_active(PortNo) = '0' and PortNo /= 7 
+--			 then DDR_Write_Seq <= IncrPort0;
+--			else DDR_Write_Seq <= Write_Wd_Count;
+--			end if;
+	-- comment this code
+	When CheckActive0 =>
+    -- Only abort to Idle when BOTH FM links AND all Rx FIFOs are idle.
+    if Rx_active = 0 and PhyRxBuff_Empty = X"FF" then
+        DDR_Write_Seq <= Idle;
+    -- Process this port if FM link is active OR its Rx FIFO has data.
+    elsif Rx_active(PortNo) = '1' or PhyRxBuff_Empty(PortNo) = '0' then
+        DDR_Write_Seq <= Rd_WdCount;
+    -- Nothing on this port; try the next one.
+    elsif PortNo /= 7 then
+        DDR_Write_Seq <= IncrPort0;
+    else
+        DDR_Write_Seq <= Write_Wd_Count;
+    end if;
 	When Rd_WdCount => DDR_Write_Seq <= Rd_uBunchHi;  DDRWrtStat <= X"3"; Debug(10 downto 7) <= X"3";
 	When Rd_uBunchHi => DDR_Write_Seq <= Rd_uBunchLo; DDRWrtStat <= X"4"; Debug(10 downto 7) <= X"4"; 
 	When Rd_uBunchLo => DDR_Write_Seq <= Rd_Stat; DDRWrtStat <= X"5"; Debug(10 downto 7) <= X"5";
