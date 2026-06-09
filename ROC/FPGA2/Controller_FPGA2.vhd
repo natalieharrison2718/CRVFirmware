@@ -126,9 +126,6 @@ signal AddrReg : std_logic_vector(11 downto 0);
 -- TClk begin spill, end spill events
 -- signal TrigCtrlReg : std_logic_vector(1 downto 0);
 
---signal uCD_wr_stage : std_logic_vector(7 downto 0) := (others => '0');
---signal uCA_wr_stage : std_logic_vector(11 downto 0) := (others => '0');
-
 -- Timing interval counters
 signal Counter1us : std_logic_vector (7 downto 0);
 signal Counter10us : std_logic_vector (9 downto 0);
@@ -136,9 +133,6 @@ signal Counter1ms : std_logic_vector (16 downto 0);
 signal Counter1s : std_logic_vector (27 downto 0);
 
 signal Seq_Busy : std_logic;
--- signal FlashEn,TempEn : std_logic; 
-
--- signal StatReg : std_logic_vector (3 downto 0);
 
 -- Count the number of triggers
 -- Make a test counter that increments with each read
@@ -147,12 +141,9 @@ signal TestCount : std_logic_vector (31 downto 0);
 signal UpTimeCount,UpTimeStage : std_logic_vector (31 downto 0);
 
 -- Spill counter, event word cout, spill word count
-
 signal GPIDL,TrigDL,iWrtDL  : Array_2x2;
--- signal GateReq : std_logic_vector (1 downto 0);
 -- Test Pulse generator signals
 signal PhaseAcc : std_logic_vector (31 downto 0);
---signal Freq_Reg : std_logic_vector (31 downto 0);
 
 signal PhyTxFifoRst_stretch : std_logic_vector(3 downto 0) := (others => '0');
 
@@ -302,8 +293,8 @@ signal FEBRxIn : Array_InRec_x8;
 signal RxDl : Array_8x2;
 signal TransitionCount : Array_8x4;
 signal Rx_active : std_logic_vector(7 downto 0);
-signal Rx_active_rxclk    : std_logic_vector(7 downto 0);  -- ADD: RxFMClk-domain copy
-signal Rx_active_sync     : Array_8x2;                      -- ADD: 2-FF synchroniser
+signal Rx_active_rxclk    : std_logic_vector(7 downto 0);  -- RxFMClk-domain copy
+signal Rx_active_sync     : Array_8x2;                      -- 2-FF synchroniser
 signal LinkStatEn : std_logic;
 signal LinkTxFullCnt : std_logic_vector(7 downto 0);
 
@@ -314,7 +305,7 @@ signal LinkFIFO_Dat : std_logic_vector(17 downto 0);
 signal BitClk,WdClk,PllLock,LockOut,Link_Stat_Req : std_logic;
 signal LinkTxFull,LinkTxEmpty,LinkTxWrReq,LinkTxRDReq,TxValid,LinkTxTraceWrReq : std_logic;
 
--- Added 11/24: PHY to FEB signal for prefetch filling
+-- PHY to FEB signal for prefetch filling
 -- Ready notification / edge-detect signals (per PHY port)
 signal phy_empty_d    : Array_8x2 := (others => (others => '1'));  -- delayed copy for edge detect
 signal ReadyStatus    : std_logic_vector(7 downto 0) := (others => '0');  -- sticky ready bits
@@ -350,7 +341,7 @@ constant MAX_TX_WORDS : std_logic_vector(15 downto 0) := X"1ffc";-- X"2000";
 -- constant UB_MISMATCH_STATUS_BIT : std_logic_vector(7 downto 0) := X"10";
 constant OVERFLOW_STATUS_BIT : std_logic_vector(15 downto 0) := X"1000"; -- bit 12
 
--- added 11/24: Auto-TX FPGA automatic READY Packet sender, 2 words for now? Can change later. 
+-- Auto-TX FPGA automatic READY Packet sender 
 signal PhyTxDin_FPGA      : std_logic_vector(15 downto 0) := (others => '0'); -- FPGA-produced write data
 signal PhyTxDin_mux       : std_logic_vector(15 downto 0) := (others => '0'); -- selected DIN to PhyTx_Buff (uC or FPGA)
 signal PhyTxBuff_wr_en_mux: std_logic := '0';                                  -- combined wr_en into PhyTx_Buff
@@ -362,23 +353,14 @@ signal AutoTx_WordIdx     : integer range 0 to 15 := 0; -- supports up to 16-wor
 signal AutoTx_Claim : std_logic_vector(7 downto 0) := (others => '0'); -- one-hot claim for main to clear ReadyStatus
 signal AutoTx_Claim_d : std_logic_vector(7 downto 0) := (others => '0');  --  delayed claim
 signal AutoTx_ReArm : std_logic_vector(7 downto 0) := (others => '0');
--- Set by AutoTx_Proc (state "110") to re-arm exactly ONE port after a
--- complete UBT?reply?DDR-drain cycle. Read by main rs_next logic.
 signal AutoTx_Active      : std_logic := '0';  
 signal AutoTx_Busy : std_logic_vector(7 downto 0) := (others => '0');
 signal AutoTx_Target       : std_logic_vector(7 downto 0) := (others => '0'); -- one-hot chosen port
---signal AutoTx_BroadcastMode: std_logic := '0'; -- if '1', ignore AutoTx_Target and broadcast to TxEn bitssignal AutoTx_Cooldown : integer range 0 to 1000000 := 0;  -- ~10ms at 100MHz
---signal AutoTx_Cooldown : integer range 0 to 1000000 := 0;  -- ~10ms at 100MHz
 signal AutoTx_TimedOut : std_logic_vector(7 downto 0) := (others => '0');
--- Sticky 8-bit saturating counters: incremented in `main` whenever
--- AutoTx_TimedOut(p) rises (one per port).  Cleared by the µC writing a
--- one-hot mask to AutoTxTimeoutClrAddr.  Read back via AutoTxTimeoutCntAd[p].
 type TimeoutCnt_t is array(0 to 7) of std_logic_vector(7 downto 0);
 signal AutoTx_TimeoutCnt   : TimeoutCnt_t := (others => (others => '0'));
 signal AutoTx_TimedOut_d   : std_logic_vector(7 downto 0) := (others => '0');
 signal AutoTx_TimeoutClr   : std_logic_vector(7 downto 0) := (others => '0');
---signal AutoTxKickMask  : std_logic_vector(7 downto 0) := (others => '0');
---signal AutoTxKickPulse : std_logic := '0';
 signal AutoTx_TxEnReqPulse : std_logic := '0';
 signal AutoTx_TxEnReqHold : std_logic := '0';  -- sticky, driven only from main
 -- CDC settling delay: counts down in SysClk domain after the last UBT word is
@@ -391,30 +373,23 @@ signal AutoTx_TxEnReqHold : std_logic := '0';  -- sticky, driven only from main
 
 -- Sequential UBT handshake: track which port we are waiting on
 signal AutoTx_WaitPort : integer range 0 to 7 := 0;
---signal AutoTx_WaitMask : std_logic_vector(7 downto 0) := (others => '0');
 signal AutoTx_RxGot : std_logic_vector(7 downto 0) := (others => '0');  -- sticky "reply arrived"
 signal PhyRxBuff_WasEmpty : std_logic_vector(7 downto 0) := (others => '1'); -- previous cycle empty
 signal PhyRxFilled : std_logic_vector(7 downto 0) := (others => '0'); -- rising edge: empty->non empty
 signal AutoTx_WaitTimeout : integer range 0 to 100000 := 0; -- ~100 ms at 100 MHz
--- FIX 1: Startup holdoff counter. Delays the PowerOnReady_done pulse until
+-- Startup holdoff counter. Delays the PowerOnReady_done pulse until
 -- the reset synchroniser, FIFOs, and AutoTx FSM have all fully settled.
 -- 256 SysClk cycles @ 100 MHz = 2.56 us, well after CpldRst_sync stabilises.
 signal StartupHoldoff : std_logic_vector(20 downto 0) := (others => '0');
 
 signal PhyRst_AutoDone : std_logic := '0';  -- prevents auto-init firing twice
 
---signal KickDataReg : std_logic_vector(7 downto 0) := (others => '0');
---signal KickAddrHit : std_logic := '0';
---signal SeenData : std_logic_vector(7 downto 0) := (others => '0');
 signal PhyTxFifoRst_pulse : std_logic := '0';  -- one-shot reset for PhyTx FIFO-- Sticky latch: holds CurrentTarget value from the most recent PhyTxBuff_rdreq pulse.
 -- Cleared by microcontroller write to LastTxTargetAddr.
 signal LastTxTarget : std_logic_vector(7 downto 0) := (others => '0');
 -- Add a synchronisation bridge for the µC LastTxTarget clear strobe
--- (SysClk ? i50MHz):
 signal LastTxTarget_clr_req  : std_logic := '0';  -- set by main (SysClk)
 signal LastTxTarget_clr_sync : std_logic_vector(2 downto 0) := "000"; -- sync in i50MHz
---signal LastTxTarget_clr_stretch_local : std_logic_vector(2 downto 0) := "000";
--- signal port_full : std_logic_vector(7 downto 0); -- hook this to your per-port FIFO-full flagssignal debug_ReadyStatus     : std_logic_vector(7 downto 0);
 signal LastTxTarget_clr_stretch : std_logic_vector(4 downto 0) := (others => '0');
 signal RoundRobin_Last : integer range 0 to 7 := 0;
 
@@ -432,7 +407,7 @@ signal nibble_hold_cnt : integer range 0 to 4 := 0;
 
 constant READY_WORD_COUNT : integer := 2; -- number of words in the READY packet (update if you change helper)
 
--- added 11/24
+
 -- helper: returns true if all bits of the std_logic_vector are '0'
 function is_all_zero(vec : std_logic_vector) return boolean is
 begin
@@ -450,39 +425,236 @@ begin CpldRst_ibuf_inst : IBUF
     O => CpldRst_ibuf
   );
 
+
+-- =============================================================================
+-- Process: rst_sync_proc
+-- Purpose: Reset Synchroniser (2-stage pipeline)
+--
+-- Problem being solved:
+--   CpldRst_ibuf is an ASYNCHRONOUS external signal. If it de-asserts (goes
+--   high) at the same moment as a rising edge of SysClk, the internal flip-flops
+--   that depend on CpldRst_sync could enter a metastable state, causing
+--   unpredictable behaviour or lock-up. This synchroniser prevents that.
+--
+-- How it works:
+--   ASSERT  (CpldRst_ibuf = '0'): Reset is applied IMMEDIATELY (asynchronously).
+--           CpldRst_r is forced to "00" regardless of the clock.
+--           This ensures the design goes into reset without delay.
+--
+--   DE-ASSERT (CpldRst_ibuf = '1'): The value '1' is shifted through a
+--           2-stage flip-flop chain on consecutive rising edges of SysClk.
+--           Only after TWO clock cycles does CpldRst_sync (= CpldRst_r(1))
+--           see '1'. This gives any metastable event on the first FF (stage 0)
+--           time to resolve before it is sampled by the second FF (stage 1).
+--
+-- Timing diagram:
+--
+--   CpldRst_ibuf  : _____|??????????????????????
+--   SysClk        :  _|?|_|?|_|?|_|?|_|?|_|?|_
+--   CpldRst_r(0)  : 0   0   0  [1]  1   1   1      <- latches '1' first
+--   CpldRst_r(1)  : 0   0   0   0  [1]  1   1      <- CpldRst_sync goes high
+--                                                       one cycle later
+--
+-- Downstream usage:
+--   CpldRst_sync <= CpldRst_r(1);   -- used as the system-wide synchronous reset
+--   ResetHi      <= not CpldRst_sync; -- active-high version for FIFO rst ports
+-- =============================================================================
+
 rst_sync_proc : process (SysClk, CpldRst_ibuf)
 begin
+
+  -- ASYNCHRONOUS reset branch:
+  -- Fires immediately when the board-level reset pin goes low,
+  -- regardless of where SysClk is in its cycle.
+  -- Clears both pipeline stages so CpldRst_sync is driven low instantly.
   if CpldRst_ibuf = '0' then
-    CpldRst_r <= "00";
+    CpldRst_r <= "00";               -- both stages ? '0'; system is in reset
+
+  -- SYNCHRONOUS de-assertion branch:
+  -- Only executed on the rising edge of the 100 MHz system clock.
   elsif rising_edge(SysClk) then
+
+    -- Stage 0: inject '1' into the pipeline.
+    -- This FF may go metastable if CpldRst_ibuf de-asserts near the clock edge,
+    -- but the following stage gives it a full clock period to resolve.
     CpldRst_r(0) <= '1';
+
+    -- Stage 1: sample the (now resolved) output of stage 0.
+    -- After this assignment CpldRst_r(1) ? aliased as CpldRst_sync ? is safe
+    -- to use anywhere in the SysClk domain.
     CpldRst_r(1) <= CpldRst_r(0);
+
   end if;
 end process rst_sync_proc;
 
--- Add synchronizer process (top level, outside main):
+-- =============================================================================
+-- Process : PhyTxEmpty_sync_proc
+-- Purpose : 2-stage Clock-Domain Crossing (CDC) synchroniser
+--           Safe transfer of PhyTxBuff_Empty from the i50MHz (read-clock)
+--           domain into the SysClk (100 MHz write/logic) domain.
+--
+-- Why this is needed:
+--   PhyTx_Buff is a true dual-clock FIFO:
+--       wr_clk => SysClk  (100 MHz)   -- written by AutoTx FSM / µC
+--       rd_clk => i50MHz  (50 MHz)    -- drained by SMI_Proc (PHY Tx path)
+--
+--   The FIFO's 'empty' flag is generated and registered on the READ side,
+--   meaning PhyTxBuff_Empty lives in the i50MHz domain.
+--   Reading it directly inside a SysClk process would violate CDC rules
+--   and risk metastability, causing the AutoTx FSM to misread the flag
+--   and either send a premature TxEnReq or stall indefinitely.
+--
+-- Synchroniser architecture (3-register chain):
+--
+--   i50MHz domain          SysClk domain
+--   ?????????????          ?????????????????????????????????????????????
+--   PhyTxBuff_Empty ??? [FF0] ??? [FF1] ??? [FF2] ??? PhyTxBuff_Empty_s
+--                    _sync(0)  _sync(1)        (registered alias)
+--
+--   FF0 (_sync(0)) : First capture register. May go metastable if the
+--                    i50MHz signal changes near a SysClk rising edge,
+--                    but is given a full SysClk cycle to resolve before
+--                    being sampled by FF1.
+--
+--   FF1 (_sync(1)) : Second capture register. Samples the (now resolved)
+--                    output of FF0. This is the standard 2-FF metastability
+--                    barrier ? sufficient for most FPGA process corners.
+--
+--   FF2 (_Empty_s) : Clean registered copy of the synchronised flag.
+--                    Decouples the synchroniser output from the fan-out
+--                    load of downstream logic (AutoTx FSM, TxEnReq path).
+--                    Also provides one extra cycle of margin for any
+--                    corner-case metastability that survived FF1.
+--
+-- Reset behaviour:
+--   On CpldRst_sync = '0' all three registers are preset to '1'.
+--   '1' = FIFO is empty ? the safe conservative default.
+--   This prevents AutoTx_Proc from asserting TxEnReq before the FIFO
+--   and PHY are fully initialised after a reset event.
+--
+-- Timing example (100 MHz SysClk, 50 MHz i50MHz):
+--
+--   i50MHz domain   PhyTxBuff_Empty : ??????????|_____________
+--   SysClk          _sync(0)        : ?????????????|___________  (1 cycle latency)
+--   SysClk          _sync(1)        : ???????????????|_________  (2 cycle latency)
+--   SysClk          _Empty_s        : ?????????????????|_______  (3 cycle latency)
+--
+--   Total worst-case latency = 3 SysClk cycles = 30 ns @ 100 MHz
+--   This is acceptable: AutoTx only needs to know the FIFO went non-empty
+--   before it pulses TxEnReq, not on a cycle-exact basis.
+--
+-- Downstream consumer:
+--   PhyTxBuff_Empty_s is read exclusively in AutoTx_Proc (SysClk domain)
+--   to gate the AT_WaitTxFill ? AT_WaitTxDrain state transition.
+-- =============================================================================
+
 PhyTxEmpty_sync_proc : process(SysClk)
 begin
   if rising_edge(SysClk) then
+
+    -- Synchronous reset: preset all stages to '1' (safe "empty" default)
     if CpldRst_sync = '0' then
-      PhyTxBuff_Empty_sync <= "11";
-      PhyTxBuff_Empty_s    <= '1';
+      PhyTxBuff_Empty_sync <= "11";   -- both CDC stages ? empty
+      PhyTxBuff_Empty_s    <= '1';    -- clean output    ? empty
+
     else
+
+      -- Stage 0: capture PhyTxBuff_Empty from the i50MHz domain.
+      -- This FF may briefly enter metastability but resolves within one
+      -- SysClk period (10 ns), well inside Xilinx 7-series MTBF targets.
       PhyTxBuff_Empty_sync(0) <= PhyTxBuff_Empty;
+
+      -- Stage 1: sample the resolved output of Stage 0.
+      -- After this register the signal is fully safe to use in SysClk logic.
       PhyTxBuff_Empty_sync(1) <= PhyTxBuff_Empty_sync(0);
+
+      -- Stage 2: registered alias for clean fan-out to downstream logic.
+      -- AutoTx_Proc reads only PhyTxBuff_Empty_s (never _sync directly).
       PhyTxBuff_Empty_s       <= PhyTxBuff_Empty_sync(1);
+
     end if;
   end if;
 end process;
 
+--=============================================================================
+-- Process : PhyPDn_sync_proc
+-- Purpose : 2-stage Clock-Domain Crossing (CDC) synchroniser
+--           Safe transfer of PhyPDn from the SysClk (100 MHz) domain into
+--           the i50MHz (50 MHz) domain.
+--
+-- Why this is needed:
+--   PhyPDn (PHY Power-Down control) is driven by the 'main' process which
+--   runs on SysClk (100 MHz). The SMI_Proc and phy_out_gating processes run
+--   on i50MHz (50 MHz). Reading PhyPDn directly inside an i50MHz process
+--   would violate CDC rules and risk metastability on the receiving FFs.
+--
+-- Direction of crossing (note: opposite to PhyTxEmpty_sync_proc):
+--
+--   SysClk domain          i50MHz domain
+--   ?????????????          ?????????????????????????????
+--   PhyPDn        ??? [FF0] ??? [FF1] ??? PhyPDn_sync(1)
+--                   _sync(0)  _sync(1)
+--                             (safe to use in i50MHz logic)
+--
+--   FF0 (_sync(0)) : First capture register. Samples PhyPDn on each rising
+--                    edge of i50MHz. May go metastable if PhyPDn changes
+--                    near the clock edge, but is given a full i50MHz cycle
+--                    (20 ns) to resolve before being sampled by FF1.
+--
+--   FF1 (_sync(1)) : Second capture register. Samples the (now resolved)
+--                    output of FF0. This is the standard 2-FF metastability
+--                    barrier ? sufficient for most FPGA process corners.
+--                    PhyPDn_sync(1) is the safe, i50MHz-domain copy of PhyPDn.
+--
+-- Reset behaviour:
+--   On CpldRst_sync = '0' both registers are preset to '1'.
+--   '1' = PHY is powered DOWN ? the safe conservative default.
+--   This guarantees that any i50MHz logic gated on PhyPDn_sync will see
+--   the PHY as powered down during and immediately after a reset event,
+--   preventing accidental transmission or MDIO traffic before the system
+--   has fully initialised.
+--
+-- Timing example (100 MHz SysClk drives PhyPDn, 50 MHz i50MHz samples it):
+--
+--   SysClk domain  PhyPDn       : ???????|___________________
+--   i50MHz         _sync(0)     : ????????????|______________  (1 i50MHz cycle latency)
+--   i50MHz         _sync(1)     : ????????????????|__________  (2 i50MHz cycle latency)
+--
+--   Total worst-case latency = 2 i50MHz cycles = 40 ns @ 50 MHz.
+--   This is acceptable: PhyPDn is a slow control signal that changes
+--   only on microcontroller writes, never on a cycle-by-cycle basis.
+--
+-- Current usage note:
+--   PhyPDn is currently only DRIVEN (not read) inside i50MHz processes,
+--   so PhyPDn_sync(1) has no active consumer today. The synchroniser is
+--   retained as a forward-compatibility measure: any future i50MHz logic
+--   that needs to gate on the PHY power state must use PhyPDn_sync(1)
+--   rather than PhyPDn directly.
+-- =============================================================================
+
 PhyPDn_sync_proc : process(i50MHz)
 begin
   if rising_edge(i50MHz) then
+
+    -- Synchronous reset: preset both stages to '1' (safe "PHY powered down" default).
+    -- Prevents any i50MHz logic from seeing the PHY as active
+    -- before the system has completed its reset sequence.
     if CpldRst_sync = '0' then
-      PhyPDn_sync <= "11";        -- safe default: PHY powered down
+      PhyPDn_sync <= "11";
+
     else
+
+      -- Stage 0: capture PhyPDn from the SysClk domain.
+      -- This FF may briefly enter metastability if PhyPDn changes near
+      -- the i50MHz clock edge, but resolves within one i50MHz period (20 ns).
       PhyPDn_sync(0) <= PhyPDn;
+
+      -- Stage 1: sample the resolved output of Stage 0.
+      -- After this register the signal is fully safe to use in i50MHz logic.
+      -- Always reference PhyPDn_sync(1) ? never PhyPDn directly ? from
+      -- within any i50MHz-clocked process.
       PhyPDn_sync(1) <= PhyPDn_sync(0);
+
     end if;
   end if;
 end process PhyPDn_sync_proc;
@@ -490,8 +662,6 @@ end process PhyPDn_sync_proc;
 CpldRst_sync <= CpldRst_r(1);
 ResetHi <= not CpldRst_sync;
 
--- You can't use type defs in the pin list. Remap type def elements to 
--- separate std_logic_vectors
 PhyRx(0) <= RxDA; TxDA <= PhyTx(0);
 PhyRx(1) <= RxDB; TxDB <= PhyTx(1);
 PhyRx(2) <= RxDC; TxDC <= PhyTx(2);
@@ -684,7 +854,7 @@ RxIn(1).FM <= HrtBtFM;
 FMRxBuffRst <= '1' when (uCWR = '0' and CpldCS = '0' and AddrReg(11 downto 10) = GA 
 						 and AddrReg(9 downto 0) = FMRxErrAddr and uCD(8) = '1') or ResetHi = '1' else '0';
 
--- FIX: add the missing data-request FM receiver on RxIn(0)/RxOut(0)
+-- add the missing data-request FM receiver on RxIn(0)/RxOut(0)
 DReqFMRx : FM_Rx
     generic MAP(Pwidth => 16)
     port map(SysClk  => SysClk,  RxClk => RxFMClk,
@@ -695,7 +865,7 @@ DReqFMRx : FM_Rx
 RxIn(0).FM <= DReqFM;
 
 
--- FIX: add the missing DatReqBuff FIFO (SCFifo_512x16 matches the
+--add the missing DatReqBuff FIFO (SCFifo_512x16 matches the
 --      declared 10-bit DatReqBuff_Count and 16-bit DatReqBuff_Out)
 DatReq_Buff : SCFifo_512x16
     PORT MAP (
@@ -778,7 +948,7 @@ PhyRx_Proc : process(CpldRst_sync, RxFMClk)
 
 begin
 
- --if CpldRst = '0' then
+
  if CpldRst_sync = '0' or PllLock = '0' then
 
 
@@ -886,7 +1056,7 @@ end process PhyRx_Proc;
 
 
 end generate;
---Debug(2) <= PhyRxBuff_wreq(1);
+
 
 -- Serializer for MDC links on the Phy chips, SPI ports on the LVDS Tx Chips --
 -- Clock runs at 50 MHz, MDI bit period is 40ns, SPI bit perios is 80ns
@@ -906,7 +1076,7 @@ PhyTxBuff_rdreq <= '0'; TxEnAck <= '0'; PreambleTx <= '0';
 PreambleCnt <= "000"; Preamble <= X"00";
 PhyTxBuff_Out_r <= (others => '0');
 TxEnMask <= X"00"; -- was X"FF"
- -- ROBUSTNESS FIX #5: TxEnMask resets to X"00" here on CpldRst_sync='0', and
+ --  TxEnMask resets to X"00" here on CpldRst_sync='0', and
 -- the UBTTarget FIFO resets in UBTTarget_FIFO_proc on ResetHi='1' (see
 -- ResetHi <= not CpldRst_sync below).  Both are driven by the same reset
 -- source, so a soft reset can never leave TxEnMask and the target FIFO
@@ -1103,64 +1273,145 @@ end if;
 
 ---------------- Logic used to set up the LVDS clock buffer ---------------
 
+-- Free-running prescaler: divides i50MHz (50 MHz) by 8 to produce a
+-- 6.25 MHz SPI clock reference. All state transitions and shift events
+-- are gated on SPIDiv = 7 (falling edge of SPISClk) to ensure every
+-- control change is aligned to the same prescaler boundary.
 SPIDiv <= SPIDiv + 1;
 
--- Idle,Load_Addr,Shift_Addr,Shift_Data,Done
+
+-- -------------------------------------------------------------------------
+-- SPI State Machine (Idle, Load_Addr, Shift_Addr, Shift_Data, Done)
+-- -------------------------------------------------------------------------
 Case SPI_State is
- When Idle => 
-	if SPI_Empty = '0' and SPIDiv = 7 then SPI_State <= Load_Addr;
-	else SPI_State <= Idle;
-	end if;
- When Load_Addr => 
-	if SPIDiv = 7 then SPI_State <= Shift_Addr;
-	else SPI_State <= Load_Addr;
-	end if;
- When Shift_Addr => 
-	if SPIDiv = 7 and SPIBitCnt = 0 then SPI_State <= Shift_Data;
-	else SPI_State <= Shift_Addr;
-	end if;
- When Shift_Data => 
-	if SPIDiv = 7 and SPIBitCnt = 0 and SPI_Empty = '1' 
-		then SPI_State <= Done;
-	else SPI_State <= Shift_Data;
-	end if;
- When Done => SPI_State <= Idle;
+
+    -- Wait until the µC has loaded at least one word into the SPI FIFO.
+    -- Transition is gated on SPIDiv = 7 so SPICS assertion and the first
+    -- shift are both aligned to the prescaler boundary with no partial bit.
+    When Idle =>
+        if SPI_Empty = '0' and SPIDiv = 7 then SPI_State <= Load_Addr;
+        else SPI_State <= Idle;
+        end if;
+
+    -- Hold for one full SPIDiv cycle to allow SPI_Shift to be loaded with
+    -- the block-write address (X"0800") and SPICS to be asserted before
+    -- the first clock edge is produced.
+    When Load_Addr =>
+        if SPIDiv = 7 then SPI_State <= Shift_Addr;
+        else SPI_State <= Load_Addr;
+        end if;
+
+    -- Shift out the 16-bit block-write address MSB-first. SPIBitCnt
+    -- decrements from 15 to 0 over 16 SPI clock cycles; transition to
+    -- the data phase only when the final bit has been clocked out.
+    When Shift_Addr =>
+        if SPIDiv = 7 and SPIBitCnt = 0 then SPI_State <= Shift_Data;
+        else SPI_State <= Shift_Addr;
+        end if;
+
+    -- Shift out data words from the SPI FIFO, one 16-bit word per 16
+    -- clock cycles. Remain in this state while more FIFO words are
+    -- pending; transition to Done only when the last bit of the last
+    -- word has been shifted and the FIFO is confirmed empty.
+    When Shift_Data =>
+        if SPIDiv = 7 and SPIBitCnt = 0 and SPI_Empty = '1'
+            then SPI_State <= Done;
+        else SPI_State <= Shift_Data;
+        end if;
+
+    -- De-assert SPICS and return to Idle. One-cycle state: no condition
+    -- needed as the transition is unconditional.
+    When Done => SPI_State <= Idle;
 
 end Case;
 
-if SPIDiv = 7 and SPI_State = Shift_Data and SPIBitCnt = X"E" then SPI_rdreq <= '1';
-else SPI_rdreq <= '0';
-end if; 
 
--- Shift register. This is set up for block data moves. 
--- Start by sending address of 0
-if SPI_State = Load_Addr then SPI_Shift <= X"0800"; 
--- After that load the shifter with data from the FIFO buffer
-elsif (SPI_State = Shift_Addr or SPI_State = Shift_Data) and SPIDiv = 7 and SPIBitCnt = 0 
-   then SPI_Shift <= SPI_Out;
--- After loading, shift the data out
-elsif (SPI_State = Shift_Addr or SPI_State = Shift_Data) and SPIBitCnt /= 0 and SPIDiv = 7 
-then SPI_Shift <= SPI_Shift(14 downto 0) & '0';
+-- Issue a FIFO read request two bits before the end of the current word
+-- (SPIBitCnt = 14). This gives the FIFO one full word period (16 SPI clock
+-- cycles = ~2.56 µs) to present the next data word at SPI_Out before the
+-- shift register reloads at SPIBitCnt = 0, preventing any stall between
+-- consecutive words.
+if SPIDiv = 7 and SPI_State = Shift_Data and SPIBitCnt = X"E" then
+    SPI_rdreq <= '1';
+else
+    SPI_rdreq <= '0';
 end if;
 
--- Shift register bit counter
-if (SPI_State = Load_Addr and SPIDiv = 7) 
-or ((SPI_State = Shift_Addr or SPI_State = Shift_Data) and SPIBitCnt = 0 and SPIDiv = 7) then SPIBitCnt <= X"F";
-elsif (SPI_State = Shift_Addr or SPI_State = Shift_Data) and SPIDiv = 7
-then SPIBitCnt <= SPIBitCnt - 1;
-else SPIBitCnt <= SPIBitCnt;
+
+-- -------------------------------------------------------------------------
+-- SPI shift register (MSB-first, left-rotation)
+--   Load_Addr              : preload fixed block-write address X"0800"
+--                            (block write to register 0 of the fanout chip)
+--   Shift_Addr/Data cnt=0  : reload from SPI_Out (next FIFO word, already
+--                            presented after the earlier SPI_rdreq strobe)
+--   Shift_Addr/Data cnt?0  : rotate left by one bit at each SPIDiv=7 tick,
+--                            promoting the next bit into position 15 for
+--                            SPIMOSI to present on the next rising clock edge
+-- -------------------------------------------------------------------------
+if SPI_State = Load_Addr then
+    SPI_Shift <= X"0800";                                    -- block-write address word
+elsif (SPI_State = Shift_Addr or SPI_State = Shift_Data)
+      and SPIDiv = 7 and SPIBitCnt = 0 then
+    SPI_Shift <= SPI_Out;                                    -- reload with next FIFO word
+elsif (SPI_State = Shift_Addr or SPI_State = Shift_Data)
+      and SPIBitCnt /= 0 and SPIDiv = 7 then
+    SPI_Shift <= SPI_Shift(14 downto 0) & '0';              -- shift left: next bit to MSB
 end if;
 
--- Hold chip selecr low for the duration of the block transfer
-if SPICS = '1' and SPI_State = Load_Addr and SPIDiv = 7 then SPICS <= '0'; 
-elsif SPI_State = Done then SPICS <= '1';
-else SPICS <= SPICS;
+
+-- -------------------------------------------------------------------------
+-- Bit counter: tracks how many bits remain in the current 16-bit word.
+--   Loaded with 15 (X"F") whenever a new word enters the shift register
+--   (at Load_Addr or when SPIBitCnt wraps to 0 in Shift_Addr/Data).
+--   Decremented once per SPI clock cycle (SPIDiv = 7) during shifting.
+--   Reaching 0 signals the last bit of the current word has been sent.
+-- -------------------------------------------------------------------------
+if (SPI_State = Load_Addr and SPIDiv = 7)
+or ((SPI_State = Shift_Addr or SPI_State = Shift_Data)
+    and SPIBitCnt = 0 and SPIDiv = 7) then
+    SPIBitCnt <= X"F";                                       -- load for new 16-bit word
+elsif (SPI_State = Shift_Addr or SPI_State = Shift_Data)
+      and SPIDiv = 7 then
+    SPIBitCnt <= SPIBitCnt - 1;                              -- count down remaining bits
+else
+    SPIBitCnt <= SPIBitCnt;                                  -- hold between prescaler ticks
 end if;
 
--- Run the clock while data is being shifted out
-if SPISClk = '0' and SPIDiv = 3 and (SPI_State = Shift_Addr or SPI_State = Shift_Data) then SPISClk <= '1';
-elsif SPISClk = '1' and SPIDiv = 7 then SPISClk <= '0'; 
-else SPISClk <= SPISClk;
+
+-- -------------------------------------------------------------------------
+-- SPICS (active low): asserted for the entire multi-word block transfer.
+--   Driven low at the Load_Addr / SPIDiv = 7 boundary (one prescaler cycle
+--   before the first clock edge) to meet the target device CS setup time.
+--   Held low through Shift_Addr and all Shift_Data words.
+--   De-asserted (high) only in Done, after the last data bit has been
+--   clocked out, to satisfy the CS hold time requirement.
+-- -------------------------------------------------------------------------
+if SPICS = '1' and SPI_State = Load_Addr and SPIDiv = 7 then
+    SPICS <= '0';                                            -- assert: start of transaction
+elsif SPI_State = Done then
+    SPICS <= '1';                                            -- de-assert: end of transaction
+else
+    SPICS <= SPICS;                                          -- hold during shifting
+end if;
+
+
+-- -------------------------------------------------------------------------
+-- SPISClk: generated only during Shift_Addr and Shift_Data states.
+--   Rises  at SPIDiv = 3 ? MOSI has been stable since SPIDiv = 7 of the
+--           previous cycle (80 ns setup time at 50 MHz i50MHz).
+--   Falls  at SPIDiv = 7 ? coincident with the shift register update and
+--           SPIBitCnt decrement, so the next bit is valid on MOSI well
+--           before the next rising edge (80 ns setup time).
+--   Idle states (Idle, Load_Addr, Done): clock held low so no spurious
+--   edges are seen by the target device while CS is de-asserted.
+-- -------------------------------------------------------------------------
+if SPISClk = '0' and SPIDiv = 3
+   and (SPI_State = Shift_Addr or SPI_State = Shift_Data) then
+    SPISClk <= '1';                                          -- rising edge: target samples MOSI
+elsif SPISClk = '1' and SPIDiv = 7 then
+    SPISClk <= '0';                                          -- falling edge: shift register advances
+else
+    SPISClk <= SPISClk;                                      -- hold between transitions
 end if;
 
 end if; -- CpldRst_sync
@@ -1168,73 +1419,242 @@ end if; -- CpldRst_sync
 end process SMI_Proc;
 
 -- Deterministic transmit gating: hold selected target for exactly 4 nibbles
-
+-- =============================================================================
+-- Process : Rx_active_cdc
+-- Purpose : 8-channel 2-stage Clock-Domain Crossing (CDC) synchroniser
+--           Safe transfer of the Rx_active bus (one bit per LVDS FM receiver
+--           channel) from the SysClk (100 MHz) domain into the RxFMClk
+--           (200 MHz) domain.
+--
+-- Why this is needed:
+--   Rx_active(7:0) is an 8-bit flag vector driven by the 'main' process on
+--   SysClk (100 MHz). Each bit indicates whether the corresponding LVDS FM
+--   link (FEB channel 0-7) is currently active, based on transition counting
+--   over a 10 µs observation window.
+--
+--   The PhyRx_Proc processes and the CRC generators run on RxFMClk (200 MHz).
+--   Reading Rx_active directly inside an RxFMClk process would violate CDC
+--   rules: because the two clocks are asynchronous and at different frequencies,
+--   a bit change in Rx_active could be sampled during a metastable window,
+--   corrupting the receive-path gating logic.
+--
+-- Direction of crossing:
+--
+--   SysClk domain (100 MHz)       RxFMClk domain (200 MHz)
+--   ???????????????????????        ??????????????????????????????????????????
+--   Rx_active(i)   ??? [FF0] ??? [FF1] ??? Rx_active_rxclk(i)
+--                    _sync(i)(0) _sync(i)(1)  (safe to use in RxFMClk logic)
+--
+--   This structure is replicated independently for all 8 channels (i = 0..7).
+--   Each channel has its own dedicated 2-FF chain, ensuring that a change on
+--   one bit cannot cause a glitch on any other bit through shared logic.
+--
+-- Two-loop structure:
+--   The synchroniser is intentionally split into two separate 'for' loops
+--   rather than one combined loop. This is a common FPGA coding style that
+--   helps synthesis and static timing tools (e.g. Vivado/ISE) correctly
+--   identify and constrain each stage as a distinct synchroniser register,
+--   allowing proper application of set_false_path or set_max_delay constraints.
+--
+--   Loop 1: advance the 2-FF pipeline for all 8 channels simultaneously
+--   Loop 2: register the resolved output into a clean 8-bit bus for fan-out
+--
+-- Reset behaviour:
+--   The reset condition is the logical OR of two independent faults:
+--     (a) CpldRst_sync = '0' : board-level reset asserted
+--     (b) PllLock     = '0'  : system PLL has lost lock (RxFMClk unreliable)
+--
+--   In either case all synchroniser stages and the output bus are cleared to '0'
+--   (all channels inactive). This is the safe conservative default: the receive
+--   path should not process any data when the clocking infrastructure is
+--   unstable, and no channel should be reported as "active" during reset.
+--
+-- Timing example (100 MHz SysClk drives Rx_active, 200 MHz RxFMClk samples it):
+--
+--   SysClk       Rx_active(i) : ???????|_______________________
+--   RxFMClk      _sync(i)(0)  : ??????????|____________________  (1 RxFMClk cycle)
+--   RxFMClk      _sync(i)(1)  : ?????????????|_________________  (2 RxFMClk cycle)
+--   RxFMClk      _rxclk(i)    : ????????????????|______________  (3 RxFMClk cycle)
+--
+--   Total worst-case latency = 3 RxFMClk cycles = 15 ns @ 200 MHz.
+--   Rx_active is a slow control signal that only changes at 10 µs window
+--   boundaries, so this latency is completely negligible.
+--
+-- Downstream consumer:
+--   Rx_active_rxclk(i) is used inside PhyRx_Proc (clocked on RxFMClk)
+--   to gate receive-side data processing per channel.
+-- =============================================================================
 Rx_active_cdc : process(RxFMClk)
 begin
   if rising_edge(RxFMClk) then
+
+    -- Synchronous reset: assert on board reset OR PLL loss-of-lock.
+    -- Clearing to '0' (all channels inactive) is the safe default:
+    -- no receive processing should occur when the clock is unreliable.
     if CpldRst_sync = '0' or PllLock = '0' then
-      Rx_active_sync   <= (others => "00");
-      Rx_active_rxclk  <= (others => '0');
+      Rx_active_sync   <= (others => "00");  -- clear all 8x2-bit synchroniser stages
+      Rx_active_rxclk  <= (others => '0');   -- clear all 8 output bits
+
     else
+
+      -- Loop 1: advance the 2-stage synchroniser pipeline for all 8 channels.
+      -- Each channel's FF chain is independent, preventing inter-channel glitches.
       for i in 0 to 7 loop
+
+        -- Stage 0: capture Rx_active(i) from the SysClk domain.
+        -- May go metastable if Rx_active(i) changes near the RxFMClk edge,
+        -- but resolves within one RxFMClk period (5 ns @ 200 MHz).
         Rx_active_sync(i)(0) <= Rx_active(i);
+
+        -- Stage 1: sample the resolved output of Stage 0.
+        -- After this register, Rx_active_sync(i)(1) is fully safe to consume
+        -- in the RxFMClk domain.
         Rx_active_sync(i)(1) <= Rx_active_sync(i)(0);
+
       end loop;
+
+      -- Loop 2: register the synchronised outputs into a clean 8-bit bus.
+      -- Separating this from Loop 1 reduces fan-out on _sync(i)(1) and
+      -- helps timing tools apply the correct synchroniser path constraints.
       for i in 0 to 7 loop
         Rx_active_rxclk(i) <= Rx_active_sync(i)(1);
       end loop;
+
     end if;
   end if;
 end process Rx_active_cdc;
 
+
+-- =============================================================================
+-- Process : TxEnReq_cdc
+-- Purpose : 2-stage Clock-Domain Crossing (CDC) synchroniser
+--           Safe transfer of TxEnReq from the SysClk (100 MHz) domain into
+--           the i50MHz (50 MHz) domain.
+--
+-- Why this is needed:
+--   TxEnReq is driven by the 'main' process on SysClk (100 MHz). It is
+--   asserted when either:
+--     (a) the microcontroller writes bit-0 = '1' to the PHY Tx CSR, or
+--     (b) the AutoTx FSM completes writing a UBT packet into PhyTx_Buff.
+--
+--   TxEnReq is consumed by SMI_Proc which runs on i50MHz (50 MHz). Reading
+--   TxEnReq directly inside SMI_Proc without synchronisation would violate
+--   CDC rules: if TxEnReq changes near an i50MHz rising edge, the receiving
+--   FF could enter a metastable state, causing TxEnAck to be asserted or
+--   suppressed unpredictably and corrupting the PHY transmit handshake.
+--
+-- Direction of crossing:
+--
+--   SysClk domain (100 MHz)        i50MHz domain (50 MHz)
+--   ???????????????????????         ??????????????????????????????????????
+--   TxEnReq        ??? [FF0] ??? [FF1] ??? TxEnReq_sync(1)
+--                    _sync(0)  _sync(1)     (safe to use in i50MHz logic)
+--
+--   FF0 (_sync(0)) : First capture register. Samples TxEnReq on each rising
+--                    edge of i50MHz. May go metastable if TxEnReq changes
+--                    near the clock edge, but resolves within one i50MHz
+--                    period (20 ns), well inside Xilinx 7-series MTBF targets.
+--
+--   FF1 (_sync(1)) : Second capture register. Samples the (now resolved)
+--                    output of FF0. After this register, TxEnReq_sync(1) is
+--                    fully safe to consume anywhere in i50MHz logic.
+--
+-- Reset behaviour:
+--   On CpldRst_sync = '0', both stages are cleared to '0'.
+--   '0' = no transmit request pending ? the correct safe default.
+--   This prevents SMI_Proc from asserting TxEnAck during or immediately
+--   after reset before the PHY and FIFO infrastructure is ready.
+--
+-- Timing example (100 MHz SysClk drives TxEnReq, 50 MHz i50MHz samples it):
+--
+--   SysClk    TxEnReq      : _____|????????????????????|______
+--   i50MHz    _sync(0)     : ________|????????????????????|___  (1 i50MHz cycle latency)
+--   i50MHz    _sync(1)     : ____________|??????????????????|_  (2 i50MHz cycle latency)
+--
+--   Total worst-case latency = 2 i50MHz cycles = 40 ns @ 50 MHz.
+--   This is acceptable: TxEnReq is a level signal held high until TxEnAck
+--   is returned. A 40 ns delay has no functional impact on the handshake.
+--
+-- Handshake flow (after synchronisation):
+--   SysClk domain                      i50MHz domain
+--   ?????????????                       ?????????????
+--   TxEnReq   asserted ??? [2-FF CDC] ??? TxEnReq_sync(1) seen high
+--                                         TxEnAck asserted (in SMI_Proc)
+--   TxEnReq   cleared  ??? TxEnAck seen in main process
+--
+-- Downstream consumer:
+--   TxEnReq_sync(1) is read exclusively in SMI_Proc (i50MHz domain):
+--     "if TxEnAck = '0' and TxEnReq_sync(1) = '1'
+--         and PhyTxBuff_Empty = '0' then TxEnAck <= '1';"
+--   It gates the TxEnAck response that enables the PHY transmit path.
+-- =============================================================================
+
 TxEnReq_cdc : process(i50MHz)
 begin
-    if rising_edge(i50MHz) then
-        if CpldRst_sync = '0' then
-            TxEnReq_sync <= "00";
-        else
-            TxEnReq_sync(0) <= TxEnReq;
-            TxEnReq_sync(1) <= TxEnReq_sync(0);
-        end if;
+  if rising_edge(i50MHz) then
+
+    -- Synchronous reset: clear both stages to '0' (no transmit request).
+    -- Prevents a spurious TxEnAck during reset or PLL startup.
+    if CpldRst_sync = '0' then
+      TxEnReq_sync <= "00";
+
+    else
+
+      -- Stage 0: capture TxEnReq from the SysClk domain.
+      -- This FF may briefly enter metastability but resolves within
+      -- one i50MHz period (20 ns @ 50 MHz).
+      TxEnReq_sync(0) <= TxEnReq;
+
+      -- Stage 1: sample the resolved output of Stage 0.
+      -- TxEnReq_sync(1) is the safe i50MHz-domain copy of TxEnReq.
+      -- Only this signal should ever be read inside i50MHz processes.
+      TxEnReq_sync(1) <= TxEnReq_sync(0);
+
     end if;
+  end if;
 end process TxEnReq_cdc;
 
 
--- Detect when a PHY Rx FIFO transitions from empty to non-empty (FEB responded)
--- Runs in SysClk domain; PhyRxBuff_Empty is in SysClk domain (rd_clk = SysClk)
--- In RxFill_detect, uncomment the sticky latch:
---RxFill_detect : process(SysClk)
---begin
---  if rising_edge(SysClk) then
---    if CpldRst_sync = '0' then
---      PhyRxBuff_WasEmpty <= (others => '1');
---      PhyRxFilled        <= (others => '0');
---      --AutoTx_RxGot       <= (others => '0');
---    else
---      for i in 0 to 7 loop
---        PhyRxBuff_WasEmpty(i) <= PhyRxBuff_Empty(i);
---        PhyRxFilled(i) <= PhyRxBuff_WasEmpty(i) and (not PhyRxBuff_Empty(i));
---        --if PhyRxBuff_WasEmpty(i) = '1' and PhyRxBuff_Empty(i) = '0' then
---          --AutoTx_RxGot(i) <= '1';
---        --end if;
---      end loop;
---    end if;
---  end if;
---end process RxFill_detect;
 
--- Stretch LastTxTarget_clr_req over 3 cycles in SysClk before crossing clock domain
---LastTxTarget_clr_stretch : process(SysClk)
---begin
---  if rising_edge(SysClk) then
---    if ResetHi = '1' then
---      LastTxTarget_clr_stretch_local <= "000";
---    elsif LastTxTarget_clr_req = '1' then
---      LastTxTarget_clr_stretch_local <= "111";  -- Hold high for 3 cycles
---    else
---      LastTxTarget_clr_stretch_local <= '0' & LastTxTarget_clr_stretch_local(2 downto 1);
---    end if;
---  end if;
---end process;
+-- =============================================================================
+-- Process : phy_out_gating
+-- Purpose : Deterministic PHY transmit output routing at 25 MHz (MII rate)
+--
+-- Responsibilities:
+--   1. Synchronise the SysClk-domain LastTxTarget clear strobe into i50MHz.
+--   2. Determine which single PHY port should receive the current nibble
+--      (one-hot target selection with priority: AutoTx > lowest TxEn bit).
+--   3. Freeze the selected target for exactly 4 nibbles (one 16-bit FIFO
+--      word) to guarantee a single consistent PHY drives all 4 nibbles of
+--      every read word, even if TxEn or AutoTx_Target changes mid-word.
+--   4. Update the LastTxTarget diagnostic register when a real transmission
+--      begins.
+--   5. Route TxReg (the current nibble from SMI_Proc) to exactly one PHY
+--      output; all other PHY outputs are held at zero.
+--
+-- Clock structure:
+--   The outer clock is i50MHz (50 MHz).
+--   The LastTxTarget_clr_sync synchroniser (Section 1) runs at full i50MHz
+--   rate so it never misses a clear strobe edge.
+--   All PHY output logic (Sections 2-5) is gated behind Clk25MHz = '1',
+--   making it execute on every OTHER i50MHz rising edge ? an effective
+--   rate of 25 MHz, aligned to the MII nibble clock.
+--
+--   Why gate at 25 MHz?
+--   The Ethernet MII interface clocks nibbles at 25 MHz (100BASE-TX).
+--   Each PhyTxBuff FIFO word is 16 bits = 4 nibbles.  Gating the output
+--   logic at 25 MHz ensures one and only one nibble is driven per MII
+--   cycle, giving maximum setup/hold margin on the PHY Tx pins.
+--
+--   Clk25MHz is generated in SMI_Proc by toggling once per i50MHz cycle.
+--   Checking Clk25MHz = '1' at rising_edge(i50MHz) samples the value
+--   registered in the PREVIOUS cycle, so this gate fires on the i50MHz
+--   edge that corresponds to the falling phase of the 25 MHz derived clock.
+--
+-- Variable declarations (process-local, not retained between cycles):
+--   tgt_candidate : working one-hot vector; resolved target for this cycle.
+--   lowest_mask   : temporary used when scanning TxEn for fallback target.
+-- =============================================================================
 
 phy_out_gating : process(i50MHz)
   variable tgt_candidate : std_logic_vector(7 downto 0);
@@ -1242,20 +1662,57 @@ phy_out_gating : process(i50MHz)
 begin
   if rising_edge(i50MHz) then
 
-    -- Synchronise the SysClk clear-request strobe into i50MHz domain.
-    -- 3-stage shift: stages 0/1 = metastability FFs, stage 2 = delayed copy
-    -- for rising-edge detect (stage2='0' and stage1='1').
+    -- -------------------------------------------------------------------------
+    -- Section 1: CDC synchroniser for LastTxTarget clear strobe
+    --            Runs at FULL i50MHz rate (outside the Clk25MHz gate) to
+    --            ensure the edge is never missed between 25 MHz windows.
+    --
+    -- Source   : LastTxTarget_clr_stretch(0) ? a 5-cycle stretched pulse
+    --            driven by SysClk-domain logic whenever the µC writes to
+    --            LastTxTargetAddr. Stretching guarantees the pulse is wide
+    --            enough for the i50MHz synchroniser to reliably capture it.
+    --
+    -- Pipeline : 3-stage shift register
+    --   _sync(0) : Stage 0 ? first metastability capture FF
+    --   _sync(1) : Stage 1 ? second metastability capture FF (resolved)
+    --   _sync(2) : Stage 2 ? one-cycle-delayed copy of Stage 1,
+    --              used as the "previous" value for rising-edge detection.
+    --
+    -- Edge detect (used in Section 3 below):
+    --   Rising edge on _sync(1) detected when:
+    --   _sync(2) = '0'  (was low last 25 MHz cycle) AND
+    --   _sync(1) = '1'  (is high this 25 MHz cycle)
+    -- -------------------------------------------------------------------------
     LastTxTarget_clr_sync <=
-    LastTxTarget_clr_sync(1 downto 0) & LastTxTarget_clr_stretch(0);
-	 
-	 	 
-	 
-    if Clk25MHz = '1' then  -- execute only on the falling edge of the 25 MHz phase
+        LastTxTarget_clr_sync(1 downto 0) & LastTxTarget_clr_stretch(0);
 
-      -- Derive one-hot target: use AutoTx_Target if set, else lowest TxEn bit
-      if not  is_all_zero(AutoTx_Target) then
+
+    -- =========================================================================
+    -- All logic below is gated at 25 MHz (one execution per MII nibble period)
+    -- =========================================================================
+    if Clk25MHz = '1' then
+
+      -- -----------------------------------------------------------------------
+      -- Section 2: One-hot transmit target selection
+      --
+      -- Priority order (highest first):
+      --   (a) AutoTx_Target ? set by AutoTx_Proc when the FSM has chosen a
+      --       specific port for a UBT packet. Takes priority over any µC-driven
+      --       TxEn bits so that automatic handshake traffic always reaches the
+      --       intended FEB.
+      --   (b) Lowest-indexed set bit in TxEn ? fallback for µC-driven
+      --       transmissions where no AutoTx port is active. Selecting only the
+      --       lowest bit prevents multi-port simultaneous drive even if the µC
+      --       accidentally sets multiple TxEn bits.
+      --
+      -- Result stored in variable tgt_candidate; used in Sections 3 and 4.
+      -- -----------------------------------------------------------------------
+      if not is_all_zero(AutoTx_Target) then
+        -- AutoTx has claimed a port: use its one-hot mask directly.
         tgt_candidate := AutoTx_Target;
       else
+        -- No AutoTx claim: scan TxEn and pick only the lowest-indexed '1' bit.
+        -- The 'exit' statement ensures at most one bit is set in lowest_mask.
         lowest_mask := ZERO8;
         for i in 0 to 7 loop
           if TxEn(i) = '1' then
@@ -1266,136 +1723,261 @@ begin
         tgt_candidate := lowest_mask;
       end if;
 
---      -- On each FIFO read: freeze target for 4 nibbles AND latch LastTxTarget
---      if PhyTxBuff_rdreq = '1' then
---        if AutoTx_BroadcastMode = '1' then
---          TxTarget_hold <= TxEn;
---          if TxEn /= ZERO8
---             and LastTxTarget_clr_sync(1) = '0'
---             and LastTxTarget_clr_sync(0) = '0' then
---            LastTxTarget <= TxEn;
---          end if;
---        else
---          TxTarget_hold <= tgt_candidate;
---			 -- Latch target, but let clear win
---			 if LastTxTarget_clr_sync(2) = '0' and LastTxTarget_clr_sync(1) = '1' then
---				LastTxTarget <= (others => '0');
---			 elsif LastTxTarget_clr_sync(1) = '1' then
---				LastTxTarget <= (others => '0');
---			 elsif tgt_candidate /= ZERO8 then
---				LastTxTarget <= tgt_candidate;   -- ? restore this line
---			 end if;        
---		  end if;
---        nibble_hold_cnt <= 4;
---      end if;
---
---      -- Synchronised µC clear: rising edge of clr_sync means the µC just
---      -- wrote to LastTxTargetAddr in the SysClk domain.
---      if LastTxTarget_clr_sync(2) = '0' and LastTxTarget_clr_sync(1) = '1' then
---        LastTxTarget <= (others => '0');
---      elsif LastTxTarget_clr_sync(1) = '1' then
---        LastTxTarget <= (others => '0');
---      end if;
 
---      if PhyTxBuff_rdreq = '1' then
---        TxTarget_hold   <= tgt_candidate;
---        nibble_hold_cnt <= 4;
---        -- Latch target ONLY if no clear is in flight
---        if (LastTxTarget_clr_sync(2) = '0' and LastTxTarget_clr_sync(1) = '1')
---            or LastTxTarget_clr_sync(1) = '1' then
---          LastTxTarget <= (others => '0');
---        elsif tgt_candidate /= ZERO8 then
---          LastTxTarget <= tgt_candidate;
---        end if;
---      end if;
-      -- Drive CurrentTarget: hold for 4 nibbles, then follow candidate
+      -- -----------------------------------------------------------------------
+      -- Section 3: FIFO read ? freeze target and update diagnostics
+      --
+      -- Fires when SMI_Proc has issued a PhyTxBuff_rdreq (NibbleCount = 2,
+      -- Clk25MHz = '0' in SMI_Proc, which means we see rdreq one i50MHz cycle
+      -- later here).
+      --
+      -- On each read:
+      --   TxTarget_hold  : latches tgt_candidate for exactly 4 nibbles so the
+      --                    entire 16-bit word is steered to one consistent port.
+      --   nibble_hold_cnt: countdown from 4 to 0; CurrentTarget follows
+      --                    TxTarget_hold while non-zero (Section 4).
+      --   LastTxTarget   : diagnostic register ? records which PHY last received
+      --                    a FIFO word. Updated only when BOTH the candidate AND
+      --                    TxEn are non-zero: this prevents LastTxTarget from
+      --                    being latched when AutoTx_Target has been set but
+      --                    TxEnMask has not yet propagated through the CDC path
+      --                    (i50MHz domain), which would make the diagnostic
+      --                    register report "UBT fired" when nothing was actually
+      --                    driven onto the wire.
+      -- -----------------------------------------------------------------------
+      if PhyTxBuff_rdreq = '1' then
+        TxTarget_hold <= tgt_candidate;
+        if tgt_candidate /= ZERO8 and TxEn /= ZERO8 then
+          LastTxTarget <= tgt_candidate;
+        end if;
+        nibble_hold_cnt <= 4;
+      end if;
 
-	-- rdreq: latch the new target.
-	-- ROBUSTNESS FIX: also require TxEn /= ZERO8.  Without this, LastTxTarget
-	-- would be latched from tgt_candidate (which can come from AutoTx_Target)
-	-- even when TxEnMask was X"00" because of the CDC race fixed in change #1
-	-- ? i.e. the diagnostic register would lie and report "UBT fired" when
-	-- nothing was actually driven onto the wire.  Gating on TxEn closes that
-	-- observability gap: LastTxTarget now only latches when a PHY is enabled.
-if PhyTxBuff_rdreq = '1' then
-    TxTarget_hold <= tgt_candidate;
-    if tgt_candidate /= ZERO8 and TxEn /= ZERO8 then
-        LastTxTarget <= tgt_candidate;
-    end if;
-    nibble_hold_cnt <= 4;
-end if;
-
--- µC clear: unconditional, NOT gated on rdreq
--- Last assignment wins ? clear beats latch if both fire together
-if LastTxTarget_clr_sync(2) = '0' and LastTxTarget_clr_sync(1) = '1' then
-    LastTxTarget <= (others => '0');
-end if;
+      -- -----------------------------------------------------------------------
+      -- Section 3b: µC clear of LastTxTarget diagnostic register
+      --
+      -- Triggered by a rising edge on LastTxTarget_clr_sync(1), which is the
+      -- synchronised version of the SysClk-domain clear strobe written when the
+      -- µC reads (or explicitly clears) LastTxTargetAddr.
+      --
+      -- Placed AFTER the rdreq latch above: in VHDL clocked processes the last
+      -- assignment to a signal wins. If a FIFO read and a µC clear coincide in
+      -- the same 25 MHz cycle, the clear takes effect ? preventing a stale
+      -- address from being re-latched on the same cycle it is being cleared.
+      -- -----------------------------------------------------------------------
+      if LastTxTarget_clr_sync(2) = '0' and LastTxTarget_clr_sync(1) = '1' then
+        LastTxTarget <= (others => '0');
+      end if;
 
 
+      -- -----------------------------------------------------------------------
+      -- Section 4: CurrentTarget ? 4-nibble hold window
+      --
+      -- Holds TxTarget_hold as CurrentTarget for exactly 4 consecutive 25 MHz
+      -- cycles (one full 16-bit FIFO word). This guarantees all 4 nibbles of a
+      -- single read are routed to the same PHY even if tgt_candidate changes
+      -- partway through the word (e.g. TxEn cleared or AutoTx_Target updated).
+      --
+      -- When the hold window expires (nibble_hold_cnt reaches 0):
+      --   - TxTarget_hold is cleared to ZERO8 on the last active cycle.
+      --   - CurrentTarget falls back to the live tgt_candidate value.
+      -- -----------------------------------------------------------------------
       if nibble_hold_cnt > 0 then
         CurrentTarget   <= TxTarget_hold;
         nibble_hold_cnt <= nibble_hold_cnt - 1;
         if nibble_hold_cnt = 1 then
-          TxTarget_hold <= ZERO8;
+          TxTarget_hold <= ZERO8;   -- pre-clear ready for next read
         end if;
       else
-        CurrentTarget <= tgt_candidate;
+        CurrentTarget <= tgt_candidate;   -- no hold active: follow live target
       end if;
 
-      -- Route TxReg to the correct PHY(s)
+
+      -- -----------------------------------------------------------------------
+      -- Section 5: PHY nibble output routing
+      --
+      -- Routes TxReg (the 4-bit nibble selected by SMI_Proc's nibble mux) to
+      -- exactly the PHY(s) whose bit in CurrentTarget is '1'.
+      -- All other PHY Tx outputs are driven to "0000" to prevent crosstalk or
+      -- accidental transmission on idle ports.
+      --
+      -- In normal operation CurrentTarget is one-hot (exactly one bit set),
+      -- so exactly one PhyTx(i) carries live data at any time.
+      -- -----------------------------------------------------------------------
       for i in 0 to 7 loop
         if CurrentTarget(i) = '1' then
-          PhyTx(i) <= TxReg;
+          PhyTx(i) <= TxReg;    -- forward nibble to selected PHY
         else
-          PhyTx(i) <= ZERO4;
+          PhyTx(i) <= ZERO4;    -- idle: hold all Tx pins low
         end if;
       end loop;
 
-    end if;  -- Clk25MHz = '1'
+    end if;  -- Clk25MHz = '1'  (25 MHz gate)
 
   end if;  -- rising_edge(i50MHz)
 end process phy_out_gating;
 
 
-
+-- Drives the MOSI pin directly from the MSB of the 16-bit SPI shift register,
+-- implementing MSB-first serial transmission to the LVDS clock fanout chip.
+-- Each left-rotation of SPI_Shift in SMI_Proc promotes the next data bit into
+-- position 15, so this concurrent assignment always presents the correct bit
+-- to the pin without an additional output register.
 SPIMOSI <= SPI_Shift(15);
 
+-- =============================================================================
+-- Process : LastTxTarget_clr_stretching
+-- Purpose : Pulse stretcher ? widens the single-cycle SysClk clear request
+--           for LastTxTarget into a 5-cycle pulse before it crosses into the
+--           i50MHz clock domain.
+--
+-- The µC asserts LastTxTarget_clr_req for exactly one SysClk cycle (10 ns)
+-- when it writes to LastTxTargetAddr. A pulse that narrow cannot be reliably
+-- captured by the 3-stage synchroniser in phy_out_gating, which samples on
+-- i50MHz (50 MHz, 20 ns period): the pulse could arrive and disappear entirely
+-- between two i50MHz edges and be missed completely. To guarantee capture, the
+-- 5-bit register LastTxTarget_clr_stretch is loaded with "11111" on the
+-- request cycle and then shifted right by one position each SysClk cycle,
+-- inserting '0' from the MSB. This produces a clean 5-cycle (50 ns) active
+-- pulse on bit 0 ? the output fed to the synchroniser ? which is wide enough
+-- to span at least two i50MHz rising edges regardless of the phase relationship
+-- between the two clocks, satisfying the minimum pulse-width requirement of
+-- the 3-FF CDC chain in phy_out_gating.
+-- =============================================================================
 LastTxTarget_clr_stretching : process(SysClk)
 begin
-	if rising_edge(SysClk) then
-		if CpldRst_sync = '0' then
-			LastTxTarget_clr_stretch <= "00000";
-		elsif LastTxTarget_clr_req = '1' then
-			LastTxTarget_clr_stretch <= "11111";
-		else 
-			LastTxTarget_clr_stretch <= '0' & LastTxTarget_clr_stretch(4 downto 1);
-		end if;
-	end if;
+    if rising_edge(SysClk) then
+
+        -- Synchronous reset: clear the stretcher so no stale pulse
+        -- propagates into the i50MHz domain after a system reset.
+        if CpldRst_sync = '0' then
+            LastTxTarget_clr_stretch <= "00000";
+
+        -- Request asserted: load all ones to begin the 5-cycle pulse.
+        elsif LastTxTarget_clr_req = '1' then
+            LastTxTarget_clr_stretch <= "11111";
+
+        -- No request: shift right each cycle, inserting '0' at the MSB.
+        -- Bit 0 remains '1' for 5 consecutive cycles then naturally falls
+        -- to '0' once the last '1' has shifted out of the register.
+        else
+            LastTxTarget_clr_stretch <= '0' & LastTxTarget_clr_stretch(4 downto 1);
+
+        end if;
+    end if;
 end process;
+         
 
-------------------------------------------------------------------------------
--- AutoTx_Proc: sequential UBT handshake
---   State "000": idle - scan ReadyStatus (or honour kick) for next port
---   State "001": write UBT packet words into PhyTxBuff
---   State "010": wait for the target PHY RX FIFO to go non-empty
---                (i.e. FEB has responded), with timeout fallback
---   State "011": immediately check for another ready port
------------------------------------------------------------------------------            
-
+-- =============================================================================
+-- Process : TxEnMask_cdc
+-- Purpose : 2-stage CDC synchroniser ? transfers the one-hot PHY transmit
+--           lane mask from the SysClk (100 MHz) domain into the i50MHz
+--           (50 MHz) domain ahead of each UBT packet transmission.
+--
+-- TxEnMask_next is a one-hot 8-bit vector driven by AutoTx_Proc on SysClk.
+-- It is loaded with AutoTx_Target (the port selected for the current UBT
+-- handshake) once per AutoTx cycle, and held stable for the entire duration
+-- of the packet transmission. Because it must be consumed by SMI_Proc
+-- (i50MHz domain) at the moment PreambleTx rises ? to load TxEnMask and
+-- thereby gate TxEn onto the correct PHY ? it must be safely transferred
+-- across the clock boundary before that event occurs. The two-stage pipeline
+-- (_sync then _i50) provides the standard metastability barrier: the first
+-- register captures the SysClk-domain value and may briefly be metastable,
+-- while the second register samples the resolved output and presents a clean
+-- signal to all i50MHz consumers. No explicit reset branch is required here
+-- because TxEnMask_next is already cleared to X"00" by AutoTx_Proc on
+-- CpldRst_sync = '0', so the synchroniser will naturally propagate the safe
+-- all-zeros (no PHY enabled) value into i50MHz logic within two cycles of
+-- any reset event.
+-- =============================================================================
 TxEnMask_cdc : process(i50MHz)
 begin
     if rising_edge(i50MHz) then
-        TxEnMask_sync  <= TxEnMask_next;
-        TxEnMask_i50   <= TxEnMask_sync;
+
+        -- Stage 1: capture TxEnMask_next from the SysClk domain.
+        -- May be briefly metastable but resolves within one i50MHz period (20 ns).
+        TxEnMask_sync <= TxEnMask_next;
+
+        -- Stage 2: sample the resolved output of Stage 1.
+        -- TxEnMask_i50 is the safe i50MHz-domain copy, read by SMI_Proc
+        -- to load TxEnMask at the start of each preamble transmission.
+        TxEnMask_i50  <= TxEnMask_sync;
+
     end if;
 end process;
 
+
+-- =============================================================================
+-- Process : AutoTx_Proc
+-- Purpose : Autonomous UBT (µBunch Transfer) handshake sequencer
+--
+-- Overview:
+--   This FSM automatically manages the full request-response cycle between
+--   FPGA2 and each Front-End Board (FEB) connected via Ethernet PHY. When a
+--   FEB port is marked ready in ReadyStatus, the FSM:
+--     1. Claims the port and writes a UBT packet into the PhyTx FIFO.
+--     2. Waits for the FIFO contents to propagate to the i50MHz read side.
+--     3. Triggers SMI_Proc to transmit the packet by pulsing TxEnReq.
+--     4. Waits for the packet to drain completely from the FIFO.
+--     5. Waits for the FEB to respond (PHY Rx FIFO goes non-empty).
+--     6. Waits for the DDR write sequencer to consume the FEB response.
+--     7. Re-arms the port in ReadyStatus so the next round-robin iteration
+--        can service it again.
+--   If any stage exceeds its timeout the port is released, AutoTx_TimedOut
+--   is flagged, and the FSM returns to idle for a retry on the next scan.
+--
+-- Round-robin arbitration:
+--   AT_Idle scans ReadyStatus starting one position past RoundRobin_Last,
+--   wrapping modulo 8. The first port that is both ready (ReadyStatus = '1')
+--   and enabled (MaskReg = '1') is selected. This ensures no single port
+--   monopolises the bus when multiple FEBs are active simultaneously.
+--
+-- Clock domain interactions:
+--   The entire process runs on SysClk (100 MHz). Several signals cross into
+--   the i50MHz domain (50 MHz) and require explicit CDC handling:
+--     TxEnMask_next  -> TxEnMask_cdc  -> TxEnMask_i50   (lane mask for SMI_Proc)
+--     AutoTx_TxEnReqPulse -> main     -> TxEnReq        (transmit enable request)
+--     PhyTxBuff_Empty (i50MHz) -> PhyTxEmpty_sync_proc -> PhyTxBuff_Empty_s
+--   The FSM always waits for PhyTxBuff_Empty_s (the synchronised empty flag)
+--   rather than reading PhyTxBuff_Empty directly, preventing metastability
+--   on all FIFO-state decisions.
+--
+-- Default signal assignments (applied every rising SysClk edge before the
+-- state machine, so any state that does not explicitly override them sees
+-- the safe pulsed-low / cleared value):
+--   AutoTx_Claim        : cleared to X"00"  (one-shot port claim pulse)
+--   AutoTx_FifoRst_req  : cleared to '0'    (one-shot FIFO reset request)
+--   AutoTx_ReArm        : cleared to X"00"  (one-shot re-arm pulse)
+--   PhyTxWrReq_FPGA     : cleared to '0'    (one-shot FIFO write strobe)
+--   AutoTx_TxEnReqPulse : cleared to '0'    (one-shot TxEnReq trigger)
+--   TxEnMask_next       : held at AutoTx_Target (stable during transmission)
+--
+-- Variable declarations (resolved combinatorially each cycle, not retained):
+--   found_port : index of the next round-robin candidate port (0-7)
+--   have_port  : true when a valid candidate was found in the scan
+--   onehot     : temporary one-hot encoding of found_port
+--
+-- State machine summary:
+--   AT_Idle        : scan ReadyStatus round-robin; claim first ready+masked port
+--   AT_WriteWords  : write UBT_ASC_COUNT words into PhyTxBuff one per cycle
+--   AT_WaitTxFill  : wait for PhyTxBuff_Empty_s to fall (CDC settling, ~3 cycles)
+--   AT_WaitTxDrain : pulse TxEnReq; wait for SMI_Proc to drain the FIFO
+--   AT_WaitRxFill  : wait for FEB to respond (PhyRxBuff goes non-empty)
+--   AT_WaitDdrDrain: wait for DDR write sequencer to drain the Rx FIFO
+-- =============================================================================
 
 AutoTx_Proc : process(SysClk, CpldRst_sync)
     variable found_port : integer range 0 to 7;
     variable have_port  : boolean;
     variable onehot     : std_logic_vector(7 downto 0);
 begin
+
+  -- ---------------------------------------------------------------------------
+  -- Asynchronous reset: return all outputs and FSM state to safe defaults.
+  -- TxEnMask_next cleared to X"00" ensures no PHY lane is enabled before
+  -- the system is fully initialised. AutoTx_Busy cleared so the main process
+  -- does not see any port as in-flight across a reset boundary.
+  -- ---------------------------------------------------------------------------
   if CpldRst_sync = '0' then
     PhyTxDin_FPGA       <= (others => '0');
     PhyTxWrReq_FPGA     <= '0';
@@ -1412,155 +1994,261 @@ begin
     RxFilled_sticky     <= '0';
     TxEnMask_next       <= (others => '0');
     RoundRobin_Last     <= 0;
-	 AutoTx_FifoRst_req <= '0';
+    AutoTx_FifoRst_req  <= '0';
 
-        
-    elsif rising_edge(SysClk) then
-        AutoTx_Claim        <= X"00";
-		  AutoTx_FifoRst_req <= '0';
-        AutoTx_ReArm        <= (others => '0');
-        PhyTxWrReq_FPGA     <= '0';
-        AutoTx_TxEnReqPulse <= '0';
-        TxEnMask_next <= AutoTx_Target;   -- one-hot, set once per UBT cycle
-        
-        -- Latch fill event any time we're waiting
-        if AutoTx_State = AT_WaitRxFill
-           and PhyRxFilled(AutoTx_Port) = '1' then
-            RxFilled_sticky <= '1';
-        end if;
-		  
-		 
+  elsif rising_edge(SysClk) then
 
-        case AutoTx_State is
+    -- -------------------------------------------------------------------------
+    -- Default pulse clears: these signals are one-shot strobes. Clearing them
+    -- here means each state only needs to assert them for a single cycle;
+    -- they are automatically de-asserted the following cycle without any
+    -- explicit else branch in the state machine.
+    -- -------------------------------------------------------------------------
+    AutoTx_Claim        <= X"00";
+    AutoTx_FifoRst_req  <= '0';
+    AutoTx_ReArm        <= (others => '0');
+    PhyTxWrReq_FPGA     <= '0';
+    AutoTx_TxEnReqPulse <= '0';
 
-            when AT_Idle =>
-                -- Round-robin scan
-                have_port := false;
-                for i in 0 to 7 loop
-                    if ReadyStatus((RoundRobin_Last+1+i) mod 8) = '1'
-                       and MaskReg((RoundRobin_Last+1+i) mod 8) = '1' then
-                        found_port := (RoundRobin_Last+1+i) mod 8;
-                        have_port  := true;
-                        exit;
-                    end if;
-                end loop;
-                if have_port
-                   and PhyTxBuff_Empty_s = '1'
-                   and PhyTxBuff_Full  = '0'
-                   and PhyTxBuff_wreq  = '0' then
-                    AutoTx_Port              <= found_port;
-                    RoundRobin_Last          <= found_port;
-                    AutoTx_WordIdx           <= 0;
-                    AutoTx_Claim(found_port) <= '1';
-                    AutoTx_Busy(found_port)  <= '1';
-                    onehot                   := (others => '0');
-                    onehot(found_port)       := '1';
-                    AutoTx_Target            <= onehot;
-                    TxEnMask_next            <= onehot;  -- CDC register
-                    AutoTx_State             <= AT_WriteWords;
-                end if;
+    -- Keep TxEnMask_next stable at the currently selected target throughout
+    -- the entire handshake cycle. TxEnMask_cdc transfers this into i50MHz
+    -- domain within 2 cycles so SMI_Proc always sees the correct lane mask.
+    TxEnMask_next <= AutoTx_Target;
 
-            when AT_WriteWords =>
-                if PhyTxBuff_Full = '0' and PhyTxWrReq_FPGA = '0' then
-                    PhyTxDin_FPGA   <= ubt_ascii_word(AutoTx_WordIdx, '1');
-                    PhyTxWrReq_FPGA <= '1';
-                    if AutoTx_WordIdx >= UBT_ASC_COUNT - 1 then
-                        -- Do NOT raise TxEnReq yet.  PhyTx_Buff is a true dual-clock FIFO
-                        -- (wr_clk=SysClk, rd_clk=i50MHz); its Empty flag needs ~3 i50MHz
-                        -- cycles after the write before it falls.  Wait for the
-                        -- synchronised Empty (PhyTxBuff_Empty_s) to fall, then pulse
-                        -- TxEnReq.  This guarantees TxEnAck in SMI_Proc can latch.
-                        AutoTx_WordIdx      <= 0;
-                        AutoTx_WaitTimeout  <= 1000;  -- 1 ms safety timeout for fill
-                        AutoTx_State        <= AT_WaitTxFill;
-                    else
-                        AutoTx_WordIdx <= AutoTx_WordIdx + 1;
-                    end if;
-                end if;
-
-            when AT_WaitTxDrain =>
-                if PhyTxBuff_Empty_s = '1' then
-                    RxFilled_sticky    <= '0';
-                    AutoTx_WaitTimeout <= 10000;  -- 10ms reply timeout
-                    AutoTx_State       <= AT_WaitRxFill;
-                elsif AutoTx_WaitTimeout > 0 then
-                    if Counter1us = X"00" then
-                        AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
-                    end if;
-                else
-                    AutoTx_TimedOut(AutoTx_Port) <= '1';
-                    AutoTx_Busy(AutoTx_Port)     <= '0';  
-						  AutoTx_FifoRst_req           <= '1';
-                    AutoTx_State                 <= AT_Idle;
-                end if;
-
-            when AT_WaitRxFill =>
-                -- FEB responds via LVDS FM ? 
-					if PhyRxBuff_Empty(AutoTx_Port) = '0' then   -- was: RxFilled_sticky
-						RxFilled_sticky    <= '0';
-						AutoTx_WaitTimeout <= 10000;
-						AutoTx_State       <= AT_WaitDdrDrain;
-                elsif AutoTx_WaitTimeout > 0 then
-                    if Counter1us = X"00" then
-                        AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
-                    end if;
-                else
-                    AutoTx_TimedOut(AutoTx_Port) <= '1';
-                    AutoTx_Busy(AutoTx_Port)     <= '0';
-						  --AutoTx_ReArm(AutoTx_Port)    <= '1';
-                    AutoTx_State                 <= AT_Idle;
-                end if;
-
-            -- AT_WaitDdrDrain: Wait for the DDR write sequencer to drain the PHY Rx FIFO
-				-- for the current port. This confirms that the FEB response data has been
-				-- fully consumed and written to LPDDR. Once drained, the next masked port	
-				-- in round-robin order is armed via AutoTx_ReArm so the main process sets
-				-- its ReadyStatus bit. If the DDR sequencer stalls and the timeout expires,
-				-- the same port is re-armed for a retry and AutoTx_TimedOut is flagged.
-				when AT_WaitDdrDrain =>
-					if PhyRxBuff_Empty(AutoTx_Port) = '1' then   -- DDR write sequencer has drained it
-							AutoTx_Busy(AutoTx_Port) <= '0';
-							AutoTx_ReArm(AutoTx_Port) <= '1';  -- ADD: re-arm for next cycle
-							AutoTx_State             <= AT_Idle;					 
-					elsif AutoTx_WaitTimeout > 0 then
-						  -- Countdown using the 1 us tick to bound the wait to ~10 ms
-						  if Counter1us = X"00" then
-								AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
-						  end if;
-
-					 else
-						  -- DDR sequencer stalled: flag the timeout, release the port,
-						  -- and re-arm the same port so it will be retried next idle scan
-						  AutoTx_TimedOut(AutoTx_Port) <= '1';
-						  AutoTx_Busy(AutoTx_Port)     <= '0';
-						  AutoTx_State                 <= AT_Idle;
-					 end if;
-				
-            when AT_WaitTxFill =>
-                -- Self-timed CDC wait: hold here until the read-side (i50MHz) Empty
-                -- flag, double-synchronised into SysClk as PhyTxBuff_Empty_s, has
-                -- de-asserted.  Only then is it safe to pulse TxEnReq, because
-                -- SMI_Proc latches TxEnAck on (TxEnReq='1' and PhyTxBuff_Empty='0').
-                if PhyTxBuff_Empty_s = '0' then
-                    AutoTx_TxEnReqPulse <= '1';
-                    AutoTx_WaitTimeout  <= 1000;   -- 1 ms TX drain timeout
-                    AutoTx_State        <= AT_WaitTxDrain;
-                elsif AutoTx_WaitTimeout > 0 then
-                    if Counter1us = X"00" then
-                        AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
-                    end if;
-                else
-                    -- Fill-side never went non-empty: FIFO/CDC is wedged.
-                    -- Flag the timeout and bail back to idle so the FSM does not
-                    -- stall this port forever.
-                    AutoTx_TimedOut(AutoTx_Port) <= '1';
-                    AutoTx_Busy(AutoTx_Port)     <= '0';  
-						  AutoTx_FifoRst_req           <= '1';   
-                    AutoTx_State                 <= AT_Idle;
-                end if;
-					 
-        end case;
+    -- -------------------------------------------------------------------------
+    -- RxFilled_sticky: latches a PhyRxBuff fill event while the FSM is in
+    -- AT_WaitRxFill. Used as a fallback in case the fill edge is missed on
+    -- the exact cycle the state machine checks PhyRxBuff_Empty. Cleared on
+    -- state exit and on reset.
+    -- -------------------------------------------------------------------------
+    if AutoTx_State = AT_WaitRxFill
+       and PhyRxFilled(AutoTx_Port) = '1' then
+        RxFilled_sticky <= '1';
     end if;
+
+
+    case AutoTx_State is
+
+      -- -----------------------------------------------------------------------
+      -- AT_Idle: scan ReadyStatus for the next port to service.
+      --
+      -- Performs a round-robin scan starting one position past RoundRobin_Last
+      -- so that no port is permanently prioritised over another. The loop exits
+      -- as soon as it finds a port that is both ready (ReadyStatus = '1') and
+      -- enabled by the channel mask (MaskReg = '1').
+      --
+      -- The FSM only leaves Idle when ALL of the following are true:
+      --   (a) A valid candidate port was found.
+      --   (b) PhyTxBuff_Empty_s = '1': the transmit FIFO is empty and safe to
+      --       write into without corrupting a preceding packet.
+      --   (c) PhyTxBuff_Full  = '0':  the FIFO has space for a new packet.
+      --   (d) PhyTxBuff_wreq  = '0':  the µC is not simultaneously writing to
+      --       the FIFO, preventing arbitration conflicts on the write port.
+      --
+      -- On departure:
+      --   AutoTx_Claim(found_port) pulsed for one cycle so the main process
+      --   can clear ReadyStatus(found_port) one cycle later, after the FSM has
+      --   already observed and acted on the set bit.
+      --   AutoTx_Busy(found_port) held high for the entire handshake cycle to
+      --   prevent re-entry for the same port until the cycle completes.
+      -- -----------------------------------------------------------------------
+      when AT_Idle =>
+          have_port := false;
+          for i in 0 to 7 loop
+              if ReadyStatus((RoundRobin_Last+1+i) mod 8) = '1'
+                 and MaskReg((RoundRobin_Last+1+i) mod 8) = '1' then
+                  found_port := (RoundRobin_Last+1+i) mod 8;
+                  have_port  := true;
+                  exit;
+              end if;
+          end loop;
+
+          if have_port
+             and PhyTxBuff_Empty_s = '1'
+             and PhyTxBuff_Full    = '0'
+             and PhyTxBuff_wreq    = '0' then
+              AutoTx_Port              <= found_port;
+              RoundRobin_Last          <= found_port;
+              AutoTx_WordIdx           <= 0;
+              AutoTx_Claim(found_port) <= '1';       -- one-shot: clears ReadyStatus next cycle
+              AutoTx_Busy(found_port)  <= '1';       -- hold until full cycle completes
+              onehot                   := (others => '0');
+              onehot(found_port)       := '1';
+              AutoTx_Target            <= onehot;    -- one-hot lane selection
+              TxEnMask_next            <= onehot;    -- pre-load CDC register immediately
+              AutoTx_State             <= AT_WriteWords;
+          end if;
+
+
+      -- -----------------------------------------------------------------------
+      -- AT_WriteWords: write the UBT packet into PhyTxBuff one word per cycle.
+      --
+      -- ubt_ascii_word(index, '1') returns the pre-computed 16-bit packet word
+      -- for the given word index. Words are written sequentially from index 0
+      -- to UBT_ASC_COUNT-1. PhyTxWrReq_FPGA is gated to '0' by the default
+      -- assignment above, so it is naturally a single-cycle strobe each
+      -- iteration without an explicit clear.
+      --
+      -- The guard (PhyTxBuff_Full = '0' and PhyTxWrReq_FPGA = '0') prevents a
+      -- write when the FIFO is full or when the previous write strobe is still
+      -- being processed, ensuring no words are dropped.
+      --
+      -- On the last word (AutoTx_WordIdx = UBT_ASC_COUNT - 1):
+      --   TxEnReq is NOT raised here. PhyTx_Buff is a true dual-clock FIFO
+      --   (wr_clk = SysClk, rd_clk = i50MHz); after the final write the i50MHz
+      --   read-side Empty flag requires approximately 3 i50MHz cycles to
+      --   de-assert. Raising TxEnReq before Empty falls would cause SMI_Proc
+      --   to miss the enable entirely. Instead, the FSM transitions to
+      --   AT_WaitTxFill and waits for the synchronised empty flag to confirm
+      --   the FIFO contents are visible on the read side.
+      -- -----------------------------------------------------------------------
+      when AT_WriteWords =>
+          if PhyTxBuff_Full = '0' and PhyTxWrReq_FPGA = '0' then
+              PhyTxDin_FPGA   <= ubt_ascii_word(AutoTx_WordIdx, '1');
+              PhyTxWrReq_FPGA <= '1';
+              if AutoTx_WordIdx >= UBT_ASC_COUNT - 1 then
+                  AutoTx_WordIdx     <= 0;
+                  AutoTx_WaitTimeout <= 1000;          -- 1 ms CDC settling timeout
+                  AutoTx_State       <= AT_WaitTxFill;
+              else
+                  AutoTx_WordIdx <= AutoTx_WordIdx + 1;
+              end if;
+          end if;
+
+
+      -- -----------------------------------------------------------------------
+      -- AT_WaitTxFill: wait for the FIFO write to become visible on the read side.
+      --
+      -- Holds until PhyTxBuff_Empty_s (the 3-stage SysClk-domain synchronised
+      -- version of the i50MHz-domain empty flag) falls to '0', confirming that
+      -- SMI_Proc can now see data waiting in the FIFO. Only at that point is
+      -- AutoTx_TxEnReqPulse asserted to trigger the TxEnReq handshake in main,
+      -- which in turn causes SMI_Proc to assert TxEnAck and begin transmission.
+      --
+      -- Timeout (1000 x 1 µs = 1 ms):
+      --   If the FIFO never goes non-empty the CDC path or FIFO is wedged.
+      --   AutoTx_FifoRst_req is asserted to force a FIFO reset via the
+      --   PhyTxFifoRst_stretch mechanism, the port is released, and the FSM
+      --   returns to idle. The port is NOT re-armed: a persistent fill failure
+      --   suggests a hardware fault that should be surfaced to the µC via the
+      --   timeout counter rather than silently retried.
+      -- -----------------------------------------------------------------------
+      when AT_WaitTxFill =>
+          if PhyTxBuff_Empty_s = '0' then
+              AutoTx_TxEnReqPulse <= '1';              -- triggers TxEnReq in main
+              AutoTx_WaitTimeout  <= 1000;             -- 1 ms transmit drain timeout
+              AutoTx_State        <= AT_WaitTxDrain;
+          elsif AutoTx_WaitTimeout > 0 then
+              if Counter1us = X"00" then
+                  AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+              end if;
+          else
+              AutoTx_TimedOut(AutoTx_Port) <= '1';
+              AutoTx_Busy(AutoTx_Port)     <= '0';
+              AutoTx_FifoRst_req           <= '1';     -- attempt FIFO recovery
+              AutoTx_State                 <= AT_Idle;
+          end if;
+
+
+      -- -----------------------------------------------------------------------
+      -- AT_WaitTxDrain: wait for SMI_Proc to fully transmit the UBT packet.
+      --
+      -- Holds until PhyTxBuff_Empty_s rises back to '1', confirming that the
+      -- i50MHz read side has consumed all words and the packet has been fully
+      -- clocked out to the PHY. RxFilled_sticky is cleared here so the
+      -- subsequent AT_WaitRxFill state starts with a clean latch.
+      --
+      -- Timeout (1000 x 1 µs = 1 ms):
+      --   If the FIFO does not drain (e.g. SMI_Proc is stalled or TxEnAck was
+      --   never asserted), AutoTx_FifoRst_req resets the FIFO, the port is
+      --   released, AutoTx_ReArm re-queues the port for a retry on the next
+      --   idle scan, and AutoTx_TimedOut is flagged for the µC.
+      -- -----------------------------------------------------------------------
+      when AT_WaitTxDrain =>
+          if PhyTxBuff_Empty_s = '1' then
+              RxFilled_sticky    <= '0';
+              AutoTx_WaitTimeout <= 10000;             -- 10 ms FEB reply timeout
+              AutoTx_State       <= AT_WaitRxFill;
+          elsif AutoTx_WaitTimeout > 0 then
+              if Counter1us = X"00" then
+                  AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+              end if;
+          else
+              AutoTx_TimedOut(AutoTx_Port) <= '1';
+              AutoTx_Busy(AutoTx_Port)     <= '0';
+              AutoTx_FifoRst_req           <= '1';     -- attempt FIFO recovery
+              AutoTx_ReArm(AutoTx_Port)    <= '1';     -- retry this port next idle scan
+              AutoTx_State                 <= AT_Idle;
+          end if;
+
+
+      -- -----------------------------------------------------------------------
+      -- AT_WaitRxFill: wait for the FEB to respond to the UBT packet.
+      --
+      -- The FEB sends its reply over the Ethernet link. The FPGA receives it
+      -- in PhyRx_Proc, which writes the incoming words into PhyRxBuff. This
+      -- state monitors PhyRxBuff_Empty(AutoTx_Port) directly: the moment it
+      -- falls to '0', data has arrived and the FSM advances.
+      -- PhyRxBuff is clocked on SysClk (rd_clk = SysClk) so this read is
+      -- safe without an additional synchroniser.
+      --
+      -- Timeout (10000 x 1 µs = 10 ms):
+      --   If no reply arrives within 10 ms the FEB is assumed unresponsive.
+      --   AutoTx_ReArm re-queues the port so the next idle scan will retry,
+      --   and AutoTx_TimedOut is flagged for diagnostic visibility.
+      -- -----------------------------------------------------------------------
+      when AT_WaitRxFill =>
+          if PhyRxBuff_Empty(AutoTx_Port) = '0' then
+              RxFilled_sticky    <= '0';
+              AutoTx_WaitTimeout <= 10000;             -- 10 ms DDR drain timeout
+              AutoTx_State       <= AT_WaitDdrDrain;
+          elsif AutoTx_WaitTimeout > 0 then
+              if Counter1us = X"00" then
+                  AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+              end if;
+          else
+              AutoTx_TimedOut(AutoTx_Port) <= '1';
+              AutoTx_Busy(AutoTx_Port)     <= '0';
+              AutoTx_ReArm(AutoTx_Port)    <= '1';     -- retry this port next idle scan
+              AutoTx_State                 <= AT_Idle;
+          end if;
+
+
+      -- -----------------------------------------------------------------------
+      -- AT_WaitDdrDrain: wait for the DDR write sequencer to consume the reply.
+      --
+      -- The DDR_Write_Seq FSM in main reads PhyRxBuff(AutoTx_Port) and writes
+      -- the FEB response data to LPDDR. This state waits until PhyRxBuff_Empty
+      -- returns to '1', confirming that all reply words have been transferred
+      -- to DDR and the receive FIFO is fully drained. Only then is the port
+      -- released (AutoTx_Busy cleared) and AutoTx_ReArm pulsed to prime the
+      -- same port for its next round-robin turn.
+      --
+      -- Timeout (10000 x 1 µs = 10 ms):
+      --   If the DDR write sequencer stalls and never drains the FIFO within
+      --   10 ms, the port is released and AutoTx_TimedOut is flagged. The port
+      --   is NOT re-armed on this timeout path: a DDR stall is a systemic fault
+      --   (not a per-port issue) and immediate retry would simply queue up
+      --   more unprocessed data. The µC can inspect AutoTx_TimedOut and
+      --   intervene via ReadyForceAddr if a manual retry is desired.
+      -- -----------------------------------------------------------------------
+      when AT_WaitDdrDrain =>
+          if PhyRxBuff_Empty(AutoTx_Port) = '1' then
+              AutoTx_Busy(AutoTx_Port)  <= '0';
+              AutoTx_ReArm(AutoTx_Port) <= '1';        -- arm port for next cycle
+              AutoTx_State              <= AT_Idle;
+          elsif AutoTx_WaitTimeout > 0 then
+              if Counter1us = X"00" then
+                  AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+              end if;
+          else
+              AutoTx_TimedOut(AutoTx_Port) <= '1';
+              AutoTx_Busy(AutoTx_Port)     <= '0';
+              AutoTx_State                 <= AT_Idle;
+          end if;
+
+    end case;
+  end if;
 end process AutoTx_Proc;
 
 
@@ -1666,21 +2354,7 @@ for p in 0 to 7 loop
   phy_empty_d(p)(0) <= PhyRxBuff_Empty(p); -- capture the current sample
 end loop;
 
--- Drain-edge detection ? fires one cycle after PhyRxBuff(p) transitions
--- from non-empty to empty AND AutoTx is not actively managing the port.
--- phy_empty_d(p)(1) = buffer state two cycles ago
--- phy_empty_d(p)(0) = buffer state one cycle ago
--- The two-cycle window aligns with AutoTx_Busy clearing in AutoTx_Proc
--- (separate process ? one-cycle visibility delay in main).
---for p in 0 to 7 loop
---  if phy_empty_d(p)(1) = '0'       -- was non-empty two cycles ago
---     and phy_empty_d(p)(0) = '1'   -- became empty one cycle ago
---     and MaskReg(p) = '1'
---     and AutoTx_Busy(p) = '0'      -- AutoTx has released the port
---  then
---    rs_next(p) := '1';
---  end if;
---end loop;
+
 
 
 
@@ -1735,22 +2409,6 @@ if WRDL = 1 and uCA(11 downto 10) = GA
 end if;
 
 
--- P3: Re-arm ReadyStatus on FEB reply.
--- When a PHY Rx FIFO transitions from empty to non-empty, the FEB has
--- responded and is ready for another UBT request.  Guard against
--- spurious re-arms during an in-flight claim by checking both the
--- current-cycle (AutoTx_Claim) and previous-cycle (AutoTx_Claim_d)
--- claim pulses, and the overall busy flag (AutoTx_Busy).
---for p in 0 to 7 loop
---  if CpldRst_sync = '1'
---     and PhyRxFilled(p) = '1'
---     and AutoTx_Busy(p) = '0'
---     and AutoTx_Claim(p) = '0'
---     and AutoTx_Claim_d(p) = '0'
---  then
---    rs_next(p) := '1';
---  end if;
---end loop;
 
 
 -- P2: Clear ReadyStatus for any port that AutoTx_Proc has just claimed (one cycle
@@ -1994,23 +2652,6 @@ end if;
 Debug(2) <= DRegSrc;
 DDRWrt_EnD <= DDRWrt_En;DDRRd_EnD <= DDRRd_en;
 
---if WRDL = 1 and ((uCA(11 downto 10) = GA and uCA(9 downto 0) = CSRRegAddr)
---					or (uCA(9 downto 0) = CSRBroadCastAd))
---	and uCD(0) = '1' and PhyRstCnt = 0
---then PhyRst <= '0';
---elsif PhyRstCnt = 1 and Counter1us = Count1us
---then PhyRst <= '1';
---else PhyRst <= PhyRst;
---end if;
-
---if WRDL = 1 and ((uCA(11 downto 10) = GA and uCA(9 downto 0) = CSRRegAddr)
---					or (uCA(9 downto 0) = CSRBroadCastAd))
--- and uCD(0) = '1' and PhyRstCnt = 0
---then PhyRstCnt <= "11";
---elsif PhyRstCnt /= 0 and Counter1us = Count1us
---then PhyRstCnt <= PhyRstCnt - 1;
---else PhyRstCnt <= PhyRstCnt;
---end if;
 
 -- AUTO-RELEASE: trigger PhyRst sequence once after startup holdoff saturates,
 -- exactly as if the microcontroller had written bit0=1 to the CSR.
@@ -2117,12 +2758,6 @@ if WRDL = 1 and AddrReg(11 downto 10) = GA and AddrReg(9 downto 0) = FMRxErrAddr
 then RxIn(1).Clr_Err <= uCD(10);
 else RxIn(1).Clr_Err <= '0';
 end if;
-
--- Enable PHY transmit either from a uC CSR write OR from AutoTx completion
--- AutoTx_TxEnReqPulse is a single-cycle pulse. If TxEnAck is still asserted from a
--- previous transmission when the pulse arrives, TxEnReq = '0' and TxEnAck = '0' will
--- not both be true and the pulse would be silently dropped. The sticky hold latches
--- the pulse and holds it until TxEnReq is successfully set, preventing missed TX enables.
 
 
 
@@ -2628,14 +3263,7 @@ else PhyRxBuff_rdreq(i) <= '0';
 end if;
 
 ---- Status indicating a port is active and a complete event is available for readout
--- if Rx_active(i) = '1' and PhyRxBuff_Empty(i) = '0' and PhyRxBuff_RdCnt(i) >= PhyRxBuff_Out(i)
---  then PhyRxBuff_RdStat(i) <= '1';
---  else PhyRxBuff_RdStat(i) <= '0';
--- end if;
- --  AFTER 
--- MaskReg gate is kept so that masked ports are never processed.
--- Rx_active gate is removed: a non-empty, fully-arrived buffer is
--- "ready" regardless of FM-link activity.
+
 if MaskReg(i) = '1'
    and PhyRxBuff_Empty(i) = '0'
    and PhyRxBuff_RdCnt(i) >= PhyRxBuff_Out(i)
@@ -2680,12 +3308,7 @@ end loop;
  end if;
 
 -- Signal to indicate if all active ports have an event ready
---  if Rx_active = PhyRxBuff_RdStat then EventRdy <= '1'; 
---  else EventRdy <= '0'; 
---  end if; 
--- "At least one masked port has a full event waiting in PhyRxBuff."
--- PhyRxBuff_RdStat is now non-zero only when real data is present
--- (Fix 1), so this can never be vacuously true.
+
 if PhyRxBuff_RdStat /= X"00" then EventRdy <= '1';
 else EventRdy <= '0';
 end if;
@@ -2709,9 +3332,7 @@ end if;
 	 else PortWdCounter(PortNo) <= PortWdCounter(PortNo);
 	end if;
 
--- Idle,ChkWrtBuff,SndCmd,WtCmdMtpy,IncrPort0,CheckActive0,Rd_WdCount,Rd_uBunchHi,Rd_uBunchLo,
--- Rd_Stat,CheckActive1,ResetPortNo,Write_Wd_Count,Wrt_Stat,
--- Wrt_uBunchHi,Wrt_uBunchLo,WrtDDR,WritePad,IncrBuffCnt
+
 
 Case DDR_Write_Seq is
    When Idle => DDRWrtStat <= X"0"; Debug(10 downto 7) <= X"0"; 
@@ -2733,16 +3354,7 @@ Case DDR_Write_Seq is
 		if SDwr_empty = '1' then DDR_Write_Seq <= Idle;
 		else DDR_Write_Seq <= WtCmdMtpy;
 		end if;
---	When IncrPort0 => DDR_Write_Seq <= CheckActive0; DDRWrtStat <= X"1"; Debug(10 downto 7) <= X"1";
---	When CheckActive0 => DDRWrtStat <= X"2"; Debug(10 downto 7) <= X"2"; 
---			if Rx_active = 0 then DDR_Write_Seq <= Idle;
---			elsif Rx_active(PortNo) = '1'
---			 then DDR_Write_Seq <= Rd_WdCount;
---			elsif Rx_active(PortNo) = '0' and PortNo /= 7 
---			 then DDR_Write_Seq <= IncrPort0;
---			else DDR_Write_Seq <= Write_Wd_Count;
---			end if;
-	-- comment this code
+
 	When CheckActive0 =>
     -- Only abort to Idle when BOTH FM links AND all Rx FIFOs are idle.
     if Rx_active = 0 and PhyRxBuff_Empty = X"FF" then
