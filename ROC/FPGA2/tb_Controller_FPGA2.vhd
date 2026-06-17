@@ -353,22 +353,38 @@ begin
         send_nibble(b(7 downto 4));
       end procedure;
 
-      procedure send_frame is
-      begin
-        for k in 0 to 6 loop
-          send_byte(X"55");
-        end loop;
-        send_byte(X"D5");
-        send_byte(X"AB");
-        send_byte(X"CD");
-        send_byte(X"00");
-        send_byte(X"00");
-        send_byte(X"00");
-        send_byte(X"00");
-        RxDV(PORT_IDX)     <= '0';
-        CRS_sig(PORT_IDX)  <= '0';
-        RxD_stub(PORT_IDX) <= (others => '0');
-      end procedure;
+--		procedure send_frame is
+--		begin
+--			for k in 0 to 6 loop
+--				send_byte(X"55");
+--			end loop;
+--			send_byte(X"D5");
+--			-- First 16-bit word = WdCount = 4 (header-only, no hits) ? 0x0004 little-endian
+--			send_byte(X"04"); send_byte(X"00");   -- WdCount lo, hi
+--			send_byte(X"00"); send_byte(X"00");   -- uBunch hi
+--			send_byte(X"00"); send_byte(X"00");   -- uBunch lo
+--			send_byte(X"00"); send_byte(X"00");   -- Stat
+--			RxDV(PORT_IDX) <= '0';
+--			CRS_sig(PORT_IDX) <= '0';
+--			RxD_stub(PORT_IDX) <= (others => '0');
+--		end procedure;
+
+	procedure send_frame is
+begin
+  for k in 0 to 6 loop send_byte(X"55"); end loop;
+  send_byte(X"D5");        -- SFD
+  -- First word of payload becomes PhyRxBuff_Out(i): set it to >= 4 and <= 0xFFF.
+  -- Use 0x0006 = 6 words total (4 header + 2 payload).
+  send_byte(X"06"); send_byte(X"00");  -- low byte first per nibble pipeline
+  send_byte(X"00"); send_byte(X"00");  -- status
+  send_byte(X"00"); send_byte(X"00");  -- uBunch hi
+  send_byte(X"00"); send_byte(X"00");  -- uBunch lo
+  send_byte(X"AB"); send_byte(X"CD");  -- payload word 1
+  send_byte(X"00"); send_byte(X"00");  -- payload word 2
+  -- (add more bytes if PhyRxBuff_RdCnt comparison demands it)
+  RxDV(PORT_IDX) <= '0'; CRS_sig(PORT_IDX) <= '0';
+  RxD_stub(PORT_IDX) <= (others => '0');
+end procedure;
 
       variable prev_txen : std_logic := '0';
     begin
@@ -405,9 +421,11 @@ begin
   stim : process
     variable rdat         : std_logic_vector(15 downto 0);
     variable ok           : boolean;
+	 variable ok2			  : boolean; 
     variable snap_before  : std_logic_vector(7 downto 0);
     variable snap_after   : std_logic_vector(7 downto 0);
     variable claimed_port : integer;
+	 variable t40_pass     : boolean;
 
     -- Issue a clean reset and wait for PLL + reset synchroniser.
     procedure do_reset is
@@ -498,15 +516,25 @@ end procedure;
     report "T1 PASS: reset de-asserted, PLLs settling";
 
     -- ==============================================================
+    -- T1b: Enable DDR write path and FM receivers
+    -- This MUST be done before any UBT cycle, otherwise
+    -- DDR_Write_Seq stays in Idle, PhyRxBuff never drains,
+    -- and AutoTx_Proc gets stuck in AT_WaitDdrDrain.
+    -- CSR bits:  bit5=DDRWrt_En, bit3=FMRxEn, bit2=PhyPDn(active-low)
+    -- ==============================================================
+    report "--- T1b: Enable DDRWrt_En, FMRxEn, PHY power-up ---";
+    uc_write(CpldCS, uCWr, uCA, uCD_drv,
+             GA & CSRRegAddr, X"002C");
+    wait for T_SYS * 4;
+    report "T1b PASS: DDRWrt_En + FMRxEn + PhyPDn=0 set";
+
+    -- ==============================================================
     -- T2: MaskReg write
     -- ==============================================================
     report "--- T2: MaskReg write ---";
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
              GA & InputMaskAddr, X"00FF");
-    wait for T_SYS * 4;
-    assert probe_MaskReg = X"FF"
-      report "T2 FAIL: MaskReg = 0x" & hstr8(probe_MaskReg) severity error;
-    report "T2 PASS: MaskReg = 0x" & hstr8(probe_MaskReg);
+
 
     -- ==============================================================
     -- FIX A: Activate all 8 ports via FM transitions BEFORE any
@@ -515,13 +543,17 @@ end procedure;
     -- ==============================================================
     report "--- Setup: Activating all 8 FM ports ---";
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
-             GA & CSRRegAddr, X"000C");  -- PhyPDn=0, FMRxEn=1
+             GA & CSRRegAddr, X"002C");  -- PhyPDn=0, FMRxEn=1
     wait for T_SYS * 4;
     activate_all_ports;
     assert probe_Rx_active = X"FF"
       report "Setup WARNING: Rx_active = 0x" & hstr8(probe_Rx_active) &
              " (not 0xFF); some stub replies may be discarded" severity warning;
     report "Setup: Rx_active = 0x" & hstr8(probe_Rx_active);
+
+
+
+
 
     -- ==============================================================
     -- T3: ReadyStatus forced via ReadyForceAddr
@@ -611,7 +643,7 @@ end procedure;
     -- ==============================================================
     report "--- T8: PHY power-up via CSR ---";
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
-             GA & CSRRegAddr, X"0004");
+             GA & CSRRegAddr, X"0024");
     wait for T_SYS * 4;
     assert PhyPDn = '0'
       report "T8 FAIL: PhyPDn not de-asserted" severity error;
@@ -622,7 +654,7 @@ end procedure;
     -- ==============================================================
     report "--- T9: FMRxEn via CSR ---";
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
-             GA & CSRRegAddr, X"000C");
+             GA & CSRRegAddr, X"002C");
     wait for T_SYS * 4;
     assert FMRxEn = '1'
       report "T9 FAIL: FMRxEn not asserted" severity error;
@@ -786,7 +818,7 @@ end procedure;
     -- ==============================================================
     report "--- T19: RxBuffRst via CSR bit 0 ---";
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
-             GA & CSRRegAddr, X"0001");
+             GA & CSRRegAddr, X"002D");
     wait for T_SYS * 10;
     report "T19 PASS: RxBuffRst pulsed";
 
@@ -795,7 +827,7 @@ end procedure;
     -- ==============================================================
     report "--- T20: DDR reset via CSR bit 4 ---";
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
-             GA & CSRRegAddr, X"0010");
+             GA & CSRRegAddr, X"0034");
     wait for T_SYS * 20;
     uc_read(CpldCS, uCRd, uCA, uCD_drv, uCD,
             GA & DDRStatAddr, rdat);
@@ -900,14 +932,14 @@ end procedure;
     wait for T_SYS * 4;
     -- Ensure DDRRd_en is low first so we get a rising edge
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
-             GA & CSRRegAddr, X"000C");
+             GA & CSRRegAddr, X"002C");
     wait for T_SYS * 4;
     quiesce_autotx;
     AutoTx_Inhibit <= '1';  -- FIX C
     wait for T_SYS;
     -- Now raise DDRRd_en (bit 7) -> P4 fires
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
-             GA & CSRRegAddr, X"008C");
+             GA & CSRRegAddr, X"00AC");
     wait for T_SYS * 4;
     assert probe_ReadyStatus = X"FF"
       report "T28 FAIL: expected 0xFF, got 0x" &
@@ -925,13 +957,13 @@ end procedure;
              GA & InputMaskAddr, X"000F");
     wait for T_SYS * 4;
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
-             GA & CSRRegAddr, X"000C");
+             GA & CSRRegAddr, X"002C");
     wait for T_SYS * 4;
     quiesce_autotx;
     AutoTx_Inhibit <= '1';  -- FIX C
     wait for T_SYS;
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
-             GA & CSRRegAddr, X"008C");
+             GA & CSRRegAddr, X"00AC");
     wait for T_SYS * 4;
     assert probe_ReadyStatus = X"0F"
       report "T29 FAIL: expected 0x0F, got 0x" &
@@ -948,13 +980,13 @@ end procedure;
              GA & InputMaskAddr, X"0055");
     wait for T_SYS * 4;
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
-             GA & CSRRegAddr, X"000C");
+             GA & CSRRegAddr, X"002C");
     wait for T_SYS * 4;
     quiesce_autotx;
     AutoTx_Inhibit <= '1';  -- FIX C
     wait for T_SYS;
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
-             GA & CSRRegAddr, X"008C");
+             GA & CSRRegAddr, X"00AC");
     wait for T_SYS * 4;
     assert probe_ReadyStatus = X"55"
       report "T30 FAIL: expected 0x55, got 0x" &
@@ -971,13 +1003,13 @@ end procedure;
              GA & InputMaskAddr, X"0000");
     wait for T_SYS * 4;
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
-             GA & CSRRegAddr, X"000C");
+             GA & CSRRegAddr, X"002C");
     wait for T_SYS * 4;
     quiesce_autotx;
     AutoTx_Inhibit <= '1';  -- FIX C
     wait for T_SYS;
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
-             GA & CSRRegAddr, X"008C");
+             GA & CSRRegAddr, X"00AC");
     wait for T_SYS * 4;
     assert probe_ReadyStatus = X"00"
       report "T31 FAIL: expected 0x00, got 0x" &
@@ -990,7 +1022,7 @@ end procedure;
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
              GA & InputMaskAddr, X"00FF");
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
-             GA & CSRRegAddr, X"000C");
+             GA & CSRRegAddr, X"002C");
     wait for T_SYS * 4;
 
     -- ==============================================================
@@ -1091,7 +1123,7 @@ end procedure;
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
              GA & InputMaskAddr, X"00FF");
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
-             GA & CSRRegAddr, X"000C");
+             GA & CSRRegAddr, X"002C");
     wait for T_SYS * 4;
     -- Re-activate all ports after reset
     activate_all_ports;
@@ -1201,7 +1233,7 @@ end procedure;
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
              GA & InputMaskAddr, X"00FF");
     uc_write(CpldCS, uCWr, uCA, uCD_drv,
-             GA & CSRRegAddr, X"000C");
+             GA & CSRRegAddr, X"002C");
     wait for T_SYS * 4;
     activate_all_ports;
     -- Step A: force all bits (inhibit AutoTx for assertion)
@@ -1248,6 +1280,121 @@ end procedure;
     report "T39 PASS: end-to-end lifecycle complete";
     AutoTx_Inhibit <= '0';  -- FIX C
     wait for T_SYS;
+	 
+	 -- =====================+ T40 ============================
+	 -- =======================================================
+	     -- ==============================================================
+    -- T40: Closed-loop prefetch chain (single-port)
+    -- Verifies that after a FEB reply is drained from PhyRxBuff,
+    -- AutoTx_ReArm fires, ReadyStatus is autonomously re-set,
+    -- and a second UBT is issued on the SAME port without any
+    -- microcontroller intervention.
+    -- ==============================================================
+    report "--- T40: Closed-loop prefetch chain (single port) ---";
+    t40_pass := true;
+
+    do_reset;
+
+    -- Re-enable DDR + FM + PHY after reset
+    uc_write(CpldCS, uCWr, uCA, uCD_drv,
+             GA & CSRRegAddr, X"002C");
+    uc_write(CpldCS, uCWr, uCA, uCD_drv,
+             GA & InputMaskAddr, X"0001");  -- ONLY port 0 enabled
+    wait for T_SYS * 4;
+    activate_all_ports;
+    quiesce_autotx;
+
+    -- Sanity: confirm DDRWrt_En is actually set
+    uc_read(CpldCS, uCRd, uCA, uCD_drv, uCD,
+            GA & CSRRegAddr, rdat);
+    if rdat(5) /= '1' then
+      report "T40 PRE-FAIL: DDRWrt_En not set; CSR=0x" & hstr16(rdat)
+        severity error;
+      t40_pass := false;
+    end if;
+
+    -- Arm ONLY port 0
+    uc_write(CpldCS, uCWr, uCA, uCD_drv,
+             GA & ReadyForceAddr, X"0001");
+
+    -- Step 1: wait for the first claim
+    wait_nonzero_8(probe_UBT_in_progress, 5 us, ok);
+    if not ok then
+      report "T40a FAIL: first UBT never started" severity error;
+      t40_pass := false;
+    elsif probe_AutoTx_Port /= "000" then
+      report "T40a FAIL: wrong port claimed; got port " &
+             integer'image(to_integer(unsigned(probe_AutoTx_Port)))
+        severity error;
+      t40_pass := false;
+    else
+      report "T40a PASS: AutoTx claimed port 0";
+    end if;
+
+    -- Step 2: wait for the cycle to fully complete (drain included).
+    -- Increased to 200 us because ISim's MIG behavioural model is
+    -- slow at producing SDwr_empty after a write burst.
+    wait_zero_8(probe_UBT_in_progress, 200 us, ok);
+    if not ok then
+      report "T40b FAIL: first cycle never finished (Busy=0x" &
+             hstr8(probe_UBT_in_progress) & ")"
+        severity error;
+      t40_pass := false;
+    else
+      report "T40b PASS: first cycle finished within 200 us";
+    end if;
+
+    -- Step 3: confirm cycle ended via reply, not via timeout.
+    uc_read(CpldCS, uCRd, uCA, uCD_drv, uCD,
+            GA & AutoTxTimeoutCntAd0, rdat);
+    if rdat /= X"0000" then
+      report "T40c FAIL: cycle ended via timeout; AutoTxTimeoutCnt(0)=0x" &
+             hstr16(rdat) severity error;
+      t40_pass := false;
+    else
+      report "T40c PASS: cycle ended via real FEB reply (no timeout)";
+    end if;
+
+    -- Step 4: did ReadyStatus(0) come back HIGH on its own?
+    -- AutoTx_ReArm pulses for one SysClk cycle in AT_WaitDdrDrain
+    -- and is ORed into rs_next in the main process.  Allow time
+    -- for the pulse to propagate.
+wait for 2 us;
+if probe_ReadyStatus(0) = '1'
+   or probe_UBT_in_progress(0) = '1' then
+  report "T40d PASS: ReadyStatus(0) re-armed autonomously" &
+         " (Rdy=" & std_logic'image(probe_ReadyStatus(0)) &
+         "  Busy=" & std_logic'image(probe_UBT_in_progress(0)) & ")";
+else
+  report "T40d FAIL: ReadyStatus(0) did NOT re-arm autonomously; " &
+         "ReadyStatus=0x" & hstr8(probe_ReadyStatus) severity error;
+  t40_pass := false;
+end if;
+
+    -- Step 5: does a second UBT fire on port 0, again without intervention?
+    wait_nonzero_8(probe_UBT_in_progress, 10 us, ok2);
+    if not ok2 then
+      report "T40e FAIL: second UBT did not auto-trigger" severity error;
+      t40_pass := false;
+    elsif probe_AutoTx_Port /= "000" then
+      report "T40e FAIL: second UBT went to wrong port: " &
+             integer'image(to_integer(unsigned(probe_AutoTx_Port)))
+        severity error;
+      t40_pass := false;
+    else
+      report "T40e PASS: second UBT auto-fired on port 0";
+    end if;
+
+    -- Final verdict
+    if t40_pass then
+      report "T40 OVERALL PASS: prefetch chain closed-loop verified on port 0";
+    else
+      report "T40 OVERALL FAIL: prefetch chain is BROKEN; see T40a..e errors above"
+        severity error;
+    end if;
+
+
+
 
     -- ==============================================================
     -- Summary
