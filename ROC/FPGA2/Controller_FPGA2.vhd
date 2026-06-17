@@ -384,6 +384,8 @@ signal AutoTx_WaitTimeout : integer range 0 to 100000 := 0; -- ~100 ms at 100 MH
 -- 256 SysClk cycles @ 100 MHz = 2.56 us, well after CpldRst_sync stabilises.
 signal StartupHoldoff : std_logic_vector(20 downto 0) := (others => '0');
 
+signal ReArm_pending : std_logic_vector(7 downto 0) := (others => '0');
+
 signal PhyRst_AutoDone : std_logic := '0';  -- prevents auto-init firing twice
 
 signal PhyTxFifoRst_pulse : std_logic := '0';  -- one-shot reset for PhyTx FIFO-- Sticky latch: holds CurrentTarget value from the most recent PhyTxBuff_rdreq pulse.
@@ -2461,7 +2463,9 @@ if AutoTx_Claim_d /= X"00" then
 end if;
 
 if AutoTx_ReArm /= X"00" then
-    rs_next := rs_next or AutoTx_ReArm;
+  --  rs_next := rs_next or AutoTx_ReArm;
+	ReArm_pending <= (ReArm_pending or AutoTx_ReArm) and (not AutoTx_Claim_d);
+	rs_next := rs_next or ReArm_pending;
 end if;
 
 
