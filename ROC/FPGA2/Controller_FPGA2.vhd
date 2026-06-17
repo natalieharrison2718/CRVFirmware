@@ -2462,11 +2462,24 @@ if AutoTx_Claim_d /= X"00" then
   rs_next := rs_next and (not AutoTx_Claim_d);
 end if;
 
+--if AutoTx_ReArm /= X"00" then
+--  --  rs_next := rs_next or AutoTx_ReArm;
+--	ReArm_pending <= (ReArm_pending or AutoTx_ReArm) and (not AutoTx_Claim_d);
+--	rs_next := rs_next or ReArm_pending;
+--end if;
+
+-- 1) ReArm_pending: registered, OUTSIDE any gate, masked every cycle
+ReArm_pending <= (ReArm_pending or AutoTx_ReArm) and (not AutoTx_Claim_d);
+
+-- 2) Combinational OR into rs_next: same-cycle visibility for fresh pulse,
+--    plus held value for following cycles
 if AutoTx_ReArm /= X"00" then
-  --  rs_next := rs_next or AutoTx_ReArm;
-	ReArm_pending <= (ReArm_pending or AutoTx_ReArm) and (not AutoTx_Claim_d);
-	rs_next := rs_next or ReArm_pending;
+  rs_next := rs_next or AutoTx_ReArm;          -- restore original line
 end if;
+rs_next := rs_next or ReArm_pending;           -- OUTSIDE the if, every cycle
+
+-- 3) Reset (in your CpldRst_sync='0' branch of the main process):
+ReArm_pending <= (others => '0');
 
 
 if WRDL = 1 and uCA(11 downto 10) = GA
