@@ -346,7 +346,8 @@ signal PhyTxDin_FPGA      : std_logic_vector(15 downto 0) := (others => '0'); --
 signal PhyTxDin_mux       : std_logic_vector(15 downto 0) := (others => '0'); -- selected DIN to PhyTx_Buff (uC or FPGA)
 signal PhyTxBuff_wr_en_mux: std_logic := '0';                                  -- combined wr_en into PhyTx_Buff
 signal PhyTxWrReq_FPGA    : std_logic := '0';                                  -- one-cycle FPGA write request
-type AutoTx_FSM is (AT_Idle, AT_WriteWords, AT_WaitTxFill, AT_WaitTxDrain, AT_WaitRxFill, AT_WaitDdrDrain);
+--type AutoTx_FSM is (AT_Idle, AT_WriteWords, AT_WaitTxFill, AT_WaitTxDrain, AT_WaitRxFill, AT_WaitDdrDrain);
+type AutoTx_FSM is (AT_Idle, AT_WriteWords, AT_WaitTxFill, AT_WaitTxDrain, AT_WaitRxFill);
 signal AutoTx_State : AutoTx_FSM := AT_Idle;
 signal AutoTx_Port        : integer range 0 to 7 := 0;
 signal AutoTx_WordIdx     : integer range 0 to 15 := 0; -- supports up to 16-word packets if needed
@@ -1751,35 +1752,26 @@ begin
       --                    register report "UBT fired" when nothing was actually
       --                    driven onto the wire.
       -- -----------------------------------------------------------------------
-      if PhyTxBuff_rdreq = '1'
-         and not (LastTxTarget_clr_sync(2) = '0' and
-                  LastTxTarget_clr_sync(1) = '1') then
-        TxTarget_hold <= tgt_candidate;
-        if tgt_candidate /= ZERO8 and TxEn /= ZERO8 then
-          LastTxTarget <= tgt_candidate;
-        end if;
-        nibble_hold_cnt <= 4;
-      elsif PhyTxBuff_rdreq = '1' then
-        -- still take the hold/countdown side-effects, just don't re-latch LastTxTarget
-        TxTarget_hold  <= tgt_candidate;
-        nibble_hold_cnt <= 4;
-      end if;
+		-- Inside phy_out_gating, replace Section 3 + Section 3b with:
 
-      -- -----------------------------------------------------------------------
-      -- Section 3b: µC clear of LastTxTarget diagnostic register
-      --
-      -- Triggered by a rising edge on LastTxTarget_clr_sync(1), which is the
-      -- synchronised version of the SysClk-domain clear strobe written when the
-      -- µC reads (or explicitly clears) LastTxTargetAddr.
-      --
-      -- Placed AFTER the rdreq latch above: in VHDL clocked processes the last
-      -- assignment to a signal wins. If a FIFO read and a µC clear coincide in
-      -- the same 25 MHz cycle, the clear takes effect ? preventing a stale
-      -- address from being re-latched on the same cycle it is being cleared.
-      -- -----------------------------------------------------------------------
-      if LastTxTarget_clr_sync(2) = '0' and LastTxTarget_clr_sync(1) = '1' then
-        LastTxTarget <= (others => '0');
-      end if;
+-- Use the LEVEL of the synchronised stretch pulse (not just the rising edge)
+-- so LastTxTarget cannot be re-latched anywhere inside the µC's clear
+-- window. The stretch is 5 SysClk cycles ? this ends up being ~2 i50MHz
+-- cycles where _sync(1) is high, which fully covers the µC read-back path.
+if LastTxTarget_clr_sync(1) = '1' then
+  LastTxTarget <= (others => '0');
+  if PhyTxBuff_rdreq = '1' then
+    TxTarget_hold   <= tgt_candidate;
+    nibble_hold_cnt <= 4;
+    -- DELIBERATELY do NOT update LastTxTarget here.
+  end if;
+elsif PhyTxBuff_rdreq = '1' then
+  TxTarget_hold <= tgt_candidate;
+  if tgt_candidate /= ZERO8 and TxEn /= ZERO8 then
+    LastTxTarget <= tgt_candidate;
+  end if;
+  nibble_hold_cnt <= 4;
+end if;
 
 
       -- -----------------------------------------------------------------------
@@ -2215,21 +2207,42 @@ begin
       --   AutoTx_ReArm re-queues the port so the next idle scan will retry,
       --   and AutoTx_TimedOut is flagged for diagnostic visibility.
       -- -----------------------------------------------------------------------
-      when AT_WaitRxFill =>
-          if PhyRxBuff_Empty(AutoTx_Port) = '0' then
-              RxFilled_sticky    <= '0';
-              AutoTx_WaitTimeout <= 10000;             -- 10 ms DDR drain timeout
-              AutoTx_State       <= AT_WaitDdrDrain;
-          elsif AutoTx_WaitTimeout > 0 then
-              if Counter1us = X"00" then
-                  AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
-              end if;
-          else
-              AutoTx_TimedOut(AutoTx_Port) <= '1';
-              AutoTx_Busy(AutoTx_Port)     <= '0';
-              AutoTx_ReArm(AutoTx_Port)    <= '1';     -- retry this port next idle scan
-              AutoTx_State                 <= AT_Idle;
-          end if;
+--      when AT_WaitRxFill =>
+--          if PhyRxBuff_Empty(AutoTx_Port) = '0' then
+--              RxFilled_sticky    <= '0';
+--              AutoTx_WaitTimeout <= 10000;             -- 10 ms DDR drain timeout
+--              AutoTx_State       <= AT_WaitDdrDrain;
+--          elsif AutoTx_WaitTimeout > 0 then
+--              if Counter1us = X"00" then
+--                  AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+--              end if;
+--          else
+--              AutoTx_TimedOut(AutoTx_Port) <= '1';
+--              AutoTx_Busy(AutoTx_Port)     <= '0';
+--              AutoTx_ReArm(AutoTx_Port)    <= '1';     -- retry this port next idle scan
+--              AutoTx_State                 <= AT_Idle;
+--          end if;
+
+		when AT_WaitRxFill =>
+    if PhyRxBuff_Empty(AutoTx_Port) = '0' then
+        -- FEB has replied; that's all we need to re-arm.
+        -- Flush the per-port Rx FIFO so the DDR sequencer (or anything else)
+        -- starts clean next cycle, and immediately release + re-arm the port.
+        AutoTx_RxFlush(AutoTx_Port) <= '1';
+        AutoTx_Busy   (AutoTx_Port) <= '0';
+        AutoTx_ReArm  (AutoTx_Port) <= '1';
+        AutoTx_State                <= AT_Idle;
+    elsif AutoTx_WaitTimeout > 0 then
+        if Counter1us = X"00" then
+            AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+        end if;
+    else
+        AutoTx_TimedOut(AutoTx_Port) <= '1';
+        AutoTx_Busy   (AutoTx_Port)  <= '0';
+        AutoTx_ReArm  (AutoTx_Port)  <= '1';
+        AutoTx_State                 <= AT_Idle;
+    end if;
+
 
 
       -- -----------------------------------------------------------------------
@@ -2250,25 +2263,25 @@ begin
       --   more unprocessed data. The µC can inspect AutoTx_TimedOut and
       --   intervene via ReadyForceAddr if a manual retry is desired.
       -- -----------------------------------------------------------------------
-		when AT_WaitDdrDrain =>
-			if PhyRxBuff_Empty(AutoTx_Port) = '1' then
-				AutoTx_Busy(AutoTx_Port)  <= '0';
-				AutoTx_ReArm(AutoTx_Port) <= '1';
-				AutoTx_State              <= AT_Idle;
-			elsif AutoTx_WaitTimeout > 0 then
-				if Counter1us = X"00" then
-					AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
-				end if;
-			else
-				-- Recovery path: malformed FEB reply (RdCnt < header word count).
-				-- Flush the offending port's PhyRxBuff so the next cycle is clean,
-				-- mark the timeout, release the port, AND re-arm so traffic resumes.
-				AutoTx_TimedOut(AutoTx_Port) <= '1';
-				AutoTx_RxFlush(AutoTx_Port)  <= '1';   -- one-shot per-port flush
-				AutoTx_Busy(AutoTx_Port)     <= '0';
-				AutoTx_ReArm(AutoTx_Port)    <= '1';   -- <-- currently missing; without this the port goes dark
-				AutoTx_State                 <= AT_Idle;
-			end if;
+--		when AT_WaitDdrDrain =>
+--			if PhyRxBuff_Empty(AutoTx_Port) = '1' then
+--				AutoTx_Busy(AutoTx_Port)  <= '0';
+--				AutoTx_ReArm(AutoTx_Port) <= '1';
+--				AutoTx_State              <= AT_Idle;
+--			elsif AutoTx_WaitTimeout > 0 then
+--				if Counter1us = X"00" then
+--					AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+--				end if;
+--			else
+--				-- Recovery path: malformed FEB reply (RdCnt < header word count).
+--				-- Flush the offending port's PhyRxBuff so the next cycle is clean,
+--				-- mark the timeout, release the port, AND re-arm so traffic resumes.
+--				AutoTx_TimedOut(AutoTx_Port) <= '1';
+--				AutoTx_RxFlush(AutoTx_Port)  <= '1';   -- one-shot per-port flush
+--				AutoTx_Busy(AutoTx_Port)     <= '0';
+--				AutoTx_ReArm(AutoTx_Port)    <= '1';   -- <-- currently missing; without this the port goes dark
+--				AutoTx_State                 <= AT_Idle;
+--			end if;
 
     end case;
   end if;
