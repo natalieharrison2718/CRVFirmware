@@ -368,10 +368,11 @@ signal AutoTx_TxEnReqHold : std_logic := '0';  -- sticky, driven only from main
 -- sufficient time to de-assert PhyTxBuff_Empty before TxEnReq is raised.
 -- 6 SysClk cycles @ 100 MHz (60 ns) >= 3 i50MHz cycles, which covers the
 -- standard 2-FF synchroniser plus one cycle of margin.
+signal AutoTx_Inhibit_int : std_logic := '0';    
+signal AutoTx_RxFlush : std_logic_vector(7 downto 0) := (others => '0');
 
 
-
--- Sequential UBT handshake: track which port we are waiting on
+-- Sequential UBT handshake: trackd which port we are waiting on
 signal AutoTx_WaitPort : integer range 0 to 7 := 0;
 signal AutoTx_RxGot : std_logic_vector(7 downto 0) := (others => '0');  -- sticky "reply arrived"
 signal PhyRxBuff_WasEmpty : std_logic_vector(7 downto 0) := (others => '1'); -- previous cycle empty
@@ -902,7 +903,7 @@ Debug(6) <= FMRx(0);
 Gen_FEBRxBuffs : for i in 0 to 7 generate
 -- 4k deep input buffers for eight Rx Phy channels
 FEBRx_Buff : PhyRxBuff
-  PORT MAP (rst => RxBuffRst, rd_clk => SysClk,
+  PORT MAP (rst => RxBuffRst or AutoTx_RxFlush(i), rd_clk => SysClk,
     wr_clk => RxFMClk, din => RxPipeline(2)(i),
     wr_en => PhyRxBuff_wreq(i), rd_en => PhyRxBuff_rdreq(i),
     dout => PhyRxBuff_Out(i), full => PhyRxBuff_Full(i),
@@ -1686,6 +1687,11 @@ begin
     LastTxTarget_clr_sync <=
         LastTxTarget_clr_sync(1 downto 0) & LastTxTarget_clr_stretch(0);
 
+	 -- Section 1b: handle the clear at full i50MHz rate so we never
+    -- miss it when the 25 MHz gate happens to be open on a rdreq cycle.
+    if LastTxTarget_clr_sync(2) = '0' and LastTxTarget_clr_sync(1) = '1' then
+      LastTxTarget <= (others => '0');
+    end if;
 
     -- =========================================================================
     -- All logic below is gated at 25 MHz (one execution per MII nibble period)
@@ -1745,11 +1751,17 @@ begin
       --                    register report "UBT fired" when nothing was actually
       --                    driven onto the wire.
       -- -----------------------------------------------------------------------
-      if PhyTxBuff_rdreq = '1' then
+      if PhyTxBuff_rdreq = '1'
+         and not (LastTxTarget_clr_sync(2) = '0' and
+                  LastTxTarget_clr_sync(1) = '1') then
         TxTarget_hold <= tgt_candidate;
         if tgt_candidate /= ZERO8 and TxEn /= ZERO8 then
           LastTxTarget <= tgt_candidate;
         end if;
+        nibble_hold_cnt <= 4;
+      elsif PhyTxBuff_rdreq = '1' then
+        -- still take the hold/countdown side-effects, just don't re-latch LastTxTarget
+        TxTarget_hold  <= tgt_candidate;
         nibble_hold_cnt <= 4;
       end if;
 
@@ -1906,6 +1918,9 @@ begin
     end if;
 end process;
 
+-- synthesis translate_off
+AutoTx_Inhibit_int <= probe_AutoTx_Inhibit;
+-- synthesis translate_on
 
 -- =============================================================================
 -- Process : AutoTx_Proc
@@ -1995,6 +2010,7 @@ begin
     TxEnMask_next       <= (others => '0');
     RoundRobin_Last     <= 0;
     AutoTx_FifoRst_req  <= '0';
+	 AutoTx_RxFlush <= (others => '0');
 
   elsif rising_edge(SysClk) then
 
@@ -2066,7 +2082,8 @@ begin
           if have_port
              and PhyTxBuff_Empty_s = '1'
              and PhyTxBuff_Full    = '0'
-             and PhyTxBuff_wreq    = '0' then
+             and PhyTxBuff_wreq    = '0'
+				 and AutoTx_Inhibit_int = '0' then  -- TB hold-off
               AutoTx_Port              <= found_port;
               RoundRobin_Last          <= found_port;
               AutoTx_WordIdx           <= 0;
@@ -2076,6 +2093,7 @@ begin
               onehot(found_port)       := '1';
               AutoTx_Target            <= onehot;    -- one-hot lane selection
               TxEnMask_next            <= onehot;    -- pre-load CDC register immediately
+				  AutoTx_RxFlush <= (others => '0');
               AutoTx_State             <= AT_WriteWords;
           end if;
 
@@ -2232,20 +2250,25 @@ begin
       --   more unprocessed data. The µC can inspect AutoTx_TimedOut and
       --   intervene via ReadyForceAddr if a manual retry is desired.
       -- -----------------------------------------------------------------------
-      when AT_WaitDdrDrain =>
-          if PhyRxBuff_Empty(AutoTx_Port) = '1' then
-              AutoTx_Busy(AutoTx_Port)  <= '0';
-              AutoTx_ReArm(AutoTx_Port) <= '1';        -- arm port for next cycle
-              AutoTx_State              <= AT_Idle;
-          elsif AutoTx_WaitTimeout > 0 then
-              if Counter1us = X"00" then
-                  AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
-              end if;
-          else
-              AutoTx_TimedOut(AutoTx_Port) <= '1';
-              AutoTx_Busy(AutoTx_Port)     <= '0';
-              AutoTx_State                 <= AT_Idle;
-          end if;
+		when AT_WaitDdrDrain =>
+			if PhyRxBuff_Empty(AutoTx_Port) = '1' then
+				AutoTx_Busy(AutoTx_Port)  <= '0';
+				AutoTx_ReArm(AutoTx_Port) <= '1';
+				AutoTx_State              <= AT_Idle;
+			elsif AutoTx_WaitTimeout > 0 then
+				if Counter1us = X"00" then
+					AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+				end if;
+			else
+				-- Recovery path: malformed FEB reply (RdCnt < header word count).
+				-- Flush the offending port's PhyRxBuff so the next cycle is clean,
+				-- mark the timeout, release the port, AND re-arm so traffic resumes.
+				AutoTx_TimedOut(AutoTx_Port) <= '1';
+				AutoTx_RxFlush(AutoTx_Port)  <= '1';   -- one-shot per-port flush
+				AutoTx_Busy(AutoTx_Port)     <= '0';
+				AutoTx_ReArm(AutoTx_Port)    <= '1';   -- <-- currently missing; without this the port goes dark
+				AutoTx_State                 <= AT_Idle;
+			end if;
 
     end case;
   end if;
@@ -2385,6 +2408,10 @@ if PowerOnReady_done = '0'
     end if;
   end loop;
   PowerOnReady_done <= '1';
+end if;
+
+if DDRRd_en = '1' and DDRRd_EnD = '0' then
+  rs_next := rs_next or MaskReg;
 end if;
 
 -- Auto-enable DDR and FM Rx after startup holdoff, exactly once
@@ -3266,10 +3293,13 @@ end if;
 
 if MaskReg(i) = '1'
    and PhyRxBuff_Empty(i) = '0'
+   and PhyRxBuff_Out(i) >= X"0004"             -- minimum header size
+   and PhyRxBuff_Out(i) <= X"0FFF"             -- sanity cap (FIFO depth)
    and PhyRxBuff_RdCnt(i) >= PhyRxBuff_Out(i)
   then PhyRxBuff_RdStat(i) <= '1';
   else PhyRxBuff_RdStat(i) <= '0';
 end if;
+
 
 end loop;
 
@@ -3427,8 +3457,20 @@ DDRRd_Mux <= SDRdDat(31 downto 16) when RdHi_LoSel = '0' else SDRdDat(15 downto 
 with uCA(9 downto 0) select
 
 
-iCD <= "000000" & DatReqBuff_Empty & "00" & DDRRd_en & PhyDatSel & DDRWrt_En & "0" 
-				& FMRxEn & "0" & RxBuffRst when CSRRegAddr,
+-- New (symmetric with write decoder):
+-- bit 15..10 : pad zeros
+-- bit  9     : TrigWdCntRst (write-only; read back as '0')   or DatReqBuff_Empty (status)
+-- bit  8     : InitReq      (write-only; read back as '0')
+-- bit  7     : DDRRd_en
+-- bit  6     : PhyDatSel
+-- bit  5     : DDRWrt_En
+-- bit  4     : '0' (reserved)
+-- bit  3     : FMRxEn
+-- bit  2     : not PhyPDn
+-- bit  1     : LinkRst (write-only; read back as '0')
+-- bit  0     : RxBuffRst (write-only; read back as '0')
+iCD <= "000000" & DatReqBuff_Empty & '0' & DDRRd_en & PhyDatSel & DDRWrt_En & '0' 
+       & FMRxEn & (not PhyPDn) & '0' & RxBuffRst when CSRRegAddr,
 		 X"00" & MaskReg when InputMaskAddr,
 		 UpTimeStage(31 downto 16) when UpTimeRegAddrHi,
 		 UpTimeStage(15 downto 0) when UpTimeRegAddrLo,
