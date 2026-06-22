@@ -295,6 +295,15 @@ signal TransitionCount : Array_8x4;
 signal Rx_active : std_logic_vector(7 downto 0);
 signal Rx_active_rxclk    : std_logic_vector(7 downto 0);  -- RxFMClk-domain copy
 signal Rx_active_sync     : Array_8x2;                      -- 2-FF synchroniser
+
+-- CDC: per-channel CRC-error-clear request from SysClk (main) into RxFMClk
+-- (PhyRx_Proc). CRCErrClr_req is a 1-SysClk-cycle pulse vector decoded in
+-- 'main' from the µC write to CRCErrAddr; CRCErrClr_sync is the per-bit 2-FF
+-- chain in the RxFMClk domain. CRCErrClr_sync(i)(1) is the safe pulse used
+-- inside PhyRx_Proc to clear CRCErr_Reg(i). Replaces the previous unsafe
+-- direct read of uCWR/CpldCS/uCA/uCD (async µC bus) inside an RxFMClk process.
+signal CRCErrClr_req      : std_logic_vector(7 downto 0) := (others => '0');
+signal CRCErrClr_sync     : Array_8x2 := (others => "00");
 signal LinkStatEn : std_logic;
 signal LinkTxFullCnt : std_logic_vector(7 downto 0);
 
@@ -989,9 +998,10 @@ begin
 -- CRC Error register
 	if iRxDV(i) = 2 and Rx_CRC_Out(i) /= X"C704DD7B" then
 	CRCErr_Reg(i) <= '1';
--- Writing a '1' to the appropriate location will clear the error bit
-	elsif uCWR = '0' and CpldCS = '0' and uCA(11 downto 10) = GA and uCA(9 downto 0) = CRCErrAddr
-		and uCD(i) = '1' then CRCErr_Reg(i) <= '0';
+-- Writing a '1' to the appropriate bit of CRCErrAddr (decoded in 'main' on
+-- SysClk) generates CRCErrClr_req(i); the 2-FF CRCErrClr_cdc synchroniser
+-- presents it here as CRCErrClr_sync(i)(1), safe to consume on RxFMClk.
+	elsif CRCErrClr_sync(i)(1) = '1' then CRCErr_Reg(i) <= '0';
 	else CRCErr_Reg(i) <= CRCErr_Reg(i);
 	end if;
 
@@ -1527,6 +1537,70 @@ begin
     end if;
   end if;
 end process Rx_active_cdc;
+
+
+-- =============================================================================
+-- Process : CRCErrClr_cdc
+-- Purpose : 2-stage Clock-Domain Crossing (CDC) synchroniser
+--           Safe transfer of the per-channel CRC-error-clear request
+--           CRCErrClr_req(7 downto 0) from the SysClk (100 MHz) domain into
+--           the RxFMClk (200 MHz) domain.
+--
+-- Why this is needed:
+--   PhyRx_Proc is clocked on RxFMClk and previously cleared CRCErr_Reg(i) by
+--   reading the asynchronous µC bus directly (uCWR, CpldCS, uCA, uCD). The µC
+--   bus has no defined timing relationship to RxFMClk, so sampling it inside
+--   an RxFMClk process is a CDC violation: any of those signals could be
+--   captured metastable, causing CRCErr_Reg(i) to be cleared spuriously, to
+--   be cleared on the wrong bit, or to fail to clear at all.
+--
+--   The clear is now decoded in 'main' on SysClk into a 1-SysClk-cycle pulse
+--   vector CRCErrClr_req (qualified by WRDL = 1, AddrReg, GA and uCD(i)). The
+--   2-FF chain below brings each bit safely into RxFMClk for use by
+--   PhyRx_Proc as CRCErrClr_sync(i)(1).
+--
+-- Pulse-width considerations:
+--   SysClk = 100 MHz -> 10 ns pulse on CRCErrClr_req(i).
+--   RxFMClk = 200 MHz -> 5 ns period.
+--   A 10 ns source pulse is guaranteed to be captured by at least one RxFMClk
+--   rising edge (Nyquist), and may be seen by one or two consecutive edges in
+--   _sync(i)(1). Clearing CRCErr_Reg(i) is idempotent, so a double-clear in
+--   adjacent RxFMClk cycles is harmless.
+--
+-- Reset behaviour:
+--   The reset condition matches Rx_active_cdc and PhyRx_Proc:
+--     (a) CpldRst_sync = '0' : board-level reset asserted
+--     (b) PllLock     = '0'  : system PLL has lost lock (RxFMClk unreliable)
+--   In either case all synchroniser stages are cleared to '0' (no clear
+--   pending), preventing a spurious clear during reset or PLL startup.
+-- =============================================================================
+CRCErrClr_cdc : process(RxFMClk)
+begin
+  if rising_edge(RxFMClk) then
+
+    if CpldRst_sync = '0' or PllLock = '0' then
+      CRCErrClr_sync <= (others => "00");
+
+    else
+
+      -- Advance the 2-stage synchroniser pipeline for all 8 channels.
+      -- Each channel's FF chain is independent, preventing inter-channel glitches.
+      for i in 0 to 7 loop
+
+        -- Stage 0: capture CRCErrClr_req(i) from the SysClk domain.
+        -- May go metastable if the source pulse edge falls near the RxFMClk
+        -- rising edge, but resolves within one RxFMClk period (5 ns @ 200 MHz).
+        CRCErrClr_sync(i)(0) <= CRCErrClr_req(i);
+
+        -- Stage 1: sample the resolved output of Stage 0.
+        -- CRCErrClr_sync(i)(1) is the RxFMClk-safe pulse consumed by PhyRx_Proc.
+        CRCErrClr_sync(i)(1) <= CRCErrClr_sync(i)(0);
+
+      end loop;
+
+    end if;
+  end if;
+end process CRCErrClr_cdc;
 
 
 -- =============================================================================
@@ -2326,6 +2400,7 @@ variable rs_next : std_logic_vector(7 downto 0);
 	TrigReqCount <= X"00"; Link_Stat_Req <= '0'; HitFlag <= X"00";
 	PhyRstCnt <= "11"; FMRxEn <= '0'; PhyRxBuff_RdStat <= X"00"; 
 	PhyRxBuff_rdreq <= X"00"; RxBuffRst <= '0'; SPI_WrtReq <= '0'; DDRWrtStat <= X"0";
+	CRCErrClr_req <= (others => '0');
 	ClockReg <= "10101"; -- initial clock pattern
 	FrameReg <= "11111"; -- initial framing pattern
 	RxDl <= (others => "00"); TransitionCount <= (others => X"0"); 
@@ -2801,6 +2876,19 @@ if ((WRDL = 1 and AddrReg(11 downto 10) = GA and AddrReg(9 downto 0) = FMRxErrAd
 	and (uCD(i) = '1' or uCD(8) = '1')) or CpldRst_sync = '0'
 then FEBRxIn(i).Clr_Err <= '1';
 else FEBRxIn(i).Clr_Err <= '0';
+end if;
+
+-- Per-channel CRC-error clear request.
+-- The µC clears CRCErr_Reg(i) by writing a '1' to bit i of CRCErrAddr. The
+-- old implementation read uCWR/CpldCS/uCA/uCD directly inside PhyRx_Proc
+-- (RxFMClk, 200 MHz), which is a CDC violation since the µC bus has no
+-- defined timing relative to RxFMClk. We now decode the write here in 'main'
+-- (SysClk) as a 1-cycle pulse, then synchronise it into RxFMClk via the
+-- CRCErrClr_cdc 2-FF chain (see CRCErrClr_sync(i)(1) in PhyRx_Proc).
+if WRDL = 1 and AddrReg(11 downto 10) = GA and AddrReg(9 downto 0) = CRCErrAddr
+   and uCD(i) = '1'
+then CRCErrClr_req(i) <= '1';
+else CRCErrClr_req(i) <= '0';
 end if;
 
 end loop;
