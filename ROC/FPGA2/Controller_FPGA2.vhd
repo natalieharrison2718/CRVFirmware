@@ -241,6 +241,13 @@ signal TxNibbleCount : std_logic_vector (1 downto 0);
 -- FIX 4: 2-FF synchronizer for TxEnReq crossing SysClk ? i50MHz
 signal TxEnReq_sync : std_logic_vector(1 downto 0) := "00";
 
+-- 2-FF synchronizer for TxEnAck crossing i50MHz ? SysClk.
+-- TxEnAck is registered in SMI_Proc (i50MHz domain) and is consumed in the
+-- SysClk-domain main process (to clear TxEnReq) and in the SysClk-domain
+-- uC readback mux. TxEnAck_sync(1) is the safe SysClk-domain copy and
+-- must be used wherever TxEnAck is read inside SysClk logic.
+signal TxEnAck_sync : std_logic_vector(1 downto 0) := "00";
+
 -- Phy Rx Signals
 signal PhyRxBuff_wreq,PhyRxBuff_rdreq,PhyRxBuff_Empty,HitFlag,
 		 PhyRxBuff_Full,iCRS,PhyRxBuff_RdStat : std_logic_vector (7 downto 0);
@@ -1621,6 +1628,46 @@ end process TxEnReq_cdc;
 
 
 -- =============================================================================
+-- Process : TxEnAck_cdc
+-- Purpose : 2-FF synchroniser carrying TxEnAck from i50MHz into SysClk.
+--
+-- Source domain  : i50MHz (50 MHz) - TxEnAck is driven by SMI_Proc.
+-- Dest. domain   : SysClk (100 MHz) - read by the main process (to clear
+--                   TxEnReq) and by the uC readback mux (PhyTxCSRAddr).
+--
+-- Reading TxEnAck directly in SysClk logic without synchronisation would
+-- violate CDC rules: TxEnAck can change near a SysClk rising edge, putting
+-- the receiving FF into metastability and corrupting the TxEnReq/TxEnAck
+-- handshake (TxEnReq could be cleared prematurely or not at all).
+--
+--   i50MHz domain                 SysClk domain (100 MHz)
+--   --------------                ----------------------
+--   TxEnAck   --> [FF0] --> [FF1] --> TxEnAck_sync(1)
+--                _sync(0)  _sync(1)   (safe to use in SysClk logic)
+--
+-- Reset behaviour:
+--   On CpldRst_sync = '0' both stages are cleared to '0' (no Ack pending),
+--   matching the reset state of TxEnAck inside SMI_Proc.
+-- =============================================================================
+TxEnAck_cdc : process(SysClk)
+begin
+  if rising_edge(SysClk) then
+    if CpldRst_sync = '0' then
+      TxEnAck_sync <= "00";
+    else
+      -- Stage 0: first metastability capture FF.
+      TxEnAck_sync(0) <= TxEnAck;
+      -- Stage 1: resolved, SysClk-safe copy. Use this signal exclusively
+      -- whenever TxEnAck is read inside a SysClk process or combinational
+      -- output that is consumed by SysClk logic.
+      TxEnAck_sync(1) <= TxEnAck_sync(0);
+    end if;
+  end if;
+end process TxEnAck_cdc;
+
+
+
+-- =============================================================================
 -- Process : phy_out_gating
 -- Purpose : Deterministic PHY transmit output routing at 25 MHz (MII rate)
 --
@@ -2820,8 +2867,10 @@ end if;
 
 
 -- TxEnReq: set when µC writes CSR bit-0=1, or AutoTx fires;
--- clear only after SMI_Proc has acknowledged (TxEnAck='1')
-if TxEnReq = '0' and TxEnAck = '0' and (
+-- clear only after SMI_Proc has acknowledged (TxEnAck='1').
+-- TxEnAck is generated in the i50MHz domain (SMI_Proc); read the
+-- 2-FF-synchronised SysClk copy TxEnAck_sync(1) here to avoid CDC.
+if TxEnReq = '0' and TxEnAck_sync(1) = '0' and (
      ( WRDL = 1 and (
          (uCA(11 downto 10) = GA and uCA(9 downto 0) = PhyTxCSRAddr   and uCD(0) = '1')
        or (uCA(9 downto 0) = PhyTxCSRBroadCastAd                       and uCD(0) = '1')
@@ -2831,7 +2880,7 @@ if TxEnReq = '0' and TxEnAck = '0' and (
    )
 then
     TxEnReq <= '1';
-elsif TxEnReq = '1' and TxEnAck = '1' then
+elsif TxEnReq = '1' and TxEnAck_sync(1) = '1' then
     TxEnReq <= '0';
 -- else: hold current value (implicit in clocked process)
 end if;
@@ -3584,7 +3633,7 @@ iCD <= "000000" & DatReqBuff_Empty & '0' & DDRRd_en & PhyDatSel & DDRWrt_En & '0
 		 X"00" & CRS when RxCRSAddr,
 		 X"00" & TxEnMask when TxEnMaskAd,
 		 X"00" & not PhyRxBuff_Empty when RxDAVAddr,
-		 X"000" & "00" & PhyTxBuff_Empty & TxEnAck when PhyTxCSRAddr,
+		 X"000" & "00" & PhyTxBuff_Empty & TxEnAck_sync(1) when PhyTxCSRAddr,
        "00000" & PhyTxBuff_Count when PhyTxCntAddr,
 		 X"00" & CurrentTarget when TxCurrentTargetAddr,
 		 TrigWdCount & DRegSrc & '0' & Debug when DebugAddr,
