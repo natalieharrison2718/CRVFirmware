@@ -271,7 +271,6 @@ signal PhyTx : Array_8x4 := (
   );
 signal Rx_CRC_Out : Array_8x32;
 signal RdCRCEn,RxCRCRst : std_logic_vector(7 downto 0);
-signal RxFilled_sticky : std_logic := '0';
 
 
 -- Signal used by timing/trigger LVDS FM receive links
@@ -353,11 +352,10 @@ signal PhyTxDin_FPGA      : std_logic_vector(15 downto 0) := (others => '0'); --
 signal PhyTxDin_mux       : std_logic_vector(15 downto 0) := (others => '0'); -- selected DIN to PhyTx_Buff (uC or FPGA)
 signal PhyTxBuff_wr_en_mux: std_logic := '0';                                  -- combined wr_en into PhyTx_Buff
 signal PhyTxWrReq_FPGA    : std_logic := '0';                                  -- one-cycle FPGA write request
---type AutoTx_FSM is (AT_Idle, AT_WriteWords, AT_WaitTxFill, AT_WaitTxDrain, AT_WaitRxFill, AT_WaitDdrDrain);
 type AutoTx_FSM is (AT_Idle, AT_WriteWords, AT_WaitTxFill, AT_WaitTxDrain, AT_WaitRxFill);
 signal AutoTx_State : AutoTx_FSM := AT_Idle;
 signal AutoTx_Port        : integer range 0 to 7 := 0;
-signal AutoTx_WordIdx     : integer range 0 to 15 := 0; -- supports up to 16-word packets if needed
+signal AutoTx_WordIdx     : integer range 0 to UBT_ASC_COUNT-1 := 0;
 signal AutoTx_Claim : std_logic_vector(7 downto 0) := (others => '0'); -- one-hot claim for main to clear ReadyStatus
 signal AutoTx_Claim_d : std_logic_vector(7 downto 0) := (others => '0');  --  delayed claim
 signal AutoTx_ReArm : std_logic_vector(7 downto 0) := (others => '0');
@@ -384,7 +382,6 @@ signal AutoTx_RxFlush : std_logic_vector(7 downto 0) := (others => '0');
 signal AutoTx_WaitPort : integer range 0 to 7 := 0;
 signal AutoTx_RxGot : std_logic_vector(7 downto 0) := (others => '0');  -- sticky "reply arrived"
 signal PhyRxBuff_WasEmpty : std_logic_vector(7 downto 0) := (others => '1'); -- previous cycle empty
-signal PhyRxFilled : std_logic_vector(7 downto 0) := (others => '0'); -- rising edge: empty->non empty
 signal AutoTx_WaitTimeout : integer range 0 to 100000 := 0; -- ~100 ms at 100 MHz
 -- Startup holdoff counter. Delays the PowerOnReady_done pulse until
 -- the reset synchroniser, FIFOs, and AutoTx FSM have all fully settled.
@@ -2004,6 +2001,7 @@ AutoTx_Inhibit_int <= probe_AutoTx_Inhibit;
 --   AutoTx_Claim        : cleared to X"00"  (one-shot port claim pulse)
 --   AutoTx_FifoRst_req  : cleared to '0'    (one-shot FIFO reset request)
 --   AutoTx_ReArm        : cleared to X"00"  (one-shot re-arm pulse)
+--   AutoTx_RxFlush      : cleared to X"00"  (one-shot per-port Rx FIFO flush)
 --   PhyTxWrReq_FPGA     : cleared to '0'    (one-shot FIFO write strobe)
 --   AutoTx_TxEnReqPulse : cleared to '0'    (one-shot TxEnReq trigger)
 --   TxEnMask_next       : held at AutoTx_Target (stable during transmission)
@@ -2019,7 +2017,6 @@ AutoTx_Inhibit_int <= probe_AutoTx_Inhibit;
 --   AT_WaitTxFill  : wait for PhyTxBuff_Empty_s to fall (CDC settling, ~3 cycles)
 --   AT_WaitTxDrain : pulse TxEnReq; wait for SMI_Proc to drain the FIFO
 --   AT_WaitRxFill  : wait for FEB to respond (PhyRxBuff goes non-empty)
---   AT_WaitDdrDrain: wait for DDR write sequencer to drain the Rx FIFO
 -- =============================================================================
 
 AutoTx_Proc : process(SysClk, CpldRst_sync)
@@ -2047,11 +2044,10 @@ begin
     AutoTx_TxEnReqPulse <= '0';
     AutoTx_TimedOut     <= (others => '0');
     AutoTx_WaitTimeout  <= 0;
-    RxFilled_sticky     <= '0';
     TxEnMask_next       <= (others => '0');
     RoundRobin_Last     <= 0;
     AutoTx_FifoRst_req  <= '0';
-	 AutoTx_RxFlush <= (others => '0');
+    AutoTx_RxFlush      <= (others => '0');
 
   elsif rising_edge(SysClk) then
 
@@ -2064,6 +2060,7 @@ begin
     AutoTx_Claim        <= X"00";
     AutoTx_FifoRst_req  <= '0';
     AutoTx_ReArm        <= (others => '0');
+    AutoTx_RxFlush      <= (others => '0');
     PhyTxWrReq_FPGA     <= '0';
     AutoTx_TxEnReqPulse <= '0';
 
@@ -2071,17 +2068,6 @@ begin
     -- the entire handshake cycle. TxEnMask_cdc transfers this into i50MHz
     -- domain within 2 cycles so SMI_Proc always sees the correct lane mask.
     TxEnMask_next <= AutoTx_Target;
-
-    -- -------------------------------------------------------------------------
-    -- RxFilled_sticky: latches a PhyRxBuff fill event while the FSM is in
-    -- AT_WaitRxFill. Used as a fallback in case the fill edge is missed on
-    -- the exact cycle the state machine checks PhyRxBuff_Empty. Cleared on
-    -- state exit and on reset.
-    -- -------------------------------------------------------------------------
-    if AutoTx_State = AT_WaitRxFill
-       and PhyRxFilled(AutoTx_Port) = '1' then
-        RxFilled_sticky <= '1';
-    end if;
 
 
     case AutoTx_State is
@@ -2134,7 +2120,6 @@ begin
               onehot(found_port)       := '1';
               AutoTx_Target            <= onehot;    -- one-hot lane selection
               TxEnMask_next            <= onehot;    -- pre-load CDC register immediately
-				  AutoTx_RxFlush <= (others => '0');
               AutoTx_State             <= AT_WriteWords;
           end if;
 
@@ -2214,8 +2199,7 @@ begin
       --
       -- Holds until PhyTxBuff_Empty_s rises back to '1', confirming that the
       -- i50MHz read side has consumed all words and the packet has been fully
-      -- clocked out to the PHY. RxFilled_sticky is cleared here so the
-      -- subsequent AT_WaitRxFill state starts with a clean latch.
+      -- clocked out to the PHY.
       --
       -- Timeout (1000 x 1 µs = 1 ms):
       --   If the FIFO does not drain (e.g. SMI_Proc is stalled or TxEnAck was
@@ -2225,7 +2209,6 @@ begin
       -- -----------------------------------------------------------------------
       when AT_WaitTxDrain =>
           if PhyTxBuff_Empty_s = '1' then
-              RxFilled_sticky    <= '0';
               AutoTx_WaitTimeout <= 10000;             -- 10 ms FEB reply timeout
               AutoTx_State       <= AT_WaitRxFill;
           elsif AutoTx_WaitTimeout > 0 then
@@ -2247,90 +2230,40 @@ begin
       -- The FEB sends its reply over the Ethernet link. The FPGA receives it
       -- in PhyRx_Proc, which writes the incoming words into PhyRxBuff. This
       -- state monitors PhyRxBuff_Empty(AutoTx_Port) directly: the moment it
-      -- falls to '0', data has arrived and the FSM advances.
+      -- falls to '0', data has arrived and the port is released and re-armed.
       -- PhyRxBuff is clocked on SysClk (rd_clk = SysClk) so this read is
       -- safe without an additional synchroniser.
+      --
+      -- On exit (success or timeout) AutoTx_Target is cleared so TxEnMask_next
+      -- de-asserts in the next idle cycle and no stale lane mask is driven
+      -- into the i50MHz domain while the FSM is idle.
       --
       -- Timeout (10000 x 1 µs = 10 ms):
       --   If no reply arrives within 10 ms the FEB is assumed unresponsive.
       --   AutoTx_ReArm re-queues the port so the next idle scan will retry,
       --   and AutoTx_TimedOut is flagged for diagnostic visibility.
       -- -----------------------------------------------------------------------
---      when AT_WaitRxFill =>
---          if PhyRxBuff_Empty(AutoTx_Port) = '0' then
---              RxFilled_sticky    <= '0';
---              AutoTx_WaitTimeout <= 10000;             -- 10 ms DDR drain timeout
---              AutoTx_State       <= AT_WaitDdrDrain;
---          elsif AutoTx_WaitTimeout > 0 then
---              if Counter1us = X"00" then
---                  AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
---              end if;
---          else
---              AutoTx_TimedOut(AutoTx_Port) <= '1';
---              AutoTx_Busy(AutoTx_Port)     <= '0';
---              AutoTx_ReArm(AutoTx_Port)    <= '1';     -- retry this port next idle scan
---              AutoTx_State                 <= AT_Idle;
---          end if;
-
-		when AT_WaitRxFill =>
-    if PhyRxBuff_Empty(AutoTx_Port) = '0' then
-        -- FEB has replied; that's all we need to re-arm.
-        -- Flush the per-port Rx FIFO so the DDR sequencer (or anything else)
-        -- starts clean next cycle, and immediately release + re-arm the port.
-        AutoTx_RxFlush(AutoTx_Port) <= '1';
-        AutoTx_Busy   (AutoTx_Port) <= '0';
-        AutoTx_ReArm  (AutoTx_Port) <= '1';
-        AutoTx_State                <= AT_Idle;
-    elsif AutoTx_WaitTimeout > 0 then
-        if Counter1us = X"00" then
-            AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
-        end if;
-    else
-        AutoTx_TimedOut(AutoTx_Port) <= '1';
-        AutoTx_Busy   (AutoTx_Port)  <= '0';
-        AutoTx_ReArm  (AutoTx_Port)  <= '1';
-        AutoTx_State                 <= AT_Idle;
-    end if;
-
-
-
-      -- -----------------------------------------------------------------------
-      -- AT_WaitDdrDrain: wait for the DDR write sequencer to consume the reply.
-      --
-      -- The DDR_Write_Seq FSM in main reads PhyRxBuff(AutoTx_Port) and writes
-      -- the FEB response data to LPDDR. This state waits until PhyRxBuff_Empty
-      -- returns to '1', confirming that all reply words have been transferred
-      -- to DDR and the receive FIFO is fully drained. Only then is the port
-      -- released (AutoTx_Busy cleared) and AutoTx_ReArm pulsed to prime the
-      -- same port for its next round-robin turn.
-      --
-      -- Timeout (10000 x 1 µs = 10 ms):
-      --   If the DDR write sequencer stalls and never drains the FIFO within
-      --   10 ms, the port is released and AutoTx_TimedOut is flagged. The port
-      --   is NOT re-armed on this timeout path: a DDR stall is a systemic fault
-      --   (not a per-port issue) and immediate retry would simply queue up
-      --   more unprocessed data. The µC can inspect AutoTx_TimedOut and
-      --   intervene via ReadyForceAddr if a manual retry is desired.
-      -- -----------------------------------------------------------------------
---		when AT_WaitDdrDrain =>
---			if PhyRxBuff_Empty(AutoTx_Port) = '1' then
---				AutoTx_Busy(AutoTx_Port)  <= '0';
---				AutoTx_ReArm(AutoTx_Port) <= '1';
---				AutoTx_State              <= AT_Idle;
---			elsif AutoTx_WaitTimeout > 0 then
---				if Counter1us = X"00" then
---					AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
---				end if;
---			else
---				-- Recovery path: malformed FEB reply (RdCnt < header word count).
---				-- Flush the offending port's PhyRxBuff so the next cycle is clean,
---				-- mark the timeout, release the port, AND re-arm so traffic resumes.
---				AutoTx_TimedOut(AutoTx_Port) <= '1';
---				AutoTx_RxFlush(AutoTx_Port)  <= '1';   -- one-shot per-port flush
---				AutoTx_Busy(AutoTx_Port)     <= '0';
---				AutoTx_ReArm(AutoTx_Port)    <= '1';   -- <-- currently missing; without this the port goes dark
---				AutoTx_State                 <= AT_Idle;
---			end if;
+      when AT_WaitRxFill =>
+          if PhyRxBuff_Empty(AutoTx_Port) = '0' then
+              -- FEB has replied; that's all we need to re-arm.
+              -- Flush the per-port Rx FIFO so the DDR sequencer (or anything
+              -- else) starts clean next cycle, and release + re-arm the port.
+              AutoTx_RxFlush(AutoTx_Port) <= '1';
+              AutoTx_Busy   (AutoTx_Port) <= '0';
+              AutoTx_ReArm  (AutoTx_Port) <= '1';
+              AutoTx_Target               <= (others => '0');
+              AutoTx_State                <= AT_Idle;
+          elsif AutoTx_WaitTimeout > 0 then
+              if Counter1us = X"00" then
+                  AutoTx_WaitTimeout <= AutoTx_WaitTimeout - 1;
+              end if;
+          else
+              AutoTx_TimedOut(AutoTx_Port) <= '1';
+              AutoTx_Busy   (AutoTx_Port)  <= '0';
+              AutoTx_ReArm  (AutoTx_Port)  <= '1';
+              AutoTx_Target                <= (others => '0');
+              AutoTx_State                 <= AT_Idle;
+          end if;
 
     end case;
   end if;
